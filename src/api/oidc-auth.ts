@@ -467,6 +467,10 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
     registration_endpoint: `${baseUrl}/oauth/register`,
     // Required capabilities
     response_types_supported: ['code'],
+    // js-sdk's isValidAuthMetadata requires both "query" and "fragment" here;
+    // without this key Element logs "Issuer configuration not valid" and
+    // disables OIDC/QR features.
+    response_modes_supported: ['query', 'fragment'],
     grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256', 'plain'],
     // Additional optional fields that Element Web may check

@@ -1168,12 +1168,24 @@ describe('GET /_matrix/client/v1/auth_metadata', () => {
       revocation_endpoint: `https://${SERVER}/oauth/revoke`,
       registration_endpoint: `https://${SERVER}/oauth/register`,
       response_types_supported: ['code'],
+      // js-sdk's isValidAuthMetadata requires both response modes; Element
+      // logs "Issuer configuration not valid" without them.
+      response_modes_supported: ['query', 'fragment'],
       grant_types_supported: ['authorization_code', 'refresh_token'],
       code_challenge_methods_supported: ['S256', 'plain'],
       device_authorization_endpoint: `https://${SERVER}/oauth/device`,
       account_management_uri: `https://${SERVER}/admin`,
       prompt_values_supported: ['create'],
     });
+  });
+
+  it('satisfies the js-sdk isValidAuthMetadata response-mode requirement', async () => {
+    // Discovered live: Element's getAuthMetadata() rejects the document with
+    // "Invalid property: response_modes_supported. query is required." when
+    // this key is absent, disabling OIDC/QR features on the login page.
+    const { body } = await request('/_matrix/client/v1/auth_metadata');
+    const meta = body as { response_modes_supported: string[] };
+    expect(meta.response_modes_supported).toEqual(['query', 'fragment']);
   });
 
   it('includes Matrix client scopes and account management actions', async () => {
