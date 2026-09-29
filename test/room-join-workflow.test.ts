@@ -19,6 +19,17 @@ const getMembership = vi.fn(async () => null as { membership: string; eventId: s
 const federationGet = vi.fn();
 const federationPut = vi.fn();
 const generateEventId = vi.fn(async () => '$generated:example.com');
+const calculateContentHash = vi.fn(async () => 'content-hash');
+const signJson = vi.fn(
+  async (obj: Record<string, unknown>, serverName: string, keyId: string) => ({
+    ...obj,
+    signatures: { [serverName]: { [keyId]: 'sig' } },
+  })
+);
+const getServerSigningKey = vi.fn(async () => ({
+  keyId: 'ed25519:test',
+  privateKeyJwk: {},
+}));
 
 vi.mock('../src/services/database', () => ({
   storeEvent: (...args: unknown[]) => storeEvent(...args),
@@ -33,6 +44,12 @@ vi.mock('../src/services/database', () => ({
 vi.mock('../src/services/federation-keys', () => ({
   federationGet: (...args: unknown[]) => federationGet(...args),
   federationPut: (...args: unknown[]) => federationPut(...args),
+  getServerSigningKey: (...args: unknown[]) => getServerSigningKey(...args),
+}));
+
+vi.mock('../src/utils/crypto', () => ({
+  calculateContentHash: (...args: unknown[]) => calculateContentHash(...args),
+  signJson: (...args: unknown[]) => signJson(...args),
 }));
 
 vi.mock('../src/utils/ids', () => ({
@@ -336,6 +353,11 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     expect(stored.auth_events).toEqual(template.event.auth_events);
     expect(stored.prev_events).toEqual(template.event.prev_events);
     expect(stored.depth).toBe(7);
+    // The join event must be hashed + signed for the resident server.
+    expect((stored as { hashes: unknown }).hashes).toEqual({ sha256: 'content-hash' });
+    expect((stored as { signatures: unknown }).signatures).toEqual({
+      'example.com': { 'ed25519:test': 'sig' },
+    });
     expect(federationPut).toHaveBeenCalled();
     const putPath = federationPut.mock.calls[0][1];
     expect(putPath).toContain('/_matrix/federation/v2/send_join/');
