@@ -935,6 +935,35 @@ export async function notifyUsersOfEvent(
   }
 }
 
+// Wake a single user's SyncDurableObject so long-polling /sync requests
+// return immediately when one of their streams changes, instead of waiting
+// out the full long-poll timeout. Used by the account-data and device-keys
+// write paths (the rooms paths use notifyUsersOfEvent above).
+// Best-effort: a failed notification must never fail the write itself.
+export async function notifyUserSync(
+  env: Env,
+  userId: string,
+  stream: string
+): Promise<void> {
+  try {
+    const syncDO = env.SYNC.get(env.SYNC.idFromName(userId));
+    await syncDO.fetch(
+      new Request('http://internal/notify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event_id: `stream:${stream}:${Date.now()}`,
+          room_id: '',
+          type: `stream:${stream}`,
+          timestamp: Date.now(),
+        }),
+      })
+    );
+  } catch (error) {
+    console.error(`[database] Failed to notify SyncDurableObject for ${userId}:`, error);
+  }
+}
+
 // Registration token (invite) operations
 
 export interface RegistrationTokenRow {

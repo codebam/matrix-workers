@@ -332,6 +332,19 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Get current position
   const currentPosition = await getLatestStreamPosition(c.env.DB);
 
+  // Snapshot the per-stream counters BEFORE any response data is read, and
+  // use these snapshots — never fresher reads — for next_batch. A write that
+  // lands while this response is being assembled (in particular during the
+  // DO long-poll wait below) must NOT be consumed by next_batch unless it is
+  // actually delivered in this response: clients such as js-sdk's
+  // `setAccountData` resolve only when their write is echoed back over sync,
+  // so a token that advances past an undelivered change hangs them forever.
+  // Under-advancing is safe (the change is redelivered next sync).
+  const [currentAccountDataPos, currentDeviceKeysPos] = await Promise.all([
+    getStreamPosition(c.env.DB, 'account_data'),
+    getStreamPosition(c.env.DB, 'device_keys'),
+  ]);
+
   // Track to-device position for next_batch
   let currentToDevicePos = sinceToDevice;
 
@@ -646,13 +659,11 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   }
 
   // Build composite next_batch token with separate positions for each stream.
-  // The account-data / device-keys positions advance to the current stream
-  // counters, so changes already delivered above are not sent again.
+  // Deliberately uses the positions snapshotted at the START of this handler
+  // (before any data was read), so next_batch can never skip a change that
+  // landed mid-response and was therefore not delivered (see the snapshot
+  // comment above; a skipped change is lost forever once the token passes it).
   if (!response.next_batch) {
-    const [currentAccountDataPos, currentDeviceKeysPos] = await Promise.all([
-      getStreamPosition(c.env.DB, 'account_data'),
-      getStreamPosition(c.env.DB, 'device_keys'),
-    ]);
     response.next_batch = buildSyncToken(
       currentPosition,
       currentToDevicePos,
