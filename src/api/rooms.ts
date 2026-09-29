@@ -1219,8 +1219,19 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
   if (membership) authEvents.push(membership.eventId);
 
-  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
-  const prevEvents = latestEvents.map(e => e.event_id);
+  // Prefer extending the remote side's chain. When the room's newest events
+  // are our own (possibly undelivered) messages, pointing prev_events at them
+  // makes the resident server fetch a chain it has never seen and then drop
+  // the event silently (its /send returns 200 before background processing).
+  // The newest event authored by another server is the safest parent: every
+  // participant already has it.
+  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 10);
+  const remoteTip = latestEvents.find((e) => {
+    const server = e.sender?.split(':')[1];
+    return server && server !== c.env.SERVER_NAME;
+  });
+  const parent = remoteTip ?? latestEvents[0];
+  const prevEvents = parent ? [parent.event_id] : [];
 
   const event: PDU = {
     event_id: eventId,
@@ -1230,7 +1241,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     content,
     origin_server_ts: Date.now(),
     unsigned: { transaction_id: txnId },
-    depth: (latestEvents[0]?.depth ?? 0) + 1,
+    depth: (parent?.depth ?? 0) + 1,
     auth_events: authEvents,
     prev_events: prevEvents,
   };

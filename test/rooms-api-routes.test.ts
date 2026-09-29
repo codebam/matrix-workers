@@ -1544,7 +1544,10 @@ describe('GET members / messages / event / send', () => {
   it('send: with a remote joined member, derives a reference-hash id and queues a wire PDU', async () => {
     getMembership.mockResolvedValue(joinMembership());
     getRoomEvents.mockResolvedValue({
-      events: [pdu({ type: 'm.room.message', event_id: '$p', depth: 7 })],
+      events: [
+        pdu({ type: 'm.room.message', event_id: '$p', depth: 7, sender: USER }),
+        pdu({ type: 'm.room.message', event_id: '$r', depth: 6, sender: '@remote:remote.example' }),
+      ],
       end: 7,
     });
     defaultState();
@@ -1600,6 +1603,9 @@ describe('GET members / messages / event / send', () => {
       expect(authEvents).not.toContain('$create');
       expect(authEvents).toContain('$pl');
       expect(authEvents).toContain('$alice-join');
+      // prev_events extends the remote side's chain ($r), not our own tip.
+      expect(payload.pdu.prev_events).toEqual(['$r']);
+      expect(payload.pdu.depth).toBe(7);
     } finally {
       restore();
     }
