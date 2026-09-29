@@ -7,10 +7,11 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { getUserById } from '../services/database';
 import { generateLoginToken, generateOpaqueId } from '../utils/ids';
-import { hashToken } from '../utils/crypto';
+import { base64UrlDecode, hashToken, verifySignature } from '../utils/crypto';
 import { encryptSecret } from './oidc-auth';
 import { fetchOIDCDiscovery } from '../services/oidc';
 import { logAdminAction } from '../services/admin-audit';
+import federation from './federation';
 
 const app = new Hono<AppEnv>();
 
@@ -581,6 +582,72 @@ app.get('/admin/api/federation/test', requireAuth(), requireAdmin, async (c) => 
     success: allPassed,
     server_name: serverName,
     tests,
+  });
+});
+
+// GET /admin/api/federation/key-check - Tester-equivalent validation of our own
+// server key response. Mirrors the gomatrixserverlib CheckKeys semantics the
+// Matrix Federation Tester applies: every published verify_key must be a valid
+// ed25519 key AND carry a matching signature, otherwise strict peers reject
+// the whole response (AllEd25519ChecksOK = false).
+// The check runs against our /_matrix/key/v2/server handler in-process, so
+// regressions are caught before the public network path is involved.
+app.get('/admin/api/federation/key-check', requireAuth(), requireAdmin, async (c) => {
+  const serverName = c.env.SERVER_NAME;
+
+  const res = await federation.request('http://localhost/_matrix/key/v2/server', {}, c.env);
+  if (!res.ok) {
+    return c.json({
+      AllChecksOK: false,
+      MatchingServerName: false,
+      FutureValidUntilTS: false,
+      HasEd25519Key: false,
+      AllEd25519ChecksOK: null,
+      Ed25519Checks: {},
+      error: `/_matrix/key/v2/server responded HTTP ${res.status}`,
+    });
+  }
+
+  const body = (await res.json()) as Record<string, unknown>;
+  const verifyKeys = (body.verify_keys ?? {}) as Record<string, { key?: string }>;
+
+  const ed25519Checks: Record<string, { ValidEd25519: boolean; MatchingSignature: boolean }> = {};
+  let hasEd25519Key = false;
+  let allEd25519ChecksOK = true;
+
+  for (const [keyId, keyData] of Object.entries(verifyKeys)) {
+    if (keyId.split(':', 2)[0] !== 'ed25519') continue;
+    hasEd25519Key = true;
+
+    let validEd25519 = false;
+    if (typeof keyData.key === 'string') {
+      try {
+        validEd25519 = base64UrlDecode(keyData.key).length === 32;
+      } catch {
+        validEd25519 = false;
+      }
+    }
+
+    const matchingSignature =
+      validEd25519 && typeof keyData.key === 'string'
+        ? await verifySignature(body, serverName, keyId, keyData.key)
+        : false;
+
+    ed25519Checks[keyId] = { ValidEd25519: validEd25519, MatchingSignature: matchingSignature };
+    if (!matchingSignature) allEd25519ChecksOK = false;
+  }
+
+  const matchingServerName = body.server_name === serverName;
+  const futureValidUntilTS =
+    (typeof body.valid_until_ts === 'number' ? body.valid_until_ts : 0) > Date.now();
+
+  return c.json({
+    AllChecksOK: matchingServerName && futureValidUntilTS && hasEd25519Key && allEd25519ChecksOK,
+    MatchingServerName: matchingServerName,
+    FutureValidUntilTS: futureValidUntilTS,
+    HasEd25519Key: hasEd25519Key,
+    AllEd25519ChecksOK: hasEd25519Key ? allEd25519ChecksOK : null,
+    Ed25519Checks: ed25519Checks,
   });
 });
 
