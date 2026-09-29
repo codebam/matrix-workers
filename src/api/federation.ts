@@ -801,6 +801,21 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
               ).bind(roomId, pdu.type, pdu.state_key, eventId).run();
             }
           }
+        // Track membership changes from incoming member events so the
+          // memberships table stays in sync with remote state (federation
+          // fan-out picks destinations from this table).
+          if (pdu.type === 'm.room.member' && typeof pdu.state_key === 'string') {
+            const membership = (pdu.content as { membership?: string } | null)?.membership;
+            if (
+              membership === 'join' ||
+              membership === 'invite' ||
+              membership === 'leave' ||
+              membership === 'ban' ||
+              membership === 'knock'
+            ) {
+              await updateMembership(c.env.DB, roomId, pdu.state_key, membership, eventId);
+            }
+          }
         } catch (e) {
           console.error(`Failed to store event ${eventId}:`, e);
         }

@@ -162,6 +162,28 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
                 this.env.DB,
                 normalized as unknown as Parameters<typeof storeEventIdempotent>[1]
               );
+
+              // Keep the memberships table in sync with the remote state --
+              // federation fan-out picks destinations from it.
+              const evStateKey = (ev as { state_key?: unknown }).state_key;
+              if (ev.type === 'm.room.member' && typeof evStateKey === 'string') {
+                const membership = (ev.content as { membership?: string } | undefined)?.membership;
+                if (
+                  membership === 'join' ||
+                  membership === 'invite' ||
+                  membership === 'leave' ||
+                  membership === 'ban' ||
+                  membership === 'knock'
+                ) {
+                  await updateMembership(
+                    this.env.DB,
+                    roomId,
+                    evStateKey,
+                    membership,
+                    String(normalized.event_id)
+                  );
+                }
+              }
             } catch (storeErr) {
               // Never let one malformed remote event abort the whole join.
               console.warn('[RoomJoinWorkflow] Skipping remote state event', {
