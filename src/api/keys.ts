@@ -17,7 +17,7 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
 import { generateOpaqueId } from '../utils/ids';
-import { getPasswordHash } from '../services/database';
+import { getPasswordHash, notifyUserSync } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -115,13 +115,21 @@ async function getNextStreamPosition(db: D1Database, streamName: string): Promis
   return result?.position || 1;
 }
 
-export async function recordKeyChange(db: D1Database, userId: string, deviceId: string | null, changeType: string): Promise<void> {
+export async function recordKeyChange(db: D1Database, userId: string, deviceId: string | null, changeType: string, env?: Env): Promise<void> {
   const streamPosition = await getNextStreamPosition(db, 'device_keys');
 
   await db.prepare(`
     INSERT INTO device_key_changes (user_id, device_id, change_type, stream_position)
     VALUES (?, ?, ?, ?)
   `).bind(userId, deviceId, changeType, streamPosition).run();
+
+  // Wake this user's in-flight /sync long-poll so device-list changes reach
+  // clients promptly instead of waiting out the long-poll timeout. Optional
+  // env keeps direct callers (tests) working; syncing correctness does not
+  // depend on the wake (see the next_batch snapshot fix in sync.ts).
+  if (env) {
+    await notifyUserSync(env, userId, 'device_keys');
+  }
 }
 
 // Remove a device's keys from the Durable Object. Used when a device is
@@ -194,7 +202,7 @@ app.post('/_matrix/client/v3/keys/upload', requireAuth(), async (c) => {
     );
 
     // Record key change for /keys/changes
-    await recordKeyChange(db, userId, deviceId, 'update');
+    await recordKeyChange(db, userId, deviceId, 'update', c.env);
 
     // Queue outbound m.device_list_update EDUs to federated servers
     try {
@@ -857,7 +865,7 @@ app.post('/_matrix/client/v3/keys/device_signing/upload', requireAuth(), async (
         key_id = excluded.key_id,
         key_data = excluded.key_data
     `).bind(userId, keyId, JSON.stringify(master_key)).run();
-    await recordKeyChange(db, userId, null, 'update');
+    await recordKeyChange(db, userId, null, 'update', c.env);
   }
 
   if (self_signing_key) {
@@ -977,7 +985,7 @@ app.post('/_matrix/client/v3/keys/signatures/upload', requireAuth(), async (c) =
         }
 
         // Record key change for sync notifications
-        await recordKeyChange(db, userId, signedKeyObj.device_id || null, 'update');
+        await recordKeyChange(db, userId, signedKeyObj.device_id || null, 'update', c.env);
       } catch (err) {
         console.error('[signatures/upload] Error processing signature:', err);
         if (!failures[userId]) failures[userId] = {};

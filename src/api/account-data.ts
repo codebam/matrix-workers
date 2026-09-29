@@ -17,6 +17,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { notifyUserSync } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -245,6 +246,14 @@ app.put('/_matrix/client/v3/user/:userId/account_data/:type', requireAuth(), asy
 
   // Record change for sync
   await recordAccountDataChange(db, targetUserId, '', eventType);
+
+  // Wake this user's in-flight /sync long-poll so the write is echoed back
+  // promptly. js-sdk's `setAccountData` only resolves once its write comes
+  // back over sync; without this the caller waits for the long-poll timeout.
+  // (Correctness does not depend on the wake: the next_batch snapshot fix in
+  // sync.ts guarantees the change is delivered on the next sync either way.)
+  // Best-effort like notifyUsersOfEvent — it never fails the write.
+  await notifyUserSync(c.env, targetUserId, 'account_data');
 
   return c.json({});
 });
