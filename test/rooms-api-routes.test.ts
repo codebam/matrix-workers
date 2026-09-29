@@ -1013,16 +1013,22 @@ describe('POST /rooms/:roomId/leave', () => {
     );
   });
 
-  it('repeated leave is an idempotent no-op', async () => {
+  it('repeated leave stores a fresh leave event', async () => {
     getMembership.mockResolvedValue({ membership: 'leave', eventId: '$l-old' });
+    getRoomEvents.mockResolvedValue({ events: [], end: 0 });
     const { status, body } = await request(
       `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
       jsonInit('POST', {})
     );
     expect(status).toBe(200);
     expect(body).toEqual({});
-    expect(storeEvent).not.toHaveBeenCalled();
-    expect(updateMembership).not.toHaveBeenCalled();
+    expect(storeEvent).toHaveBeenCalled();
+    const stored = storeEvent.mock.calls[0][1] as PDU;
+    expect(stored).toMatchObject({
+      type: 'm.room.member',
+      state_key: USER,
+      content: { membership: 'leave' },
+    });
   });
 
   it('forbids leave when never a member', async () => {

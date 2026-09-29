@@ -982,7 +982,7 @@ describe('leave / knock leftovers', () => {
     expect(body).toEqual({});
   });
 
-  it('leave is an idempotent no-op when already left', async () => {
+  it('repeated leave stores a fresh leave event so stragglers converge', async () => {
     getMembership.mockResolvedValue({ membership: 'leave', eventId: '$old' });
     const { status, body } = await request(
       `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
@@ -990,7 +990,7 @@ describe('leave / knock leftovers', () => {
     );
     expect(status).toBe(200);
     expect(body).toEqual({});
-    expect(storeEvent).not.toHaveBeenCalled();
+    expect(storeEvent).toHaveBeenCalled();
   });
 
   it('leave forbids ban membership', async () => {

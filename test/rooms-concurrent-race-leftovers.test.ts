@@ -606,9 +606,9 @@ describe('race membership×endpoint matrix concurrent after #190', () => {
         expect(results.every((r) => r.status === 200)).toBe(true);
         expect(storeEvent).toHaveBeenCalled();
       } else if (m === 'leave') {
-        // Idempotent: already left -> 200 without storing another event.
+        // Repeated leave mints a fresh leave event so stragglers converge.
         expect(results.every((r) => r.status === 200)).toBe(true);
-        expect(storeEvent).not.toHaveBeenCalled();
+        expect(storeEvent).toHaveBeenCalled();
       } else {
         expect(results.every((r) => r.status === 403)).toBe(true);
         expect(storeEvent).not.toHaveBeenCalled();

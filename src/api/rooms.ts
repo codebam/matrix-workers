@@ -608,16 +608,16 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  // Leaving is idempotent: a client that missed the transition (e.g. the
-  // user left from another device, or an earlier leave response was lost)
-  // must get 200 -- otherwise it wedges on the stale room and 403-loops on
-  // every room endpoint.
-  if (currentMembership.membership === 'leave') {
-    return c.json({});
-  }
-
-  // Rejecting an invite is also a leave; bans cannot be left.
-  if (currentMembership.membership !== 'join' && currentMembership.membership !== 'invite') {
+  // join / invite / leave all proceed: leaving an invite rejects it, and a
+  // REPEATED leave stores a fresh m.room.member leave event. The fresh event
+  // matters -- a client whose sync token already advanced past the original
+  // leave event (or that missed the transition entirely) can only converge
+  // when a leave newer than its token is delivered via /sync. The auth rules
+  // allow a self leave from any state, so the extra event is valid.
+  // Bans cannot be left; knocks are not memberships to leave.
+  if (currentMembership.membership !== 'join' &&
+      currentMembership.membership !== 'invite' &&
+      currentMembership.membership !== 'leave') {
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
