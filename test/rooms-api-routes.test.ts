@@ -9,7 +9,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env, PDU } from '../src/types';
-import { hashToken } from '../src/utils/crypto';
+import { hashToken, generateSigningKeyPair } from '../src/utils/crypto';
 
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => {
@@ -87,6 +87,16 @@ vi.mock('../src/utils/ids', async (importOriginal) => {
   };
 });
 
+const getServerSigningKey = vi.fn();
+
+vi.mock('../src/services/federation-keys', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/federation-keys')>();
+  return {
+    ...actual,
+    getServerSigningKey: (...args: unknown[]) => getServerSigningKey(...args),
+  };
+});
+
 import rooms from '../src/api/rooms';
 
 const USER = '@alice:example.com';
@@ -130,6 +140,7 @@ type DbOpts = {
   contextAfter?: Array<Record<string, unknown>>;
   tsEvents?: Array<{ event_id: string; origin_server_ts: number; room_id: string }>;
   lastEvent?: { event_id: string; depth: number } | null;
+  remoteJoinedUserIds?: Array<string>;
 };
 
 function createSqlDb(opts: DbOpts = {}) {
@@ -146,6 +157,7 @@ function createSqlDb(opts: DbOpts = {}) {
   const contextAfter = opts.contextAfter ?? [];
   const tsEvents = opts.tsEvents ?? [];
   const lastEvent = opts.lastEvent ?? { event_id: '$last:example.com', depth: 5 };
+  const remoteJoinedUserIds = opts.remoteJoinedUserIds ?? [];
   const inserts: SqlCall[] = [];
   const updates: SqlCall[] = [];
   const deletes: SqlCall[] = [];
@@ -295,6 +307,12 @@ function createSqlDb(opts: DbOpts = {}) {
                 return { results: contextAfter as T[] };
               }
 
+              if (sql.includes('SELECT DISTINCT user_id FROM room_memberships')) {
+                return {
+                  results: remoteJoinedUserIds.map((id) => ({ user_id: id })) as T[],
+                };
+              }
+
               return { results: [] as T[] };
             },
 
@@ -352,6 +370,53 @@ function mockKv() {
   } as unknown as KVNamespace;
 }
 
+/** Remap Cloudflare NODE-ED25519 → Node Ed25519 for unit tests. */
+function installNodeEd25519Shim() {
+  const subtle = crypto.subtle;
+  const origGenerateKey = subtle.generateKey.bind(subtle);
+  const origImportKey = subtle.importKey.bind(subtle);
+  const origSign = subtle.sign.bind(subtle);
+  const origVerify = subtle.verify.bind(subtle);
+
+  const mapAlg = (
+    alg: AlgorithmIdentifier | EcKeyGenParams | EcKeyImportParams | EcdsaParams | unknown
+  ): AlgorithmIdentifier => {
+    if (typeof alg === 'string') {
+      return alg === 'NODE-ED25519' ? 'Ed25519' : alg;
+    }
+    if (alg && typeof alg === 'object' && (alg as { name?: string }).name === 'NODE-ED25519') {
+      return 'Ed25519';
+    }
+    return alg as AlgorithmIdentifier;
+  };
+
+  subtle.generateKey = ((alg: AlgorithmIdentifier, extractable: boolean, usages: KeyUsage[]) =>
+    origGenerateKey(mapAlg(alg), extractable, usages)) as typeof subtle.generateKey;
+  subtle.importKey = ((
+    format: KeyFormat,
+    keyData: BufferSource | JsonWebKey,
+    alg: AlgorithmIdentifier,
+    extractable: boolean,
+    usages: KeyUsage[]
+  ) =>
+    origImportKey(format, keyData, mapAlg(alg), extractable, usages)) as typeof subtle.importKey;
+  subtle.sign = ((alg: AlgorithmIdentifier, key: CryptoKey, data: BufferSource) =>
+    origSign(mapAlg(alg), key, data)) as typeof subtle.sign;
+  subtle.verify = ((
+    alg: AlgorithmIdentifier,
+    key: CryptoKey,
+    signature: BufferSource,
+    data: BufferSource
+  ) => origVerify(mapAlg(alg), key, signature, data)) as typeof subtle.verify;
+
+  return () => {
+    subtle.generateKey = origGenerateKey;
+    subtle.importKey = origImportKey;
+    subtle.sign = origSign;
+    subtle.verify = origVerify;
+  };
+}
+
 function createExecCtx() {
   const waitUntilPromises: Promise<unknown>[] = [];
   return {
@@ -387,6 +452,7 @@ function envFor(
   extras: {
     workflow?: ReturnType<typeof createWorkflowStub>;
     pushWorkflow?: { create: ReturnType<typeof vi.fn> };
+    fedFetch?: ReturnType<typeof vi.fn>;
   } = {}
 ): Env {
   return {
@@ -398,6 +464,10 @@ function envFor(
     PUSH_NOTIFICATION_WORKFLOW: (extras.pushWorkflow ?? {
       create: vi.fn(async () => ({ id: 'push-1' })),
     }) as unknown as Env['PUSH_NOTIFICATION_WORKFLOW'],
+    FEDERATION: {
+      idFromName: (name: string) => name,
+      get: () => ({ fetch: extras.fedFetch ?? (async (_req: Request) => new Response('Queued')) }),
+    } as unknown as Env['FEDERATION'],
   } as unknown as Env;
 }
 
@@ -1469,6 +1539,61 @@ describe('GET members / messages / event / send', () => {
         sender: USER,
       }),
     });
+  });
+
+  it('send: with a remote joined member, derives a reference-hash id and queues a wire PDU', async () => {
+    getMembership.mockResolvedValue(joinMembership());
+    getRoomEvents.mockResolvedValue({
+      events: [pdu({ type: 'm.room.message', event_id: '$p', depth: 7 })],
+      end: 7,
+    });
+    // Cloudflare's NODE-ED25519 alias must stay shimmed for signJson too.
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({ keyId: 'ed25519:test', privateKeyJwk: kp.privateKeyJwk });
+      const fedFetch = vi.fn(async (_req: Request) => new Response('Queued'));
+      const pushCreate = vi.fn(async () => ({ id: 'p1' }));
+      const { status, body } = await request(
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.message/txn-r`,
+        jsonInit('PUT', { msgtype: 'm.text', body: 'hello remote' }),
+        createSqlDb({ remoteJoinedUserIds: ['@remote:remote.example'] }),
+        { pushWorkflow: { create: pushCreate }, fedFetch }
+      );
+      expect(status).toBe(200);
+      const eventId = (body as { event_id: string }).event_id;
+      // Local id is the derived reference hash, not the random generated id.
+      expect(eventId).not.toBe('$evt:example.com');
+      expect(eventId).toMatch(/^\$/);
+
+      // Stored under the derived id with hashes + signatures attached.
+      const stored = storeEvent.mock.calls[0][1] as PDU & {
+        hashes?: { sha256?: string };
+        signatures?: Record<string, unknown>;
+      };
+      expect(stored.event_id).toBe(eventId);
+      expect(stored.hashes?.sha256).toBeTruthy();
+
+      // Queued to the remote server's Federation DO in v4+ wire format.
+      expect(fedFetch).toHaveBeenCalledTimes(1);
+      const sentRequest = fedFetch.mock.calls[0][0] as Request;
+      const payload = JSON.parse(await sentRequest.text()) as {
+        destination: string;
+        event_id: string;
+        room_id: string;
+        pdu: Record<string, unknown>;
+      };
+      expect(payload.destination).toBe('remote.example');
+      expect(payload.event_id).toBe(eventId);
+      expect(payload.room_id).toBe(ROOM);
+      expect(payload.pdu.event_id).toBeUndefined();
+      expect((payload.pdu.hashes as { sha256?: string }).sha256).toBeTruthy();
+      const signatures = payload.pdu.signatures as Record<string, Record<string, string>>;
+      expect(signatures[SERVER]?.['ed25519:test']).toBeTruthy();
+      expect(payload.pdu.content).toEqual({ msgtype: 'm.text', body: 'hello remote' });
+    } finally {
+      restore();
+    }
   });
 
   it('send: encrypted also schedules push; other types do not', async () => {

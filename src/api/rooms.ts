@@ -1,13 +1,15 @@
 // Matrix room endpoints
 
 import { Hono } from 'hono';
-import type { AppEnv, RoomCreateContent, RoomMemberContent, PDU } from '../types';
+import type { AppEnv, Env, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias } from '../utils/ids';
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
-import { calculateContentHash } from '../utils/crypto';
+import { calculateContentHash, signJson } from '../utils/crypto';
+import { computeWireEventId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
+import { getServerSigningKey } from '../services/federation-keys';
 import {
   createRoom,
   getRoom,
@@ -1094,6 +1096,88 @@ app.get('/_matrix/client/v3/rooms/:roomId/event/:eventId', requireAuth(), async 
   });
 });
 
+// Servers (other than ours) with at least one joined member in the room --
+// the federation destinations for events created locally in this room.
+// Returns [] on any lookup failure so message sending never depends on it.
+async function getJoinedRemoteServers(db: D1Database, roomId: string, serverName: string): Promise<string[]> {
+  try {
+    const { results } = await db
+      .prepare(`SELECT DISTINCT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'`)
+      .bind(roomId)
+      .all<{ user_id: string }>();
+    const servers = new Set<string>();
+    for (const row of results || []) {
+      const server = row.user_id?.split(':')[1];
+      if (server && server !== serverName) servers.add(server);
+    }
+    return [...servers];
+  } catch (err) {
+    console.error('[rooms] getJoinedRemoteServers failed:', err);
+    return [];
+  }
+}
+
+// Prepare a locally-created event for the federation wire (v4+ event format,
+// room versions 11+): attach the content hash, derive the reference-hash
+// event ID, and sign the redacted event. Returns null when no signing key is
+// available (delivery is skipped; the event stays local-only).
+async function prepareOutboundPdu(
+  env: Env,
+  event: PDU
+): Promise<{
+  wireId: string;
+  hashes: Record<string, string>;
+  signatures: Record<string, unknown>;
+  wire: Record<string, unknown>;
+} | null> {
+  try {
+    const source = toWireEventObject(event as unknown as Record<string, unknown>);
+    const hashes = { sha256: await calculateContentHash(source) };
+    const hashed = { ...source, hashes };
+    const wireId = await computeWireEventId(hashed);
+
+    const signingKey = await getServerSigningKey(env.DB);
+    if (!signingKey) {
+      console.warn('[rooms] No signing key available; skipping federation delivery');
+      return null;
+    }
+    const signed = await signJson(
+      redactEventForSigning(hashed),
+      env.SERVER_NAME,
+      signingKey.keyId,
+      signingKey.privateKeyJwk
+    );
+    const signatures = (signed as { signatures?: Record<string, unknown> }).signatures || {};
+    return { wireId, hashes, signatures, wire: { ...hashed, signatures } };
+  } catch (err) {
+    console.error('[rooms] prepareOutboundPdu failed:', err);
+    return null;
+  }
+}
+
+// Hand a wire PDU to the per-destination Federation DO, which signs the
+// federation transaction, batches, retries with backoff, and tracks delivery.
+async function queueFederationPdu(
+  env: Env,
+  destinations: string[],
+  pdu: Record<string, unknown>,
+  eventId: string,
+  roomId: string
+): Promise<void> {
+  for (const destination of destinations) {
+    try {
+      const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(destination));
+      await fedDO.fetch(new Request('http://internal/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ destination, event_id: eventId, room_id: roomId, pdu }),
+      }));
+    } catch (err) {
+      console.error(`[rooms] Federation queueing failed for ${destination}:`, err);
+    }
+  }
+}
+
 // PUT /_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId - Send message
 app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -1140,10 +1224,32 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     prev_events: prevEvents,
   };
 
+  // If remote servers have joined members in this room, deliver over
+  // federation: adapt to the v4+ wire format (reference-hash ID, no explicit
+  // event_id, signatures over the redacted event) and store under the same
+  // derived ID so our local view matches the resident servers' view.
+  const remoteServers = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
+  let wirePdu: Record<string, unknown> | null = null;
+  if (remoteServers.length > 0) {
+    const prepared = await prepareOutboundPdu(c.env, event);
+    if (prepared) {
+      event.event_id = prepared.wireId;
+      (event as unknown as Record<string, unknown>).hashes = prepared.hashes;
+      (event as unknown as Record<string, unknown>).signatures = prepared.signatures;
+      wirePdu = prepared.wire;
+    }
+  }
+
   await storeEvent(c.env.DB, event);
 
   // Notify all room members that a new message was sent (wakes up long-polling syncs)
-  await notifyUsersOfEvent(c.env, roomId, eventId, eventType);
+  await notifyUsersOfEvent(c.env, roomId, event.event_id, eventType);
+
+  // Hand the wire PDU to the federation delivery queue (signs the
+  // transaction, batches, retries; self-catching -- never blocks the send).
+  if (wirePdu) {
+    await queueFederationPdu(c.env, remoteServers, wirePdu, event.event_id, roomId);
+  }
 
   // Send push notifications via durable workflow (fire and forget)
   // Only for message and encrypted event types
@@ -1151,7 +1257,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     c.executionCtx.waitUntil(
       c.env.PUSH_NOTIFICATION_WORKFLOW.create({
         params: {
-          eventId,
+          eventId: event.event_id,
           roomId,
           eventType,
           sender: userId,
@@ -1164,7 +1270,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     );
   }
 
-  return c.json({ event_id: eventId });
+  return c.json({ event_id: event.event_id });
 });
 
 // POST /_matrix/client/v3/rooms/:roomId/invite - Invite a user
