@@ -1946,6 +1946,60 @@ describe('invite v1/v2', () => {
       )
     ).toBe(true);
   });
+
+  it('invite v2 stores under the URL event id when the body omits event_id', async () => {
+    const db = createFedDb({
+      users: [{ user_id: LOCAL_USER }],
+      serverKeys: [
+        {
+          key_id: serverKeyPair.keyId,
+          public_key: serverKeyPair.publicKey,
+          private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+          key_version: 2,
+          valid_from: 1,
+          valid_until: Date.now() + 100000,
+          is_current: 1,
+        },
+      ],
+    });
+    const env = makeEnv(db);
+    const remoteRoom = '!dm-noid:remote.example.com';
+    const { status } = await req(
+      'PUT',
+      `/_matrix/federation/v2/invite/${encodeURIComponent(remoteRoom)}/%24url-id-only`,
+      env,
+      {
+        room_version: '10',
+        event: {
+          // No event_id: remote servers may omit it from the body; the URL
+          // path carries the authoritative copy.
+          room_id: remoteRoom,
+          sender: REMOTE_USER,
+          type: 'm.room.member',
+          state_key: LOCAL_USER,
+          content: { membership: 'invite' },
+        },
+        invite_room_state: [
+          {
+            type: 'm.room.create',
+            state_key: '',
+            content: { room_version: '10' },
+            sender: REMOTE_USER,
+          },
+        ],
+      }
+    );
+    expect(status).toBe(200);
+    expect(db.events.has('$url-id-only')).toBe(true);
+    expect(
+      db.inserts.some(
+        (i) =>
+          i.sql.includes('room_memberships') &&
+          i.args[0] === remoteRoom &&
+          i.args[3] === '$url-id-only'
+      )
+    ).toBe(true);
+  });
 });
 
 describe('query/directory and query/profile', () => {
