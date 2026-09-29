@@ -8,6 +8,7 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
+import { deleteDeviceKeysFromDO } from './keys';
 
 const app = new Hono<AppEnv>();
 
@@ -159,9 +160,9 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?
   `).bind(userId, deviceId).run();
 
-  await db.prepare(`
-    DELETE FROM device_keys WHERE user_id = ? AND device_id = ?
-  `).bind(userId, deviceId).run();
+  // Device keys live in the UserKeys DO (there is no D1 device_keys table);
+  // remove them there so /keys/query stops returning a deleted device.
+  await deleteDeviceKeysFromDO(c.env, userId, deviceId);
 
   await db.prepare(`
     DELETE FROM devices WHERE user_id = ? AND device_id = ?
@@ -218,9 +219,8 @@ app.post('/_matrix/client/v3/delete_devices', requireAuth(), async (c) => {
       DELETE FROM access_tokens WHERE user_id = ? AND device_id = ?
     `).bind(userId, deviceId).run();
 
-    await db.prepare(`
-      DELETE FROM device_keys WHERE user_id = ? AND device_id = ?
-    `).bind(userId, deviceId).run();
+    // Device keys live in the UserKeys DO (no D1 device_keys table).
+    await deleteDeviceKeysFromDO(c.env, userId, deviceId);
 
     await db.prepare(`
       DELETE FROM devices WHERE user_id = ? AND device_id = ?

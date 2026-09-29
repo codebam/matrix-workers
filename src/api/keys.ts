@@ -124,9 +124,13 @@ export async function recordKeyChange(db: D1Database, userId: string, deviceId: 
   `).bind(userId, deviceId, changeType, streamPosition).run();
 }
 
-// Remove a device's keys from the Durable Object. Used when a dehydrated
-// device is replaced or deleted so /keys/query stops returning it.
+// Remove a device's keys from the Durable Object. Used when a device is
+// replaced or deleted so /keys/query stops returning it.
 export async function deleteDeviceKeysFromDO(env: Env, userId: string, deviceId: string): Promise<void> {
+  // Minimal environments (e.g. focused route-test doubles) may not carry the
+  // binding. Key cleanup is best-effort: it must never fail device deletion.
+  if (!env.USER_KEYS) return;
+
   const stub = getUserKeysDO(env, userId);
   const response = await stub.fetch(new Request('http://internal/device-keys/delete', {
     method: 'POST',
