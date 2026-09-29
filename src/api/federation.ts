@@ -132,8 +132,14 @@ app.get('/_matrix/key/v2/server', async (c) => {
     };
   }
 
+  // Publish only keys we can actually sign with. Legacy v1 placeholder rows and
+  // duplicates from a concurrent first-request generation can linger as
+  // is_current = 1; advertising them without a matching signature fails strict
+  // consumers like the Matrix Federation Tester (AllEd25519ChecksOK).
+  const signableKeys = keys.results.filter((k) => k.key_version === 2 && k.private_key_jwk);
+
   const verifyKeys: Record<string, { key: string }> = {};
-  for (const key of keys.results) {
+  for (const key of signableKeys) {
     verifyKeys[key.key_id] = { key: key.public_key };
   }
 
@@ -146,19 +152,15 @@ app.get('/_matrix/key/v2/server', async (c) => {
     old_verify_keys: {},
   };
 
-  // Sign the response with the secure key
-  const currentKey = keys.results.find((k) => k.key_version === 2 && k.private_key_jwk);
-  if (currentKey && currentKey.private_key_jwk) {
-    const signed = await signJson(
-      response,
-      serverName,
-      currentKey.key_id,
-      JSON.parse(currentKey.private_key_jwk)
-    );
-    return c.json(signed);
+  // Sign with every published key: signJson merges signatures, so each
+  // verify_key above gets a matching entry under `signatures`.
+  let signed: Record<string, unknown> = response;
+  for (const key of signableKeys) {
+    if (!key.private_key_jwk) continue;
+    signed = await signJson(signed, serverName, key.key_id, JSON.parse(key.private_key_jwk));
   }
 
-  return c.json(response);
+  return c.json(signed);
 });
 
 // GET /_matrix/key/v2/server/:keyId - Get specific key
