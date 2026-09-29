@@ -1830,12 +1830,20 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
 async function storeInboundInvite(
   env: Env,
   inviteEvent: any,
-  inviteRoomState: any[] | undefined
+  inviteRoomState: any[] | undefined,
+  inviteEventIdFromUrl: string
 ): Promise<void> {
   try {
     const roomId: string = inviteEvent?.room_id;
     const invitee: string = inviteEvent?.state_key;
-    if (!roomId || !invitee) return;
+    const sender: string = typeof inviteEvent?.sender === 'string' ? inviteEvent.sender : '';
+    // Remote servers may omit event_id from the signed event body (the URL
+    // path carries the authoritative copy; the handler compares when present).
+    const inviteEventId: string =
+      typeof inviteEvent?.event_id === 'string' && inviteEvent.event_id
+        ? inviteEvent.event_id
+        : inviteEventIdFromUrl;
+    if (!roomId || !invitee || !sender || !inviteEventId) return;
 
     // Room version: prefer the create event's, else default to v10.
     const createEv = (inviteRoomState ?? []).find((ev: any) => ev?.type === 'm.room.create');
@@ -1844,7 +1852,7 @@ async function storeInboundInvite(
 
     const existing = await getRoom(env.DB, roomId);
     if (!existing) {
-      await createRoom(env.DB, roomId, roomVersion, inviteEvent.sender);
+      await createRoom(env.DB, roomId, roomVersion, sender);
     }
 
     // Store the stripped invite_room_state so the room renders with its
@@ -1859,7 +1867,7 @@ async function storeInboundInvite(
       await storeEventIdempotent(env.DB, {
         event_id: syntheticId,
         room_id: roomId,
-        sender: typeof ev.sender === 'string' ? ev.sender : inviteEvent.sender,
+        sender: typeof ev.sender === 'string' ? ev.sender : sender,
         type: ev.type,
         state_key: stateKey,
         content,
@@ -1874,10 +1882,10 @@ async function storeInboundInvite(
     // Store the invite event itself and the invitee's membership row --
     // this is what makes the room appear in the user's /sync as an invite.
     await storeEventIdempotent(env.DB, {
-      event_id: inviteEvent.event_id,
+      event_id: inviteEventId,
       room_id: roomId,
-      sender: inviteEvent.sender,
-      type: inviteEvent.type,
+      sender,
+      type: typeof inviteEvent.type === 'string' ? inviteEvent.type : 'm.room.member',
       state_key: invitee,
       content: inviteEvent.content ?? {},
       origin_server_ts:
@@ -1889,7 +1897,7 @@ async function storeInboundInvite(
       signatures: inviteEvent.signatures,
     });
 
-    await updateMembership(env.DB, roomId, invitee, 'invite', inviteEvent.event_id);
+    await updateMembership(env.DB, roomId, invitee, 'invite', inviteEventId);
 
     // Wake the invitee's long-polling sync so the invite appears immediately.
     await notifyUserSync(env, invitee, 'events');
@@ -1975,7 +1983,7 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
   }
 
   // Persist the invite locally so the invited user sees it in /sync.
-  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state);
+  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state, eventId);
 
   // Sign the invite event and return it
   // Get our signing key
@@ -2095,7 +2103,7 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
   }
 
   // Persist the invite locally so the invited user sees it in /sync.
-  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state);
+  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state, eventId);
 
   // Sign the invite event and return it
   const key = await c.env.DB.prepare(
