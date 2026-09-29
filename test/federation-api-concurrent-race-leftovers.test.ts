@@ -106,6 +106,7 @@ vi.mock('../src/utils/crypto', async (importOriginal) => {
 
 import federation from '../src/api/federation';
 import { generateSigningKeyPair } from '../src/utils/crypto';
+import { computeWireEventId } from '../src/utils/event-signing';
 
 type SelectBarrier = { match: (sql: string, args: unknown[]) => boolean; count: number };
 type KvBarrier = { match: (key: string) => boolean; count: number };
@@ -2321,7 +2322,15 @@ describe('race residual send hash∥prev-rejected after #252', () => {
       rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
     });
     const env = makeEnv(db);
-    verifyRemoteSignature.mockResolvedValueOnce(false).mockResolvedValue(true);
+    // v4+ verification checks the redacted form first; the redacted object
+    // keeps `signatures`, so distinguish verdicts by the signature value.
+    verifyRemoteSignature.mockImplementation((obj: Record<string, unknown>) =>
+      Promise.resolve(
+        (obj.signatures as Record<string, Record<string, string>> | undefined)?.[FED_ORIGIN]?.[
+          'ed25519:1'
+        ] === 'sig'
+      )
+    );
     verifyContentHash.mockResolvedValue(true);
     checkEventAuth.mockImplementation(() => {
       throw new Error('auth-race');
@@ -2948,6 +2957,8 @@ describe('race second-wave legacy∥hash-v10 / custom-reject∥auth-fallback aft
         ],
       });
       const env = makeEnv(db);
+      const unsignedPdu = { room_id: ROOM, type: 'm.room.message', content: { body: 'x' } };
+      const derivedId = await computeWireEventId(unsignedPdu);
       const results = await Promise.all([
         req('PUT', `/_matrix/federation/v1/send/txn-sw-l-${i}`, env, {
           pdus: [
@@ -2962,13 +2973,13 @@ describe('race second-wave legacy∥hash-v10 / custom-reject∥auth-fallback aft
           ],
         }),
         req('PUT', `/_matrix/federation/v1/send/txn-sw-u-${i}`, env, {
-          pdus: [{ room_id: ROOM, type: 'm.room.message', content: { body: 'x' } }],
+          pdus: [unsignedPdu],
         }),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
-      expect((results[1].body as { pdus: Record<string, { error: string }> }).pdus.unknown.error).toBe(
-        'Invalid PDU structure'
-      );
+      expect(
+        (results[1].body as { pdus: Record<string, { error: string }> }).pdus[derivedId].error
+      ).toBe('Invalid PDU structure');
     });
   }
 });

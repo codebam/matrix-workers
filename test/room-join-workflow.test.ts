@@ -52,6 +52,21 @@ vi.mock('../src/utils/crypto', () => ({
   signJson: (...args: unknown[]) => signJson(...args),
 }));
 
+const computeWireEventId = vi.fn(async (..._args: unknown[]) => '$wire:reference-hash' as string);
+const redactEventForSigning = vi.fn((e: Record<string, unknown>) => e);
+const toWireEventObject = vi.fn((e: Record<string, unknown>) => {
+  const wire = { ...e };
+  delete wire['event_id'];
+  return wire;
+});
+vi.mock('../src/utils/event-signing', () => ({
+  computeWireEventId: (...args: unknown[]) => computeWireEventId(...args),
+  redactEventForSigning: (...args: unknown[]) =>
+    redactEventForSigning(...(args as [Record<string, unknown>])),
+  toWireEventObject: (...args: unknown[]) =>
+    toWireEventObject(...(args as [Record<string, unknown>])),
+}));
+
 vi.mock('../src/utils/ids', () => ({
   generateEventId: (...args: unknown[]) => generateEventId(...args),
 }));
@@ -372,6 +387,91 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
       '$st1:remote.example',
       '$generated:example.com',
     ]);
+  });
+
+  it('modern room (v12) join uses v4+ wire format: no event_id, reference-hash id, derived remote state ids', async () => {
+    const template = { ...validRemoteTemplate(), room_version: '12' };
+    federationGet.mockResolvedValue(new Response(JSON.stringify(template), { status: 200 }));
+    federationPut.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          origin: 'remote.example',
+          auth_chain: [
+            {
+              // v4+ wire events omit event_id and the create event also omits room_id.
+              type: 'm.room.create',
+              sender: '@r:remote.example',
+              state_key: '',
+              content: { room_version: '12' },
+              origin_server_ts: 1,
+              depth: 1,
+              auth_events: [],
+              prev_events: [],
+              hashes: { sha256: 'remote-hash' },
+              signatures: { 'remote.example': { 'ed25519:1': 'rsig' } },
+            },
+          ],
+          state: [
+            {
+              type: 'm.room.power_levels',
+              sender: '@r:remote.example',
+              state_key: '',
+              content: { users: {} },
+              origin_server_ts: 2,
+              depth: 3,
+              auth_events: [],
+              prev_events: [],
+              hashes: { sha256: 'remote-hash2' },
+              signatures: { 'remote.example': { 'ed25519:1': 'rsig' } },
+            },
+          ],
+        }),
+        { status: 200 }
+      )
+    );
+
+    const env = createSyncEnv();
+    const step = mockStep();
+    const wf = new RoomJoinWorkflow({} as any, env as any);
+    const result = await wf.run(
+      {
+        payload: {
+          roomId: ROOM,
+          userId: USER,
+          isRemote: true,
+          remoteServer: 'remote.example',
+        },
+      } as any,
+      step as any
+    );
+
+    expect(result.success).toBe(true);
+
+    // The join event's local id is the reference hash, not a random id.
+    const stored = storeEvent.mock.calls[0][1];
+    expect(stored.event_id).toBe('$wire:reference-hash');
+    expect(stored.event_id).not.toBe('$generated:example.com');
+    expect((stored as { hashes: unknown }).hashes).toEqual({ sha256: 'content-hash' });
+
+    // The wire body must not include event_id, and the send_join URL carries
+    // the derived reference-hash id.
+    const putBody = federationPut.mock.calls[0][2] as Record<string, unknown>;
+    expect('event_id' in putBody).toBe(false);
+    expect(putBody.hashes).toEqual({ sha256: 'content-hash' });
+    const putPath = federationPut.mock.calls[0][1] as string;
+    expect(putPath).toContain(encodeURIComponent(stored.event_id));
+
+    // Remote state events without event_id get derived reference-hash ids,
+    // and the create event gets its room_id derived from the id.
+    const idempotentCalls = storeEventIdempotent.mock.calls;
+    expect(idempotentCalls).toHaveLength(2);
+    for (const call of idempotentCalls) {
+      expect((call[1] as { event_id: string }).event_id).toBe('$wire:reference-hash');
+    }
+    const createStored = idempotentCalls.find(
+      (c) => (c[1] as { type: string }).type === 'm.room.create'
+    )![1] as { room_id: string };
+    expect(createStored.room_id).toBe('!wire:reference-hash');
   });
 
   it('remote template with missing auth/prev/depth falls back to [] / [] / 1', async () => {

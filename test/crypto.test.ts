@@ -2134,7 +2134,7 @@ describe('crypto TOKENMAXX residual nonary leftovers after #336', () => {
     expect(hash).toMatch(/^\$pbkdf2-sha256\$100000\$/);
   });
 
-  it('calculateContentHash keeps hashes field (not stripped) under race with signatures/unsigned', async () => {
+  it('calculateContentHash strips hashes/signatures/unsigned under race', async () => {
     const withHashes = {
       type: 'm.test',
       content: { body: 'x' },
@@ -2156,13 +2156,13 @@ describe('crypto TOKENMAXX residual nonary leftovers after #336', () => {
       verifyContentHash(withHashes, expected),
       verifyContentHash(withoutHashes, expected),
     ]);
-    // signatures/unsigned stripped → same as hashes-only body
+    // signatures/unsigned/hashes are all stripped → all three bodies hash the
+    // same (per spec, `hashes` is excluded from the content hash).
     expect(hKeep).toBe(hStrip);
     expect(hKeep).toBe(expected);
-    // hashes is hashed (not stripped) → differs from bare body
-    expect(hKeep).not.toBe(hBare);
+    expect(hKeep).toBe(hBare);
     expect(vKeep).toBe(true);
-    expect(vBare).toBe(false);
+    expect(vBare).toBe(true);
   });
 
   for (let i = 0; i < 6; i++) {

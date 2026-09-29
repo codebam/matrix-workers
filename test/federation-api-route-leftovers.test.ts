@@ -111,6 +111,7 @@ vi.mock('../src/utils/crypto', async (importOriginal) => {
 
 import federation from '../src/api/federation';
 import { generateSigningKeyPair } from '../src/utils/crypto';
+import { computeWireEventId } from '../src/utils/event-signing';
 
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
@@ -3791,16 +3792,18 @@ describe('soft second-wave send custom-reject / hash-v11 / auth-fallback / unkno
   }
 
   for (let i = 0; i < 10; i++) {
-    it(`invalid PDU no event_id → pdus.unknown soft-${i}`, async () => {
+    it(`invalid PDU no event_id → derived reference-hash key soft-${i}`, async () => {
       const db = createFedDb({
         rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
       });
+      const pdu = { room_id: ROOM, type: 'm.room.message', content: { body: 'x' } };
+      const derivedId = await computeWireEventId(pdu);
       const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-unknown-${i}`, makeEnv(db), {
-        pdus: [{ room_id: ROOM, type: 'm.room.message', content: { body: 'x' } }],
+        pdus: [pdu],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus.unknown.error).toBe(
-        'Invalid PDU structure'
-      );
+      expect(
+        (body as { pdus: Record<string, { error: string }> }).pdus[derivedId].error
+      ).toBe('Invalid PDU structure');
     });
   }
 });

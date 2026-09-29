@@ -100,6 +100,13 @@ export async function sha256(data: string | Uint8Array): Promise<string> {
     .replace(/=/g, '');
 }
 
+// Standard (non-URL-safe) unpadded base64 encoding, as used by Matrix for
+// signatures and content hashes (`hashes.sha256`). The URL-safe variant
+// above is used for tokens and event IDs.
+export function encodeUnpaddedBase64(bytes: Uint8Array): string {
+  return btoa(String.fromCharCode(...bytes)).replace(/=/g, '');
+}
+
 // Hash an access token for storage
 export async function hashToken(token: string): Promise<string> {
   return sha256(token);
@@ -204,7 +211,7 @@ export async function signJson(
   );
 
   // Encode signature as unpadded base64
-  const signatureB64 = base64UrlEncode(new Uint8Array(signatureBytes));
+  const signatureB64 = encodeUnpaddedBase64(new Uint8Array(signatureBytes));
 
   // Merge with existing signatures if present
   const existingSignatures = (obj.signatures as Record<string, Record<string, string>>) || {};
@@ -305,13 +312,18 @@ export function canonicalJson(obj: unknown): string {
 
 // Calculate content hash for PDU
 export async function calculateContentHash(content: Record<string, unknown>): Promise<string> {
-  // Remove signatures and unsigned before hashing
+  // Per the spec, the content hash is calculated over the event with
+  // `unsigned`, `signatures` and `hashes` removed, encoded as canonical
+  // JSON, hashed with SHA-256, and finally encoded using unpadded base64
+  // (standard alphabet, not URL-safe).
   const toHash = { ...content };
   delete toHash['signatures'];
   delete toHash['unsigned'];
+  delete toHash['hashes'];
 
   const canonical = canonicalJson(toHash);
-  return sha256(canonical);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical));
+  return encodeUnpaddedBase64(new Uint8Array(digest));
 }
 
 // Verify content hash

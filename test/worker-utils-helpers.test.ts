@@ -942,7 +942,8 @@ describe('crypto canonicalJson / content-hash extras after #75', () => {
 
   it('empty object content hash is stable', async () => {
     const h = await calculateContentHash({});
-    expect(h).toMatch(/^[A-Za-z0-9_-]+$/);
+    // Content hashes use standard (non-URL-safe) unpadded base64.
+    expect(h).toMatch(/^[A-Za-z0-9+/]+$/);
     expect(await verifyContentHash({}, h)).toBe(true);
   });
 });

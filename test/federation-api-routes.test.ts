@@ -62,7 +62,8 @@ import federation, {
   isModernRoomVersion,
   isValidServerName,
 } from '../src/api/federation';
-import { generateSigningKeyPair } from '../src/utils/crypto';
+import { generateSigningKeyPair, calculateContentHash } from '../src/utils/crypto';
+import { computeWireEventId } from '../src/utils/event-signing';
 
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
@@ -1203,6 +1204,34 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
     expect((body as { pdus: Record<string, { error: string }> }).pdus['$authfail'].error).toMatch(
       /power levels|authorization/i
     );
+  });
+
+  it('derives reference-hash event ids for modern PDUs that omit event_id', async () => {
+    const db = seedBasicRoom();
+    const pduBase = {
+      room_id: ROOM,
+      sender: REMOTE_USER,
+      type: 'm.room.message',
+      content: { body: 'hello from v12', msgtype: 'm.text' },
+      origin_server_ts: 1700000000000,
+      depth: 9,
+      auth_events: ['$create:example.com'],
+      prev_events: ['$prev:example.com'],
+    };
+    const pdu = { ...pduBase, hashes: { sha256: await calculateContentHash(pduBase) } };
+    const derivedId = await computeWireEventId(pdu);
+
+    const { status, body } = await req(
+      'PUT',
+      '/_matrix/federation/v1/send/txn-v12-noid',
+      makeEnv(db),
+      { pdus: [pdu] }
+    );
+
+    expect(status).toBe(200);
+    const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
+    expect(Object.keys(pdus)).toEqual([derivedId]);
+    expect(pdus[derivedId].error).toBeUndefined();
   });
 
   it('accepts valid legacy PDU without hash when auth allows', async () => {

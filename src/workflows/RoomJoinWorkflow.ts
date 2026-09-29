@@ -11,6 +11,11 @@ import type { Env } from '../types';
 import { generateEventId } from '../utils/ids';
 import { calculateContentHash, signJson } from '../utils/crypto';
 import {
+  computeWireEventId,
+  redactEventForSigning,
+  toWireEventObject,
+} from '../utils/event-signing';
+import {
   storeEvent,
   storeEventIdempotent,
   updateMembership,
@@ -131,8 +136,29 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
             ...(sendJoinResponse?.event ? [sendJoinResponse.event] : []),
           ];
           for (const ev of remoteEvents) {
-            if (!ev || typeof ev !== 'object' || !ev.event_id || !ev.type) continue;
-            await storeEventIdempotent(this.env.DB, ev);
+            if (!ev || typeof ev !== 'object' || !ev.type) continue;
+            try {
+              const normalized: Record<string, unknown> = { ...ev };
+              if (typeof ev.event_id !== 'string' || !ev.event_id) {
+                // v4+ events omit event_id on the wire; derive the reference
+                // hash the same way the resident server did.
+                normalized.event_id = await computeWireEventId(ev as Record<string, unknown>);
+              }
+              if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
+                // v4+ create events also omit room_id; it is the event ID
+                // with the sigil swapped.
+                normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
+              }
+              await storeEventIdempotent(
+                this.env.DB,
+                normalized as unknown as Parameters<typeof storeEventIdempotent>[1]
+              );
+            } catch (storeErr) {
+              // Never let one malformed remote event abort the whole join.
+              console.warn('[RoomJoinWorkflow] Skipping remote state event', {
+                error: storeErr instanceof Error ? storeErr.message : 'Unknown error',
+              });
+            }
           }
         });
       }
@@ -260,8 +286,12 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       memberContent.reason = reason;
     }
 
-    const event: SerializableEvent = {
-      event_id: eventId,
+    const signingKey = await getServerSigningKey(this.env.DB);
+    if (!signingKey) {
+      throw new Error('Server signing key not configured');
+    }
+
+    const baseEvent = {
       room_id: roomId,
       sender: userId,
       type: 'm.room.member',
@@ -273,20 +303,48 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       prev_events: prevEvents,
     };
 
-    // Attach a content hash and sign the event with our server key: remote
-    // resident servers reject unsigned events (M_BAD_JSON) on send_join, and
-    // the signature must cover the event including its hashes.
+    // Room versions using the v4+ event format (11 and up) do not carry an
+    // `event_id` on the wire — the resident server derives it as the
+    // reference hash — and signatures cover the redacted event, not the
+    // full one. Sending an explicit event_id gets the whole join rejected
+    // with "Invalid event JSON". Earlier room versions keep the legacy
+    // shape.
+    const wireFormat =
+      !!remoteEventTemplate?.event &&
+      parseInt(remoteEventTemplate.room_version, 10) >= 11;
+
+    if (wireFormat) {
+      const hashed = {
+        ...baseEvent,
+        hashes: {
+          sha256: await calculateContentHash(baseEvent as unknown as Record<string, unknown>),
+        },
+      };
+      const eventId = await computeWireEventId(hashed as unknown as Record<string, unknown>);
+      const signed = await signJson(
+        redactEventForSigning(hashed as unknown as Record<string, unknown>),
+        this.env.SERVER_NAME,
+        signingKey.keyId,
+        signingKey.privateKeyJwk
+      );
+      return {
+        ...hashed,
+        event_id: eventId,
+        signatures: (signed as Record<string, unknown>).signatures,
+      } as unknown as SerializableEvent;
+    }
+
+    const event: SerializableEvent = {
+      event_id: eventId,
+      ...baseEvent,
+    } as SerializableEvent;
+
     const hashed = {
       ...event,
       hashes: {
         sha256: await calculateContentHash(event as unknown as Record<string, unknown>),
       },
     } as SerializableEvent;
-
-    const signingKey = await getServerSigningKey(this.env.DB);
-    if (!signingKey) {
-      throw new Error('Server signing key not configured');
-    }
 
     return (await signJson(
       hashed as unknown as Record<string, unknown>,
@@ -309,7 +367,9 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     const response = await federationPut(
       remoteServer,
       path,
-      joinEvent,
+      // v4+ events must not carry event_id on the wire; the resident server
+      // derives the reference hash itself.
+      toWireEventObject(joinEvent as unknown as Record<string, unknown>),
       this.env.SERVER_NAME,
       this.env.DB,
       this.env.CACHE

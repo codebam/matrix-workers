@@ -4,6 +4,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
+import { computeWireEventId, redactEventForSigning } from '../utils/event-signing';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import {
   getRemoteKeysWithNotarySignature,
@@ -538,7 +539,14 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   // Process incoming PDUs (Persistent Data Units - events)
   for (const pdu of pdus || []) {
     try {
-      const eventId = pdu.event_id;
+      // v4+ wire events (room versions 11 and up) omit `event_id`; the
+      // receiving server derives it as the event's reference hash. Derive
+      // it once here so everything downstream (processed_pdus, storage,
+      // sync) uses the same ID the sender's server uses.
+      const eventId =
+        typeof pdu.event_id === 'string' && pdu.event_id
+          ? pdu.event_id
+          : await computeWireEventId(pdu as Record<string, unknown>);
       const roomId = pdu.room_id;
 
       // Check if we've already processed this PDU
@@ -582,13 +590,24 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           const keyIds = Object.keys(pdu.signatures[signatory]);
           for (const keyId of keyIds) {
             try {
-              const isValid = await verifyRemoteSignature(
-                pdu,
-                signatory,
-                keyId,
-                c.env.DB,
-                c.env.CACHE
-              );
+              // v4+ signatures cover the *redacted* event, so verify that
+              // form first; fall back to the legacy full-event form for
+              // older room versions.
+              const isValid =
+                (await verifyRemoteSignature(
+                  redactEventForSigning(pdu as Record<string, unknown>),
+                  signatory,
+                  keyId,
+                  c.env.DB,
+                  c.env.CACHE
+                )) ||
+                (await verifyRemoteSignature(
+                  pdu,
+                  signatory,
+                  keyId,
+                  c.env.DB,
+                  c.env.CACHE
+                ));
               if (isValid) {
                 signatureValid = true;
                 break;
