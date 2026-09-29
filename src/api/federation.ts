@@ -1,7 +1,7 @@
 // Matrix Server-Server (Federation) API endpoints
 
 import { Hono } from 'hono';
-import type { AppEnv, PDU } from '../types';
+import type { AppEnv, Env, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
 import { requireFederationAuth } from '../middleware/federation-auth';
@@ -12,7 +12,8 @@ import {
 } from '../services/federation-keys';
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
-import { getRoomState } from '../services/database';
+import { getRoom, getRoomState, createRoom, storeEventIdempotent, updateMembership, notifyUserSync } from '../services/database';
+import { deliverInboundToDevice } from './to-device';
 import { resolveState } from '../services/state-resolution';
 
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
@@ -901,7 +902,14 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           break;
 
         case 'm.direct_to_device':
-          // Handle to-device messages
+          // Deliver federated to-device messages (Olm/Megolm key exchange,
+          // encrypted payloads) to the target users' local devices.
+          {
+            const delivered = await deliverInboundToDevice(c.env, content);
+            if (delivered > 0) {
+              console.log('[federation] Delivered', delivered, 'to-device messages from EDU');
+            }
+          }
           break;
 
         case 'm.signing_key_update':
@@ -1809,6 +1817,87 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
   return c.json({});
 });
 
+// Persist an invite received from a remote server so the invited local user
+// actually sees it in /sync. The remote side is told "success" as soon as we
+// return the signed event, so failures here are logged rather than
+// propagated -- a storage hiccup must not break the remote room's invite
+// flow (which would fail the whole DM creation upstream).
+//
+// Stripped state events from `invite_room_state` carry no event_id, so
+// deterministic synthetic ids are derived from their content; re-invites
+// overwrite cleanly (rooms are only created if missing, state events use
+// idempotent inserts, membership rows are replaced).
+async function storeInboundInvite(
+  env: Env,
+  inviteEvent: any,
+  inviteRoomState: any[] | undefined
+): Promise<void> {
+  try {
+    const roomId: string = inviteEvent?.room_id;
+    const invitee: string = inviteEvent?.state_key;
+    if (!roomId || !invitee) return;
+
+    // Room version: prefer the create event's, else default to v10.
+    const createEv = (inviteRoomState ?? []).find((ev: any) => ev?.type === 'm.room.create');
+    const roomVersion: string =
+      typeof createEv?.content?.room_version === 'string' ? createEv.content.room_version : '10';
+
+    const existing = await getRoom(env.DB, roomId);
+    if (!existing) {
+      await createRoom(env.DB, roomId, roomVersion, inviteEvent.sender);
+    }
+
+    // Store the stripped invite_room_state so the room renders with its
+    // name/topic/avatar/join_rules for the invited user.
+    for (const ev of inviteRoomState ?? []) {
+      if (!ev || typeof ev !== 'object' || typeof ev.type !== 'string') continue;
+      const stateKey = typeof ev.state_key === 'string' ? ev.state_key : '';
+      const content = ev.content ?? {};
+      const syntheticId =
+        '$invite_state_' +
+        (await sha256(`${roomId}|${ev.type}|${stateKey}|${JSON.stringify(content)}`)).slice(0, 32);
+      await storeEventIdempotent(env.DB, {
+        event_id: syntheticId,
+        room_id: roomId,
+        sender: typeof ev.sender === 'string' ? ev.sender : inviteEvent.sender,
+        type: ev.type,
+        state_key: stateKey,
+        content,
+        origin_server_ts:
+          typeof ev.origin_server_ts === 'number' ? ev.origin_server_ts : Date.now(),
+        depth: 0,
+        auth_events: [],
+        prev_events: [],
+      });
+    }
+
+    // Store the invite event itself and the invitee's membership row --
+    // this is what makes the room appear in the user's /sync as an invite.
+    await storeEventIdempotent(env.DB, {
+      event_id: inviteEvent.event_id,
+      room_id: roomId,
+      sender: inviteEvent.sender,
+      type: inviteEvent.type,
+      state_key: invitee,
+      content: inviteEvent.content ?? {},
+      origin_server_ts:
+        typeof inviteEvent.origin_server_ts === 'number' ? inviteEvent.origin_server_ts : Date.now(),
+      depth: typeof inviteEvent.depth === 'number' ? inviteEvent.depth : 0,
+      auth_events: Array.isArray(inviteEvent.auth_events) ? inviteEvent.auth_events : [],
+      prev_events: Array.isArray(inviteEvent.prev_events) ? inviteEvent.prev_events : [],
+      hashes: inviteEvent.hashes,
+      signatures: inviteEvent.signatures,
+    });
+
+    await updateMembership(env.DB, roomId, invitee, 'invite', inviteEvent.event_id);
+
+    // Wake the invitee's long-polling sync so the invite appears immediately.
+    await notifyUserSync(env, invitee, 'events');
+  } catch (error) {
+    console.error('[federation] Failed to store inbound invite:', error);
+  }
+}
+
 // PUT /_matrix/federation/v1/invite/:roomId/:eventId - Receive invite (v1)
 // Used when a remote server invites a local user to a room
 app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
@@ -1884,6 +1973,9 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
       404
     );
   }
+
+  // Persist the invite locally so the invited user sees it in /sync.
+  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state);
 
   // Sign the invite event and return it
   // Get our signing key
@@ -2001,6 +2093,9 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
       404
     );
   }
+
+  // Persist the invite locally so the invited user sees it in /sync.
+  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state);
 
   // Sign the invite event and return it
   const key = await c.env.DB.prepare(
