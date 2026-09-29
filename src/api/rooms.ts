@@ -113,6 +113,11 @@ async function createInitialRoomEvents(
     membership?: { userId: string; state: 'join' | 'invite' };
   }
 
+  // In the v4 event format (room versions 11+) the create event is implicit
+  // in every event's auth chain and MUST NOT be listed in auth_events.
+  const roomVersionNum = parseInt(roomVersion, 10);
+  const createIsImplicit = Number.isFinite(roomVersionNum) && roomVersionNum >= 11;
+
   const planned: PlannedEvent[] = [];
   const authEvents: string[] = [];
   const prevEvents: string[] = [];
@@ -145,7 +150,9 @@ async function createInitialRoomEvents(
 
     planned.push({ pdu, membership });
 
-    if (stateKey !== undefined) authEvents.push(eventId);
+    if (stateKey !== undefined && !(type === 'm.room.create' && createIsImplicit)) {
+      authEvents.push(eventId);
+    }
     prevEvents.length = 0;
     prevEvents.push(eventId);
     return eventId;
@@ -430,6 +437,17 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
 
   // Notify the creator's sync that the room was created
   await notifyUsersOfEvent(c.env, roomId, roomId, 'm.room.create');
+
+  // Federate invites for remote invitees so their servers learn about the
+  // room (the Federation DO owns delivery and retries).
+  if (invite) {
+    for (const invitee of invite) {
+      const inviteeDomain = String(invitee).split(':').slice(1).join(':');
+      if (!inviteeDomain || inviteeDomain === c.env.SERVER_NAME) continue;
+      const inviteEvent = await getStateEvent(c.env.DB, roomId, 'm.room.member', invitee);
+      if (inviteEvent) await federateInvite(c.env, roomId, inviteEvent);
+    }
+  }
 
   return c.json({
     room_id: roomId,
@@ -1194,6 +1212,93 @@ async function queueFederationPdu(
   }
 }
 
+// The state a receiving server needs to render an invite for its user
+// (Matrix prejoin state). The m.room.create event is mandatory and enforced
+// for room versions 12+ (MSC4311); the inviter's member event is included so
+// the invitee can display their profile (MSC4319).
+const INVITE_ROOM_STATE_TYPES: Array<[string, string]> = [
+  ['m.room.create', ''],
+  ['m.room.join_rules', ''],
+  ['m.room.name', ''],
+  ['m.room.topic', ''],
+  ['m.room.avatar', ''],
+  ['m.room.canonical_alias', ''],
+  ['m.room.encryption', ''],
+];
+
+// Deliver an invite for a remote user through the federation invite endpoint.
+// The invitee's server is not in the room yet, so the invite cannot travel in
+// a /send transaction: receiving servers validate every invite_room_state
+// entry as a full PDU (parse + hash + signature checks for room versions
+// 12+) and reject the request when m.room.create is missing. Each entry is
+// therefore prepared for the wire exactly like an outbound PDU.
+async function federateInvite(env: Env, roomId: string, inviteEvent: PDU): Promise<boolean> {
+  try {
+    const invitee = inviteEvent.state_key ?? '';
+    const domain = invitee.split(':').slice(1).join(':');
+    if (!domain || domain === env.SERVER_NAME) return false;
+
+    const room = await getRoom(env.DB, roomId);
+    const roomVersion = String(room?.room_version ?? '10');
+    const roomVersionNum = parseInt(roomVersion, 10);
+    const createIsImplicit = Number.isFinite(roomVersionNum) && roomVersionNum >= 11;
+    const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
+    const createEventId = createEvent?.event_id;
+
+    // v4 event format (room versions 11+): the create event is implicit and
+    // must not appear in auth_events. Strip it from a copy, before hashing
+    // and signing, so the prepared wire event is self-consistent.
+    const forWire = (event: PDU): PDU => {
+      if (!createIsImplicit || !createEventId) return event;
+      return {
+        ...event,
+        auth_events: (event.auth_events ?? []).filter((id) => id !== createEventId),
+      };
+    };
+
+    const preparedInvite = await prepareOutboundPdu(env, forWire(inviteEvent));
+    if (!preparedInvite) return false;
+
+    const inviteRoomState: Record<string, unknown>[] = [];
+    const stateEntries: Array<[string, string]> = [
+      ...INVITE_ROOM_STATE_TYPES,
+      ['m.room.member', inviteEvent.sender],
+    ];
+    for (const [type, stateKey] of stateEntries) {
+      const stateEvent = await getStateEvent(env.DB, roomId, type, stateKey);
+      if (!stateEvent) continue;
+      const preparedState = await prepareOutboundPdu(env, forWire(stateEvent));
+      if (!preparedState) continue;
+      inviteRoomState.push(preparedState.wire);
+    }
+
+    // Receiving servers reject the invite when create is missing.
+    if (!inviteRoomState.some((e) => e.type === 'm.room.create')) {
+      console.error(`[rooms] Cannot federate invite for ${roomId}: no create event in room state`);
+      return false;
+    }
+
+    const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(domain));
+    await fedDO.fetch(new Request('http://internal/invite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        destination: domain,
+        room_id: roomId,
+        event_id: preparedInvite.wireId,
+        room_version: roomVersion,
+        event: preparedInvite.wire,
+        invite_room_state: inviteRoomState,
+      }),
+    }));
+    console.log(`[rooms] Federated invite ${preparedInvite.wireId} for ${invitee} to ${domain}`);
+    return true;
+  } catch (err) {
+    console.error('[rooms] federateInvite failed:', err);
+    return false;
+  }
+}
+
 // PUT /_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId - Send message
 app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -1348,7 +1453,12 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     return Errors.forbidden('User is already in the room').toResponse();
   }
   if (inviteeMembership?.membership === 'invite') {
-    return c.json({}); // Already invited, idempotent
+    // Already invited, idempotent -- but re-federate the existing invite so a
+    // retry reaches the invitee's server even when the original delivery
+    // failed (or predates invite federation).
+    const existingInvite = await getStateEvent(c.env.DB, roomId, 'm.room.member', inviteeId);
+    if (existingInvite) await federateInvite(c.env, roomId, existingInvite);
+    return c.json({});
   }
 
   // Create invite event
@@ -1356,8 +1466,17 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
 
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
+  // v4 event format (room versions 11+): the create event is implicit in the
+  // auth chain and must not be listed explicitly.
+  const inviteRoomVersionNum = parseInt(
+    String((await getRoom(c.env.DB, roomId))?.room_version ?? ''),
+    10
+  );
+  const inviteCreateIsImplicit =
+    Number.isFinite(inviteRoomVersionNum) && inviteRoomVersionNum >= 11;
+
   const authEvents: string[] = [];
-  if (createEvent) authEvents.push(createEvent.event_id);
+  if (createEvent && !inviteCreateIsImplicit) authEvents.push(createEvent.event_id);
   if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
   if (inviterMembership) authEvents.push(inviterMembership.eventId);
 
@@ -1392,6 +1511,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
 
   // Notify room members and the invitee about the invite
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  // Federate the invite to the invitee's server: they are not in the room
+  // yet, so it travels via the federation invite endpoint rather than a
+  // /send transaction.
+  await federateInvite(c.env, roomId, event);
 
   return c.json({});
 });

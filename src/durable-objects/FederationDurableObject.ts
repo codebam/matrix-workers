@@ -29,6 +29,20 @@ interface OutboundEdu {
   created_at: number;
 }
 
+// An invite queued for delivery via PUT /_matrix/federation/v2/invite/...
+// The invitee's server is not in the room yet, so invites cannot travel in
+// /send transactions alongside regular PDUs.
+interface OutboundInvite {
+  room_id: string;
+  event_id: string;
+  destination: string;
+  event: any;
+  room_version: string;
+  invite_room_state: any[];
+  created_at: number;
+  retry_count: number;
+}
+
 export class FederationDurableObject extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -56,6 +70,10 @@ export class FederationDurableObject extends DurableObject<Env> {
 
     if (path === '/send-edu') {
       return this.handleSendEdu(request);
+    }
+
+    if (path === '/invite') {
+      return this.handleInvite(request);
     }
 
     return new Response('Not found', { status: 404 });
@@ -425,6 +443,153 @@ export class FederationDurableObject extends DurableObject<Env> {
     await this.ctx.storage.setAlarm(nextRetry);
   }
 
+  // Queue an invite for delivery over the federation invite endpoint.
+  private async handleInvite(request: Request): Promise<Response> {
+    const data = await request.json() as {
+      destination: string;
+      room_id: string;
+      event_id: string;
+      room_version: string;
+      event: any;
+      invite_room_state: any[];
+    };
+
+    const invite: OutboundInvite = {
+      room_id: data.room_id,
+      event_id: data.event_id,
+      destination: data.destination,
+      event: data.event,
+      room_version: data.room_version,
+      invite_room_state: data.invite_room_state ?? [],
+      created_at: Date.now(),
+      retry_count: 0,
+    };
+
+    await this.ctx.storage.put(`invite:${data.destination}:${data.event_id}`, invite);
+    console.log(`[federation] Queued invite ${data.event_id} for ${data.destination}`);
+
+    // Try to send immediately
+    await this.processInviteQueue(data.destination);
+
+    return new Response('Queued');
+  }
+
+  // Deliver queued invites. Each invite is its own PUT to
+  // /_matrix/federation/v2/invite/{roomId}/{eventId} -- receiving servers
+  // validate the invite_room_state entries as signed PDUs, so this cannot be
+  // folded into the /send transaction batching above.
+  private async processInviteQueue(destination: string): Promise<void> {
+    const prefix = `invite:${destination}:`;
+    const allKeys = await this.ctx.storage.list({ prefix });
+    if (allKeys.size === 0) return;
+
+    const invites: OutboundInvite[] = [];
+    for (const [, value] of allKeys) {
+      invites.push(value as OutboundInvite);
+    }
+    invites.sort((a, b) => a.created_at - b.created_at);
+
+    let failures = 0;
+    for (const invite of invites) {
+      try {
+        const path = `/_matrix/federation/v2/invite/${encodeURIComponent(invite.room_id)}/${encodeURIComponent(invite.event_id)}`;
+        const content = {
+          event: invite.event,
+          room_version: invite.room_version,
+          invite_room_state: invite.invite_room_state,
+        };
+
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        };
+
+        const signingKey = await getServerSigningKey(this.env.DB);
+        if (signingKey) {
+          headers['Authorization'] = await signFederationRequest(
+            'PUT',
+            path,
+            this.env.SERVER_NAME,
+            destination,
+            signingKey,
+            content
+          );
+        } else {
+          console.warn(`[federation] No signing key available — sending unsigned invite to ${destination}`);
+        }
+
+        let serverUrl: string;
+        try {
+          const discovery = await discoverServer(destination, this.env.CACHE);
+          serverUrl = buildServerUrl(discovery);
+        } catch {
+          serverUrl = `https://${destination}`;
+        }
+
+        const response = await federationFetch(`${serverUrl}${path}`, {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify(content),
+          signal: AbortSignal.timeout(30000),
+        });
+
+        console.log(`[federation] Invite ${invite.event_id} to ${destination}: HTTP ${response.status}`);
+
+        if (response.ok) {
+          await this.ctx.storage.delete(`invite:${destination}:${invite.event_id}`);
+          const target: FederationTarget = {
+            serverName: destination,
+            lastContact: Date.now(),
+            retryCount: 0,
+            nextRetry: null,
+          };
+          await this.ctx.storage.put(`server:${destination}`, target);
+        } else {
+          let bodyText = '';
+          try {
+            bodyText = (await response.text()).slice(0, 300);
+          } catch {
+            // Non-text body; the status code is the useful part
+          }
+          console.warn(`[federation] Invite ${invite.event_id} rejected by ${destination}: HTTP ${response.status} ${bodyText}`);
+          invite.retry_count += 1;
+          if (invite.retry_count >= 32) {
+            console.error(`[federation] Dropping invite ${invite.event_id} after ${invite.retry_count} retries to ${destination}`);
+            await this.ctx.storage.delete(`invite:${destination}:${invite.event_id}`);
+          } else {
+            await this.ctx.storage.put(`invite:${destination}:${invite.event_id}`, invite);
+            failures += 1;
+          }
+        }
+      } catch (e) {
+        console.error(`[federation] Invite ${invite.event_id} to ${destination} failed:`, e);
+        invite.retry_count += 1;
+        if (invite.retry_count >= 32) {
+          await this.ctx.storage.delete(`invite:${destination}:${invite.event_id}`);
+        } else {
+          await this.ctx.storage.put(`invite:${destination}:${invite.event_id}`, invite);
+          failures += 1;
+        }
+      }
+    }
+
+    if (failures > 0) {
+      // Exponential backoff shared with the PDU queue, so a down destination
+      // is not hammered by either path.
+      const target = await this.ctx.storage.get(`server:${destination}`) as FederationTarget | undefined;
+      const retryCount = (target?.retryCount || 0) + 1;
+      const delay = Math.min(60000 * Math.pow(2, retryCount - 1), 86400000);
+      const nextRetry = Date.now() + delay;
+      await this.ctx.storage.put(`server:${destination}`, {
+        serverName: destination,
+        lastContact: target?.lastContact || 0,
+        retryCount,
+        nextRetry,
+      });
+      await this.ctx.storage.setAlarm(nextRetry);
+    }
+  }
+
   async alarm(): Promise<void> {
     // Process all destinations with pending retries
     const allKeys = await this.ctx.storage.list({ prefix: 'server:' });
@@ -432,6 +597,7 @@ export class FederationDurableObject extends DurableObject<Env> {
     for (const [, value] of allKeys) {
       const target = value as FederationTarget;
       if (target.nextRetry && target.nextRetry <= Date.now()) {
+        await this.processInviteQueue(target.serverName);
         await this.processFederationQueue(target.serverName);
       }
     }

@@ -741,6 +741,88 @@ describe('POST /createRoom', () => {
     );
   });
 
+  it('createRoom: federates remote invites over the federation invite route', async () => {
+    getRoom.mockResolvedValue({ room_id: '!newroom:example.com', room_version: '12', is_public: 0 });
+    getStateEvent.mockImplementation(async (_db, _room, type: string, stateKey = '') => {
+      if (type === 'm.room.create') {
+        return pdu({ type: 'm.room.create', event_id: '$create', state_key: '' });
+      }
+      if (type === 'm.room.join_rules') {
+        return pdu({
+          type: 'm.room.join_rules',
+          event_id: '$jr',
+          state_key: '',
+          content: { join_rule: 'invite' },
+        });
+      }
+      if (type === 'm.room.power_levels') {
+        return pdu({
+          type: 'm.room.power_levels',
+          event_id: '$pl',
+          state_key: '',
+          content: { users: { [USER]: 100 }, invite: 50 },
+        });
+      }
+      if (type === 'm.room.member' && stateKey === '@carol:remote.example') {
+        return pdu({
+          type: 'm.room.member',
+          event_id: '$carol-invite',
+          state_key: '@carol:remote.example',
+          content: { membership: 'invite' },
+        });
+      }
+      if (type === 'm.room.member' && stateKey === USER) {
+        return pdu({
+          type: 'm.room.member',
+          event_id: '$alice-join',
+          state_key: USER,
+          content: { membership: 'join' },
+        });
+      }
+      return null;
+    });
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({ keyId: 'ed25519:test', privateKeyJwk: kp.privateKeyJwk });
+      const fedFetch = vi.fn(async (_req: Request) => new Response('Queued'));
+      const { status, body } = await request(
+        '/_matrix/client/v3/createRoom',
+        jsonInit('POST', { room_version: '12', invite: ['@carol:remote.example'] }),
+        createSqlDb(),
+        { fedFetch }
+      );
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ room_id: '!newroom:example.com' });
+      expect(fedFetch).toHaveBeenCalledTimes(1);
+      const sent = fedFetch.mock.calls[0][0] as Request;
+      expect(new URL(sent.url).pathname).toBe('/invite');
+      const payload = JSON.parse(await sent.text()) as {
+        destination: string;
+        room_id: string;
+        event_id: string;
+        room_version: string;
+        event: Record<string, unknown>;
+        invite_room_state: Array<Record<string, unknown>>;
+      };
+      expect(payload.destination).toBe('remote.example');
+      expect(payload.room_id).toBe('!newroom:example.com');
+      expect(payload.room_version).toBe('12');
+      expect(payload.event.event_id).toBeUndefined();
+      expect(payload.event.state_key).toBe('@carol:remote.example');
+      expect(payload.event.auth_events as string[]).not.toContain('$create');
+      const stateTypes = payload.invite_room_state.map((e) => e.type);
+      expect(stateTypes).toContain('m.room.create');
+      expect(
+        payload.invite_room_state.some(
+          (e) => e.type === 'm.room.member' && e.state_key === USER
+        )
+      ).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
   it('rolls back rooms row when initial events batch fails', async () => {
     const db = createSqlDb({ batchError: new Error('batch boom') });
     const { status, body } = await request(
@@ -1830,6 +1912,162 @@ describe('invite / kick / ban / unban', () => {
       'invite',
       '$evt:example.com'
     );
+  });
+
+  it('invite: federates a remote invitee over the federation invite route', async () => {
+    getMembership.mockImplementation(async (_db, _room, userId: string) => {
+      if (userId === USER) return joinMembership();
+      return null;
+    });
+    getStateEvent.mockImplementation(async (_db, _room, type: string, stateKey = '') => {
+      if (type === 'm.room.create') {
+        return pdu({ type: 'm.room.create', event_id: '$create', state_key: '' });
+      }
+      if (type === 'm.room.power_levels') {
+        return pdu({
+          type: 'm.room.power_levels',
+          event_id: '$pl',
+          state_key: '',
+          content: { users: { [USER]: 100 }, invite: 50 },
+        });
+      }
+      if (type === 'm.room.join_rules') {
+        return pdu({
+          type: 'm.room.join_rules',
+          event_id: '$jr',
+          state_key: '',
+          content: { join_rule: 'invite' },
+        });
+      }
+      if (type === 'm.room.member' && stateKey === USER) {
+        return pdu({
+          type: 'm.room.member',
+          event_id: '$alice-join',
+          state_key: USER,
+          content: { membership: 'join' },
+        });
+      }
+      return null;
+    });
+    getRoom.mockResolvedValue({ room_id: ROOM, room_version: '12', is_public: 0 });
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({ keyId: 'ed25519:test', privateKeyJwk: kp.privateKeyJwk });
+      const fedFetch = vi.fn(async (_req: Request) => new Response('Queued'));
+      const { status, body } = await request(
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/invite`,
+        jsonInit('POST', { user_id: '@carol:remote.example' }),
+        createSqlDb(),
+        { fedFetch }
+      );
+      expect(status).toBe(200);
+      expect(body).toEqual({});
+      expect(fedFetch).toHaveBeenCalledTimes(1);
+      const sent = fedFetch.mock.calls[0][0] as Request;
+      expect(new URL(sent.url).pathname).toBe('/invite');
+      const payload = JSON.parse(await sent.text()) as {
+        destination: string;
+        room_id: string;
+        event_id: string;
+        room_version: string;
+        event: Record<string, unknown>;
+        invite_room_state: Array<Record<string, unknown>>;
+      };
+      expect(payload.destination).toBe('remote.example');
+      expect(payload.room_id).toBe(ROOM);
+      expect(payload.room_version).toBe('12');
+      // The invite event travels in v4 wire format: derived id, no event_id.
+      expect(payload.event.event_id).toBeUndefined();
+      expect(payload.event_id).toMatch(/^\$/);
+      expect((payload.event.hashes as { sha256?: string }).sha256).toBeTruthy();
+      // v12: create is implicit in the auth chain, never listed explicitly.
+      const inviteAuth = payload.event.auth_events as string[];
+      expect(inviteAuth).not.toContain('$create');
+      expect(inviteAuth).toContain('$pl');
+      // invite_room_state must include create (mandatory) and the inviter's
+      // member event; every entry is a signed, v4-formatted wire PDU.
+      const stateTypes = payload.invite_room_state.map((e) => e.type);
+      expect(stateTypes).toContain('m.room.create');
+      expect(
+        payload.invite_room_state.some(
+          (e) => e.type === 'm.room.member' && e.state_key === USER
+        )
+      ).toBe(true);
+      for (const entry of payload.invite_room_state) {
+        expect(entry.event_id).toBeUndefined();
+        expect((entry.hashes as { sha256?: string }).sha256).toBeTruthy();
+        const sigs = entry.signatures as Record<string, Record<string, string>>;
+        expect(sigs[SERVER]?.['ed25519:test']).toBeTruthy();
+      }
+    } finally {
+      restore();
+    }
+  });
+
+  it('invite: already invited re-federates the existing invite', async () => {
+    getMembership.mockImplementation(async (_db, _room, userId: string) => {
+      if (userId === USER) return joinMembership();
+      if (userId === '@carol:remote.example') return { membership: 'invite', eventId: '$carol-invite' };
+      return null;
+    });
+    defaultState({
+      'm.room.member\0@carol:remote.example': pdu({
+        type: 'm.room.member',
+        event_id: '$carol-invite',
+        state_key: '@carol:remote.example',
+        content: { membership: 'invite' },
+      }),
+      'm.room.member\0@alice:example.com': pdu({
+        type: 'm.room.member',
+        event_id: '$alice-join',
+        state_key: USER,
+        content: { membership: 'join' },
+      }),
+    });
+    getRoom.mockResolvedValue({ room_id: ROOM, room_version: '12', is_public: 0 });
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({ keyId: 'ed25519:test', privateKeyJwk: kp.privateKeyJwk });
+      const fedFetch = vi.fn(async (_req: Request) => new Response('Queued'));
+      const { status } = await request(
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/invite`,
+        jsonInit('POST', { user_id: '@carol:remote.example' }),
+        createSqlDb(),
+        { fedFetch }
+      );
+      expect(status).toBe(200);
+      // No new invite event -- the existing one is re-federated instead.
+      expect(storeEvent).not.toHaveBeenCalled();
+      expect(fedFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it('invite: a local invitee is not federated', async () => {
+    getMembership.mockImplementation(async (_db, _room, userId: string) => {
+      if (userId === USER) return joinMembership();
+      return null;
+    });
+    defaultState();
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({ keyId: 'ed25519:test', privateKeyJwk: kp.privateKeyJwk });
+      const fedFetch = vi.fn(async () => new Response('Queued'));
+      const { status } = await request(
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/invite`,
+        jsonInit('POST', { user_id: BOB }),
+        createSqlDb(),
+        { fedFetch }
+      );
+      expect(status).toBe(200);
+      expect(fedFetch).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
   });
 
   it('kick: missing user / not in room / PL too low vs target', async () => {
