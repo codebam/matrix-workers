@@ -9,6 +9,7 @@
 import { WorkflowEntrypoint, WorkflowEvent, WorkflowStep } from 'cloudflare:workers';
 import type { Env } from '../types';
 import { generateEventId } from '../utils/ids';
+import { calculateContentHash, signJson } from '../utils/crypto';
 import {
   storeEvent,
   storeEventIdempotent,
@@ -18,7 +19,7 @@ import {
   getRoomEvents,
   getMembership,
 } from '../services/database';
-import { federationGet, federationPut } from '../services/federation-keys';
+import { getServerSigningKey, federationGet, federationPut } from '../services/federation-keys';
 import { validateRemoteJoinTemplate } from './join-template-validation';
 
 // Room versions this homeserver can participate in. make_join must advertise
@@ -272,7 +273,27 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       prev_events: prevEvents,
     };
 
-    return event;
+    // Attach a content hash and sign the event with our server key: remote
+    // resident servers reject unsigned events (M_BAD_JSON) on send_join, and
+    // the signature must cover the event including its hashes.
+    const hashed = {
+      ...event,
+      hashes: {
+        sha256: await calculateContentHash(event as unknown as Record<string, unknown>),
+      },
+    } as SerializableEvent;
+
+    const signingKey = await getServerSigningKey(this.env.DB);
+    if (!signingKey) {
+      throw new Error('Server signing key not configured');
+    }
+
+    return (await signJson(
+      hashed as unknown as Record<string, unknown>,
+      this.env.SERVER_NAME,
+      signingKey.keyId,
+      signingKey.privateKeyJwk
+    )) as unknown as SerializableEvent;
   }
 
   // Send an authenticated send_join request to a remote server
