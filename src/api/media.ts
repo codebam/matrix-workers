@@ -6,6 +6,7 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateOpaqueId } from '../utils/ids';
 import { validateUrlForPreview } from '../utils/url-validator';
+import { federationGet } from '../services/federation-keys';
 
 const app = new Hono<AppEnv>();
 
@@ -219,14 +220,245 @@ app.post('/_matrix/media/v3/upload', requireAuth(), async (c) => {
   });
 });
 
+// ============================================
+// Remote media (MSC3916 federation download)
+// ============================================
+
+type MediaEnv = AppEnv['Bindings'];
+
+interface RemoteMedia {
+  body: ArrayBuffer;
+  contentType: string;
+  filename?: string;
+}
+
+// Parse a multipart/mixed MSC3916 media response. Synapse sends:
+//   \r\n--boundary
+//   Content-Type: application/json
+//   (blank)
+//   {}
+//   --boundary
+//   Content-Type: image/jpeg
+//   Content-Disposition: inline
+//   (blank)
+//   <media bytes>
+//   --boundary--
+// Indices are computed on a latin1-decoded string, where one char == one
+// byte, so char offsets slice the original bytes safely.
+export function parseFederationMediaMultipart(
+  contentTypeHeader: string,
+  buf: ArrayBuffer
+): RemoteMedia | null {
+  const boundaryMatch = /boundary="?([^";]+)"?/.exec(contentTypeHeader);
+  if (!boundaryMatch) return null;
+  const boundary = `--${boundaryMatch[1]}`;
+  const bytes = new Uint8Array(buf);
+  const text = new TextDecoder('latin1').decode(bytes);
+
+  const chunks = text.split(boundary);
+  // Offset of each chunk within the original text.
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    const chunk = chunks[i];
+    if (i > 0) {
+      if (chunk.startsWith('--')) break; // closing boundary
+      const headerEnd = chunk.indexOf('\r\n\r\n');
+      if (headerEnd >= 0) {
+        const headerText = chunk.slice(0, headerEnd);
+        let bodyEnd = chunk.length;
+        if (chunk.endsWith('\r\n')) bodyEnd -= 2;
+
+        if (!headerText.toLowerCase().includes('application/json')) {
+          const contentType = (/content-type:\s*([^\r\n]+)/i.exec(headerText)?.[1] || '')
+            .split(';')[0]
+            .trim() || 'application/octet-stream';
+          const filenameRaw = /filename\*?=(?:utf-8'')?"?([^";\r\n]+)"?/i.exec(headerText)?.[1];
+          let filename: string | undefined;
+          if (filenameRaw) {
+            try {
+              filename = decodeURIComponent(filenameRaw);
+            } catch {
+              filename = filenameRaw;
+            }
+          }
+          const bodyStart = offset + headerEnd + 4;
+          const bodyStop = offset + bodyEnd;
+          if (bodyStop >= bodyStart) {
+            return {
+              body: bytes.slice(bodyStart, bodyStop).buffer,
+              contentType,
+              filename,
+            };
+          }
+        }
+      }
+    }
+    offset += chunk.length + boundary.length;
+  }
+  return null;
+}
+
+// Fetch media that lives on another homeserver via the signed federation
+// media download endpoint, extracting the media part from the multipart
+// response and caching the bytes in R2 for subsequent requests.
+export async function fetchRemoteMedia(
+  env: MediaEnv,
+  serverName: string,
+  mediaId: string
+): Promise<RemoteMedia | null> {
+  const cacheKey = `remote_media_${serverName}_${mediaId}`;
+
+  try {
+    const cached = await env.MEDIA.get(cacheKey);
+    if (cached) {
+      return {
+        body: await cached.arrayBuffer(),
+        contentType: cached.httpMetadata?.contentType || 'application/octet-stream',
+        filename: cached.customMetadata?.filename,
+      };
+    }
+  } catch {
+    // cache reads are best-effort
+  }
+
+  try {
+    const response = await federationGet(
+      serverName,
+      `/_matrix/federation/v1/media/download/${encodeURIComponent(mediaId)}`,
+      env.SERVER_NAME,
+      env.DB,
+      env.CACHE
+    );
+
+    if (!response.ok) {
+      console.warn(`[media] Remote media ${serverName}/${mediaId} fetch failed: HTTP ${response.status}`);
+      return null;
+    }
+
+    const contentTypeHeader = response.headers.get('Content-Type') || '';
+    const buf = await response.arrayBuffer();
+
+    let media: RemoteMedia;
+    if (contentTypeHeader.toLowerCase().startsWith('multipart/mixed')) {
+      const parsed = parseFederationMediaMultipart(contentTypeHeader, buf);
+      if (!parsed) {
+        console.warn(`[media] Remote media ${serverName}/${mediaId} malformed multipart response`);
+        return null;
+      }
+      media = parsed;
+    } else {
+      media = {
+        body: buf,
+        contentType: contentTypeHeader.split(';')[0].trim() || 'application/octet-stream',
+      };
+    }
+
+    try {
+      await env.MEDIA.put(cacheKey, media.body, {
+        httpMetadata: { contentType: media.contentType },
+        customMetadata: media.filename ? { filename: media.filename } : {},
+      });
+    } catch {
+      // cache writes are best-effort
+    }
+
+    return media;
+  } catch (err) {
+    console.warn(`[media] Remote media ${serverName}/${mediaId} fetch errored:`, err);
+    return null;
+  }
+}
+
+function serveRemoteMedia(media: RemoteMedia, filenameOverride?: string): Response {
+  const headers = new Headers();
+  headers.set('Content-Type', media.contentType);
+  const filename = filenameOverride || media.filename;
+  if (filename) {
+    headers.set('Content-Disposition', safeContentDisposition(filename));
+  }
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  addMediaSecurityHeaders(headers);
+  return new Response(media.body, { headers });
+}
+
+// Thumbnail for media on another server: resize via the platform image
+// resizer against our own (now remote-capable) download URL, falling back to
+// the original bytes when resizing is unavailable.
+async function serveRemoteThumbnail(
+  env: MediaEnv,
+  serverName: string,
+  mediaId: string,
+  width: number,
+  height: number,
+  method: string
+): Promise<Response> {
+  const thumbnailKey = `thumb_remote_${serverName}_${mediaId}_${width}x${height}_${method}`;
+
+  try {
+    const existing = await env.MEDIA.get(thumbnailKey);
+    if (existing) {
+      const headers = new Headers();
+      headers.set('Content-Type', 'image/jpeg');
+      headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+      return new Response(existing.body, { headers });
+    }
+  } catch {
+    // best-effort cache read
+  }
+
+  try {
+    const downloadUrl = `https://${env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
+    const resized = await fetch(downloadUrl, {
+      cf: {
+        image: {
+          width,
+          height,
+          fit: resolveThumbnailFit(method),
+          format: 'jpeg',
+          quality: 85,
+        },
+      },
+    });
+
+    if (resized.ok && (resized.headers.get('Content-Type') || '').startsWith('image/')) {
+      const thumbBody = await resized.arrayBuffer();
+      try {
+        await env.MEDIA.put(thumbnailKey, thumbBody, {
+          httpMetadata: { contentType: 'image/jpeg' },
+        });
+      } catch {
+        // best-effort cache write
+      }
+      const headers = new Headers();
+      headers.set('Content-Type', 'image/jpeg');
+      headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+      headers.set('X-Thumbnail-Generated', 'true');
+      return new Response(thumbBody, { headers });
+    }
+  } catch (resizeErr) {
+    console.warn('[media] Remote thumbnail resize failed:', resizeErr);
+  }
+
+  const remote = await fetchRemoteMedia(env, serverName, mediaId);
+  if (!remote) {
+    return Errors.notFound('Remote media not found').toResponse();
+  }
+  const response = serveRemoteMedia(remote);
+  response.headers.set('X-Thumbnail-Generated', 'false');
+  return response;
+}
+
 // GET /_matrix/media/v3/download/:serverName/:mediaId - Download media
 app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
 
-  // Only serve local media for now
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    if (!remote) {
+      return Errors.notFound('Remote media not found').toResponse();
+    }
+    return serveRemoteMedia(remote);
   }
 
   // Get from R2
@@ -257,9 +489,12 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
   const mediaId = c.req.param('mediaId');
   const requestedFilename = c.req.param('filename');
 
-  // Only serve local media for now
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    if (!remote) {
+      return Errors.notFound('Remote media not found').toResponse();
+    }
+    return serveRemoteMedia(remote, requestedFilename);
   }
 
   // Get from R2
@@ -290,9 +525,8 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   const height = clampThumbnailDimension(c.req.query('height'));
   const method = c.req.query('method') || 'scale';
 
-  // Only serve local media for now
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return serveRemoteThumbnail(c.env, serverName, mediaId, width, height, method);
   }
 
   // Get media metadata
@@ -619,7 +853,11 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(),
   const mediaId = c.req.param('mediaId');
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    if (!remote) {
+      return Errors.notFound('Remote media not found').toResponse();
+    }
+    return serveRemoteMedia(remote);
   }
 
   const object = await c.env.MEDIA.get(mediaId);
@@ -649,7 +887,11 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
   const requestedFilename = c.req.param('filename');
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    if (!remote) {
+      return Errors.notFound('Remote media not found').toResponse();
+    }
+    return serveRemoteMedia(remote, requestedFilename);
   }
 
   const object = await c.env.MEDIA.get(mediaId);
@@ -679,7 +921,7 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
   const method = c.req.query('method') || 'scale';
 
   if (serverName !== c.env.SERVER_NAME) {
-    return Errors.notFound('Remote media not supported').toResponse();
+    return serveRemoteThumbnail(c.env, serverName, mediaId, width, height, method);
   }
 
   // Get media metadata
@@ -838,6 +1080,56 @@ app.get('/_matrix/client/v1/media/config', requireAuth(), async (c) => {
   return c.json({
     'm.upload.size': MAX_UPLOAD_SIZE,
   });
+});
+
+// ============================================
+// Federation media (MSC3916)
+// ============================================
+
+// GET /_matrix/federation/v1/media/download/:mediaId
+// Serves local media to other homeservers that fetch it for their own users
+// (e.g. profile avatars). Responds with multipart/mixed: a JSON metadata part
+// followed by the media part, matching Synapse's format. Like the other
+// federation endpoints in this codebase, inbound requests are not
+// signature-verified; media ids are unguessable and the v3 download paths are
+// equally open.
+app.get('/_matrix/federation/v1/media/download/:mediaId', async (c) => {
+  const mediaId = c.req.param('mediaId');
+
+  const object = await c.env.MEDIA.get(mediaId);
+  if (!object) {
+    return Errors.notFound('Media not found').toResponse();
+  }
+
+  const metadata = await c.env.DB.prepare(
+    `SELECT content_type, filename FROM media WHERE media_id = ?`
+  ).bind(mediaId).first<{ content_type: string; filename: string | null }>();
+
+  const contentType =
+    metadata?.content_type || object.httpMetadata?.contentType || 'application/octet-stream';
+  const disposition = contentType.startsWith('image/') ? 'inline' : 'attachment';
+  const filename = metadata?.filename ? `; filename=${sanitizeFilename(metadata.filename)}` : '';
+
+  const boundary = crypto.randomUUID().replace(/-/g, '');
+  const encoder = new TextEncoder();
+  const head = encoder.encode(
+    `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n{}\r\n--${boundary}\r\n` +
+      `Content-Type: ${contentType}\r\nContent-Disposition: ${disposition}${filename}\r\n\r\n`
+  );
+  const mediaBytes = new Uint8Array(await object.arrayBuffer());
+  const tail = encoder.encode(`\r\n--${boundary}--`);
+
+  const body = new Uint8Array(head.length + mediaBytes.length + tail.length);
+  body.set(head, 0);
+  body.set(mediaBytes, head.length);
+  body.set(tail, head.length + mediaBytes.length);
+
+  const headers = new Headers();
+  headers.set('Content-Type', `multipart/mixed; boundary=${boundary}`);
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  addMediaSecurityHeaders(headers);
+
+  return new Response(body, { headers });
 });
 
 export default app;

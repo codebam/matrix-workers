@@ -6,7 +6,7 @@
  * keys-media SSRF status-only floods. keys-media concurrent only races
  * placeholder double-fill TOCTOU success paths — never exact soft error:
  * strings under Promise.all (grep Unsupported content type / File exceeds /
- * Remote media not supported / Missing required parameter: url / Access to
+ * Remote media not found / Missing required parameter: url / Access to
  * internal / Only HTTP and HTTPS / Only standard HTTP ports / Invalid URL /
  * Cannot upload to remote / Not authorized / Media already uploaded in
  * *media*concurrent* = 0 aside from this file).
@@ -14,7 +14,7 @@
  * Primary deepen:
  *   v3/v1 upload `Unsupported content type` + M_FORBIDDEN ∥ image upload ok;
  *   `File exceeds maximum upload size` + M_TOO_LARGE (Content-Length) ∥ ok;
- *   download/thumbnail `Remote media not supported` ∥ local 200;
+ *   download/thumbnail `Remote media not found` ∥ local 200;
  *   preview_url `Missing required parameter: url` + M_MISSING_PARAM ∥ cached;
  *   SSRF exact errors (internal IP/hostname, schemes, ports, Invalid URL) ∥
  *   cached preview success; placeholder PUT `Cannot upload to remote server` /
@@ -434,6 +434,14 @@ beforeEach(() => {
   opaqueSeq = 0;
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.setSystemTime(new Date('2026-09-14T00:00:00.000Z'));
+  // Remote media now federates; keep every non-explicitly-mocked fetch
+  // deterministic and offline so tests never touch the network.
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new Error('offline');
+    })
+  );
 });
 
 afterEach(() => {
@@ -665,8 +673,8 @@ describe('media concurrent File exceeds maximum upload size ∥ ok after tip', (
 // Remote media soft ∥ local download/thumbnail
 // ---------------------------------------------------------------------------
 
-describe('media concurrent Remote media not supported ∥ local after tip', () => {
-  it('v3 download remote ∥ local — exact Remote media not supported', async () => {
+describe('media concurrent Remote media not found ∥ local after tip', () => {
+  it('v3 download remote ∥ local — exact Remote media not found', async () => {
     const { db, media } = seedLocalDownload('loc-dl-1');
     const env = envFor({ db, media });
     const results = await Promise.all([
@@ -676,7 +684,7 @@ describe('media concurrent Remote media not supported ∥ local after tip', () =
     expect(statusesOf(results)).toEqual([200, 404]);
     expect(softBody(results, 404).body).toMatchObject({
       errcode: 'M_NOT_FOUND',
-      error: 'Remote media not supported',
+      error: 'Remote media not found',
     });
     expect(softBody(results, 200).text).toBe('PNGDATA');
   });
@@ -689,7 +697,7 @@ describe('media concurrent Remote media not supported ∥ local after tip', () =
       request(`/_matrix/media/v3/thumbnail/${SERVER}/loc-th-1?width=32&height=32`, {}, env),
     ]);
     expect(statusesOf(results)).toEqual([200, 404]);
-    expect(softBody(results, 404).body.error).toBe('Remote media not supported');
+    expect(softBody(results, 404).body.error).toBe('Remote media not found');
   });
 
   it('v1 download + filename remote ∥ local under race', async () => {
@@ -703,12 +711,12 @@ describe('media concurrent Remote media not supported ∥ local after tip', () =
     const softs = results.filter((r) => r.status === 404);
     const ok = results.find((r) => r.status === 200)!;
     expect(softs).toHaveLength(2);
-    expect(softs.every((r) => r.body.error === 'Remote media not supported')).toBe(true);
+    expect(softs.every((r) => r.body.error === 'Remote media not found')).toBe(true);
     expect(ok.text).toBe('BODY');
   });
 
   for (let i = 0; i < 6; i++) {
-    it(`Remote media not supported flood-${i}`, async () => {
+    it(`Remote media not found flood-${i}`, async () => {
       const id = `loc-flood-${i}`;
       const { db, media } = seedLocalDownload(id, `D${i}`);
       const env = envFor({ db, media });
@@ -727,7 +735,7 @@ describe('media concurrent Remote media not supported ∥ local after tip', () =
         request(okPath, {}, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 404]);
-      expect(softBody(results, 404).body.error).toBe('Remote media not supported');
+      expect(softBody(results, 404).body.error).toBe('Remote media not found');
     });
   }
 });
@@ -1150,7 +1158,7 @@ describe('media concurrent cross-route soft isolation after tip', () => {
     expect(results.filter((r) => r.status === 404)).toHaveLength(1);
     expect(results.filter((r) => r.status === 400)).toHaveLength(1);
     expect(softBody(results, 403).body.error).toBe('Unsupported content type: text/html');
-    expect(softBody(results, 404).body.error).toBe('Remote media not supported');
+    expect(softBody(results, 404).body.error).toBe('Remote media not found');
     expect(softBody(results, 400).body.error).toBe('Missing required parameter: url');
   });
 
@@ -1243,7 +1251,7 @@ describe('media concurrent cross-route soft isolation after tip', () => {
       ]);
       expect(statusesOf(results)).toEqual([200, 200, 400, 404]);
       expect(softBody(results, 400).body.errcode).toBe('M_UNKNOWN');
-      expect(softBody(results, 404).body.error).toBe('Remote media not supported');
+      expect(softBody(results, 404).body.error).toBe('Remote media not found');
     });
   }
 });

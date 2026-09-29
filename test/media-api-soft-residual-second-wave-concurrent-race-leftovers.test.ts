@@ -69,9 +69,9 @@ const MEDIA_NOT_FOUND = {
   error: 'Media not found',
 } as const;
 
-const REMOTE_NOT_SUPPORTED = {
+const REMOTE_NOT_FOUND = {
   errcode: 'M_NOT_FOUND',
-  error: 'Remote media not supported',
+  error: 'Remote media not found',
 } as const;
 
 const FILE_EXCEEDS = {
@@ -404,6 +404,14 @@ beforeEach(() => {
   opaqueSeq = 0;
   vi.useFakeTimers({ shouldAdvanceTime: true });
   vi.setSystemTime(new Date('2026-09-14T00:00:00.000Z'));
+  // Remote media now federates; keep every non-explicitly-mocked fetch
+  // deterministic and offline so tests never touch the network.
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async () => {
+      throw new Error('offline');
+    })
+  );
 });
 
 afterEach(() => {
@@ -731,7 +739,7 @@ describe('media residual concurrent multi-error soft isolation after #301', () =
       .filter((r) => r.status === 404)
       .map((r) => r.body.error)
       .sort();
-    expect(notFoundErrors).toEqual(['Media not found', 'Remote media not supported'].sort());
+    expect(notFoundErrors).toEqual(['Media not found', 'Remote media not found'].sort());
     expect(softBody(results, 403).body.error).toBe('Unsupported content type: text/html');
     expect(softBody(results, 400).body).toEqual(MISSING_URL);
   });
@@ -768,7 +776,7 @@ describe('media residual concurrent multi-error soft isolation after #301', () =
         .filter((r) => r.status === 404)
         .map((r) => r.body.error)
         .sort()
-    ).toEqual(['Media not found', 'Media not found', 'Remote media not supported'].sort());
+    ).toEqual(['Media not found', 'Media not found', 'Remote media not found'].sort());
   });
 
   for (let i = 0; i < 6; i++) {
@@ -787,7 +795,7 @@ describe('media residual concurrent multi-error soft isolation after #301', () =
           .filter((r) => r.status === 404)
           .map((r) => r.body)
           .sort((a, b) => String(a.error).localeCompare(String(b.error)))
-      ).toEqual([MEDIA_NOT_FOUND, REMOTE_NOT_SUPPORTED].sort((a, b) => a.error.localeCompare(b.error)));
+      ).toEqual([MEDIA_NOT_FOUND, REMOTE_NOT_FOUND].sort((a, b) => a.error.localeCompare(b.error)));
       expect(softBody(results, 200).text).toBe(`F${i}`);
     });
   }

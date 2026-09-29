@@ -30,7 +30,14 @@ vi.mock('../src/utils/ids', async (importOriginal) => {
   };
 });
 
-import mediaApp from '../src/api/media';
+vi.mock('../src/services/federation-keys', () => ({
+  federationGet: vi.fn(),
+}));
+
+import mediaApp, { parseFederationMediaMultipart } from '../src/api/media';
+import { federationGet } from '../src/services/federation-keys';
+
+const federationGetMock = vi.mocked(federationGet);
 
 const USER = '@alice:example.com';
 const OTHER = '@bob:example.com';
@@ -53,6 +60,7 @@ type R2ObjectLike = {
   body: ReadableStream | ArrayBuffer | Uint8Array | string;
   httpMetadata?: { contentType?: string };
   customMetadata?: Record<string, string>;
+  arrayBuffer?: () => Promise<ArrayBuffer>;
 };
 
 type MediaBucket = {
@@ -227,9 +235,20 @@ function createMediaBucket(seed: Record<string, R2ObjectLike> = {}): MediaBucket
     store,
     puts,
     gets,
-    async get(key: string) {
+    async get(key) {
       gets.push(key);
-      return store.get(key) ?? null;
+      const stored = store.get(key);
+      if (!stored) return null;
+      const arrayBuffer = async (): Promise<ArrayBuffer> => {
+        const raw = stored.body;
+        if (typeof raw === 'string') return new TextEncoder().encode(raw).buffer as ArrayBuffer;
+        if (raw instanceof ArrayBuffer) return raw;
+        if (raw instanceof Uint8Array) {
+          return raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength) as ArrayBuffer;
+        }
+        return new Response(raw).arrayBuffer();
+      };
+      return { ...stored, arrayBuffer } as R2ObjectLike;
     },
     async put(key, body, options) {
       puts.push({ key, body, options });
@@ -558,11 +577,14 @@ describe('media GET /_matrix/media/v3/download/:serverName/:mediaId', () => {
   });
 
   it('returns 404 for remote serverName', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('offline');
+    }));
     const res = await request(`/_matrix/media/v3/download/${REMOTE}/abc`);
     expect(res.status).toBe(404);
     expect(res.body).toMatchObject({
       errcode: 'M_NOT_FOUND',
-      error: 'Remote media not supported',
+      error: 'Remote media not found',
     });
   });
 
@@ -604,9 +626,12 @@ describe('media GET /_matrix/media/v3/download/:serverName/:mediaId/:filename', 
   });
 
   it('rejects remote server and missing object', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('offline');
+    }));
     const remote = await request(`/_matrix/media/v3/download/${REMOTE}/x/a.png`);
     expect(remote.status).toBe(404);
-    expect(remote.body).toMatchObject({ error: 'Remote media not supported' });
+    expect(remote.body).toMatchObject({ error: 'Remote media not found' });
 
     const missing = await request(`/_matrix/media/v3/download/${SERVER}/missing/a.png`);
     expect(missing.status).toBe(404);
@@ -633,9 +658,12 @@ describe('media GET /_matrix/media/v3/download/:serverName/:mediaId/:filename', 
 
 describe('media GET /_matrix/media/v3/thumbnail/:serverName/:mediaId', () => {
   it('returns 404 for remote server', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('offline');
+    }));
     const res = await request(`/_matrix/media/v3/thumbnail/${REMOTE}/x?width=32&height=32`);
     expect(res.status).toBe(404);
-    expect(res.body).toMatchObject({ error: 'Remote media not supported' });
+    expect(res.body).toMatchObject({ error: 'Remote media not found' });
   });
 
   it('returns 404 when media metadata missing', async () => {
@@ -1266,9 +1294,12 @@ describe('media GET /_matrix/client/v1/media/download/:serverName/:mediaId', () 
   });
 
   it('404s remote and missing objects', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('offline');
+    }));
     const remote = await request(`/_matrix/client/v1/media/download/${REMOTE}/x`);
     expect(remote.status).toBe(404);
-    expect(remote.body).toMatchObject({ error: 'Remote media not supported' });
+    expect(remote.body).toMatchObject({ error: 'Remote media not found' });
 
     const missing = await request(`/_matrix/client/v1/media/download/${SERVER}/nope`);
     expect(missing.status).toBe(404);
@@ -2381,5 +2412,167 @@ describe('media API TOKENMAXX edges after #109/#111 — Browser Rendering (v3 on
       { browser }
     );
     expect(res.body).toEqual({ 'og:title': 'BasicOk2' });
+  });
+});
+
+// ============================================
+// Remote media via federation (MSC3916)
+// ============================================
+
+function buildFederationMultipart(mediaBody: string, contentType: string, filename?: string): Response {
+  const boundary = 'testboundary123';
+  const encoder = new TextEncoder();
+  const filenamePart = filename ? `; filename=${filename}` : '';
+  const head = encoder.encode(
+    `\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n{}\r\n--${boundary}\r\n` +
+      `Content-Type: ${contentType}\r\nContent-Disposition: inline${filenamePart}\r\n\r\n`
+  );
+  const mediaBytes = encoder.encode(mediaBody);
+  const tail = encoder.encode(`\r\n--${boundary}--`);
+  const body = new Uint8Array(head.length + mediaBytes.length + tail.length);
+  body.set(head, 0);
+  body.set(mediaBytes, head.length);
+  body.set(tail, head.length + mediaBytes.length);
+  return new Response(body, {
+    status: 200,
+    headers: { 'Content-Type': `multipart/mixed; boundary=${boundary}` },
+  });
+}
+
+describe('remote media (federation download)', () => {
+  beforeEach(() => {
+    federationGetMock.mockReset();
+  });
+
+  it('v3 download proxies remote media through the federation endpoint', async () => {
+    federationGetMock.mockResolvedValueOnce(buildFederationMultipart('REMOTEJPEG', 'image/jpeg'));
+    const res = await request(`/_matrix/media/v3/download/${REMOTE}/remote-media-1`);
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('REMOTEJPEG');
+    expect(res.headers.get('Content-Type')).toBe('image/jpeg');
+    expect(federationGetMock).toHaveBeenCalledWith(
+      REMOTE,
+      '/_matrix/federation/v1/media/download/remote-media-1',
+      SERVER,
+      expect.anything(),
+      expect.anything()
+    );
+  });
+
+  it('caches remote media bytes in R2 and serves repeats from cache', async () => {
+    federationGetMock.mockResolvedValueOnce(buildFederationMultipart('CACHED', 'image/png'));
+    const media = createMediaBucket();
+    const first = await request(`/_matrix/media/v3/download/${REMOTE}/cache-me`, {}, { media });
+    expect(first.status).toBe(200);
+    expect(first.text).toBe('CACHED');
+    expect(media.puts.some((p) => p.key === `remote_media_${REMOTE}_cache-me`)).toBe(true);
+
+    federationGetMock.mockClear();
+    const second = await request(`/_matrix/media/v3/download/${REMOTE}/cache-me`, {}, { media });
+    expect(second.status).toBe(200);
+    expect(second.text).toBe('CACHED');
+    expect(second.headers.get('Content-Type')).toBe('image/png');
+    expect(federationGetMock).not.toHaveBeenCalled();
+  });
+
+  it('client/v1 download proxies remote media too', async () => {
+    federationGetMock.mockResolvedValueOnce(buildFederationMultipart('V1BYTES', 'image/webp', 'pic.webp'));
+    const res = await request(`/_matrix/client/v1/media/download/${REMOTE}/remote-v1`);
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('V1BYTES');
+    expect(res.headers.get('Content-Type')).toBe('image/webp');
+    expect(res.headers.get('Content-Disposition')).toBe('inline; filename="pic.webp"');
+  });
+
+  it('v3 thumbnail resizes remote media via the image resizer', async () => {
+    const fetchMock = vi.fn(
+      async () => new Response('RESIZED', { status: 200, headers: { 'Content-Type': 'image/jpeg' } })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const res = await request(
+      `/_matrix/media/v3/thumbnail/${REMOTE}/remote-thumb?width=32&height=32&method=crop`
+    );
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('RESIZED');
+    expect(res.headers.get('X-Thumbnail-Generated')).toBe('true');
+    expect(fetchMock).toHaveBeenCalledWith(
+      `https://${SERVER}/_matrix/media/v3/download/${REMOTE}/remote-thumb`,
+      expect.objectContaining({ cf: expect.anything() })
+    );
+  });
+
+  it('v3 thumbnail falls back to the original when resizing fails', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('resize offline');
+      })
+    );
+    federationGetMock.mockResolvedValueOnce(buildFederationMultipart('ORIGINALBYTES', 'image/png'));
+    const res = await request(`/_matrix/media/v3/thumbnail/${REMOTE}/remote-thumb-2?width=32&height=32`);
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('ORIGINALBYTES');
+    expect(res.headers.get('X-Thumbnail-Generated')).toBe('false');
+    expect(res.headers.get('Content-Type')).toBe('image/png');
+  });
+
+  it('client/v1 thumbnail supports remote media', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('V1THUMB', { status: 200, headers: { 'Content-Type': 'image/jpeg' } }))
+    );
+    const res = await request(`/_matrix/client/v1/media/thumbnail/${REMOTE}/remote-v1-thumb?width=16&height=16`);
+    expect(res.status).toBe(200);
+    expect(res.text).toBe('V1THUMB');
+    expect(res.headers.get('X-Thumbnail-Generated')).toBe('true');
+  });
+
+  it('v3 thumbnail 404s when remote media cannot be fetched at all', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        throw new Error('offline');
+      })
+    );
+    federationGetMock.mockResolvedValueOnce(new Response('nope', { status: 404 }));
+    const res = await request(`/_matrix/media/v3/thumbnail/${REMOTE}/missing-thumb?width=32&height=32`);
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ error: 'Remote media not found' });
+  });
+
+  it('federation media download serves local media as multipart/mixed', async () => {
+    const db = createMediaDb({
+      rows: [
+        {
+          media_id: 'fed-media-1',
+          user_id: USER,
+          content_type: 'image/png',
+          content_length: 8,
+          filename: 'avatar.png',
+          created_at: 1700000000000,
+        },
+      ],
+    });
+    const media = createMediaBucket({
+      'fed-media-1': { body: 'FEDBYTES', httpMetadata: { contentType: 'image/png' } },
+    });
+    const res = await request('/_matrix/federation/v1/media/download/fed-media-1', {}, { db, media });
+    expect(res.status).toBe(200);
+    const contentTypeHeader = res.headers.get('Content-Type') || '';
+    expect(contentTypeHeader).toContain('multipart/mixed');
+    const parsed = parseFederationMediaMultipart(
+      contentTypeHeader,
+      new TextEncoder().encode(res.text).buffer as ArrayBuffer
+    );
+    expect(parsed).not.toBeNull();
+    expect(parsed?.contentType).toBe('image/png');
+    expect(parsed?.filename).toBe('avatar.png');
+    expect(new TextDecoder().decode(parsed?.body)).toBe('FEDBYTES');
+  });
+
+  it('federation media download 404s unknown media', async () => {
+    const res = await request('/_matrix/federation/v1/media/download/nope');
+    expect(res.status).toBe(404);
+    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND', error: 'Media not found' });
   });
 });
