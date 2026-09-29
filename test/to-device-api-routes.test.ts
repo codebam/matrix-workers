@@ -182,12 +182,13 @@ function createToDeviceDb(opts: {
 
 type ToDeviceDb = ReturnType<typeof createToDeviceDb>;
 
-function createEnv(db?: ToDeviceDb, federation?: unknown) {
+function createEnv(db?: ToDeviceDb, federation?: unknown, sync?: unknown) {
   const d = db ?? createToDeviceDb();
   return {
     DB: d as unknown as D1Database,
     SERVER_NAME: 'example.com',
     FEDERATION: federation,
+    SYNC: sync,
     _db: d,
   } as unknown as Env & { _db: ToDeviceDb };
 }
@@ -683,5 +684,61 @@ describe('PUT /sendToDevice/:eventType/:txnId', () => {
       },
     });
     expect(typeof fedCalls[0].body.content.message_id).toBe('string');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Sync wake-up on local delivery (parked /sync long-polls must return early)
+// ---------------------------------------------------------------------------
+
+describe('sendToDevice wakes local recipients sync loops', () => {
+  function createSyncFake() {
+    const calls: Array<{ id: string; url: string }> = [];
+    return {
+      calls,
+      idFromName: (name: string) => name,
+      get: (name: string) => ({
+        fetch: async (req: Request) => {
+          calls.push({ id: name, url: req.url });
+          return new Response('OK');
+        },
+      }),
+    };
+  }
+
+  it('notifies every local recipient after storing', async () => {
+    const db = createToDeviceDb({ devices: [{ user_id: USER, device_id: 'DEV1' }] });
+    const sync = createSyncFake();
+    const env = createEnv(db, undefined, sync);
+
+    const res = await request(
+      env,
+      sendPath(EVENT_TYPE, 'txn-wake'),
+      jsonInit('PUT', {
+        messages: {
+          [USER]: { '*': { wake: 1 } },
+          [BOB]: { DEVZ: { wake: 2 } },
+        },
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(sync.calls.map((c) => c.id).sort()).toEqual([USER, BOB].sort());
+    for (const call of sync.calls) {
+      expect(call.url).toContain('/notify');
+    }
+  });
+
+  it('does not notify for remote-only recipients', async () => {
+    const db = createToDeviceDb();
+    const sync = createSyncFake();
+    const env = createEnv(db, undefined, sync);
+
+    const res = await request(
+      env,
+      sendPath(EVENT_TYPE, 'txn-wake-remote'),
+      jsonInit('PUT', { messages: { '@remote:remote.example.org': { D: { x: 1 } } } })
+    );
+    expect(res.status).toBe(200);
+    expect(sync.calls).toHaveLength(0);
   });
 });

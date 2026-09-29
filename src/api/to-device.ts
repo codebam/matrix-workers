@@ -167,6 +167,7 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
   // Process each recipient user
   const localSuffix = `:${c.env.SERVER_NAME}`;
   const remoteByServer: Record<string, Record<string, Record<string, any>>> = {};
+  const notified = new Set<string>();
 
   for (const [recipientUserId, deviceMessages] of Object.entries(body.messages)) {
     // Users on other servers cannot be delivered to locally; collect them
@@ -213,7 +214,17 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
           streamPosition
         ).run();
       }
+      notified.add(recipientUserId);
     }
+  }
+
+  // Wake recipients' sync loops so the messages are delivered immediately
+  // instead of waiting out the long-poll timeout. Without this, parked syncs
+  // (e.g. FluffyChat's 25s poll) only pick up verification requests and key
+  // shares at park expiry -- users cancel the flow before the phone ever sees
+  // it.
+  for (const recipientUserId of notified) {
+    await notifyUserSync(c.env, recipientUserId, 'to_device');
   }
 
   // Forward messages addressed to remote users over federation as
