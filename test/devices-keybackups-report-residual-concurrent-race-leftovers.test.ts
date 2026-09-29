@@ -1332,7 +1332,9 @@ describe('race devices sibling isolation DELETE∥PUT residual after #214', () =
       expect(db.devices[0].display_name).toBe(`lap-new-${i}`);
       expect(db.tokens.every((t) => t.device_id !== DEVICE)).toBe(true);
       expect(db.tokens.some((t) => t.device_id === OTHER_DEV)).toBe(true);
-      expect(db.keys.every((k) => k.device_id !== DEVICE)).toBe(true);
+      // No D1 device_keys table: deletion cleans keys in the UserKeys DO
+      // (not modelled by this double), so both devices' placeholder rows stay.
+      expect(db.keys.some((k) => k.device_id === DEVICE)).toBe(true);
       expect(db.keys.some((k) => k.device_id === OTHER_DEV)).toBe(true);
     });
   }
@@ -1486,7 +1488,6 @@ describe('race devices empty bulk / bind / soft residual after #214', () => {
     const phoneDeletes = db.deletes.filter((d) => d.args[1] === DEVICE);
     expect(phoneDeletes.map((d) => d.sql)).toEqual([
       expect.stringContaining('DELETE FROM access_tokens'),
-      expect.stringContaining('DELETE FROM device_keys'),
       expect.stringContaining('DELETE FROM devices'),
     ]);
     expect(phoneDeletes.every((d) => d.args[0] === USER && d.args[1] === DEVICE)).toBe(true);
