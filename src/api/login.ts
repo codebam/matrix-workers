@@ -21,6 +21,7 @@ import {
   createAccessToken,
   deleteAccessToken,
   deleteAllUserTokens,
+  consumeRegistrationToken,
 } from '../services/database';
 import { requireAuth, extractAccessToken } from '../middleware/auth';
 
@@ -35,9 +36,6 @@ app.get('/_matrix/client/v3/login', (c) => {
       },
       {
         type: 'm.login.token',
-      },
-      {
-        type: 'm.login.dummy',
       },
     ],
   });
@@ -145,24 +143,10 @@ app.post('/_matrix/client/v3/login', async (c) => {
     if (lockoutData) {
       await c.env.SESSIONS.delete(lockoutKey);
     }
-  } else if (type === 'm.login.dummy') {
-    // m.login.dummy is for UIA flows - requires identifier but no password verification
-    // Per Matrix spec, this "does nothing and never fails" but still needs a user identifier
-    if (!identifier) {
-      return Errors.missingParam('identifier').toResponse();
-    }
-
-    // Parse identifier
-    if (identifier.type === 'm.id.user') {
-      if (identifier.user.startsWith('@')) {
-        userId = identifier.user;
-      } else {
-        userId = formatUserId(identifier.user, c.env.SERVER_NAME);
-      }
-    } else {
-      return Errors.unrecognized('Unknown identifier type').toResponse();
-    }
   } else {
+    // m.login.dummy is deliberately not a login type: it is only a UIA stage
+    // for registration. Treating it as a login would hand out access tokens
+    // for any user without credentials (account takeover).
     return Errors.unrecognized('Unknown login type').toResponse();
   }
 
@@ -344,6 +328,7 @@ app.post('/_matrix/client/v3/register', async (c) => {
     device_id,
     initial_device_display_name,
     inhibit_login,
+    token,
     auth,
   } = body;
 
@@ -355,14 +340,22 @@ app.post('/_matrix/client/v3/register', async (c) => {
 
   const isGuest = kind === 'guest';
 
+  // Invite-only mode (REGISTRATION_REQUIRE_TOKEN): every registration, user
+  // or guest, must present a valid, unspent registration token.
+  const tokenRequired =
+    c.env.REGISTRATION_REQUIRE_TOKEN === 'true' || c.env.REGISTRATION_REQUIRE_TOKEN === '1';
+
   // For non-guests, require username and password
   if (!isGuest) {
     // Simple auth - in production, implement UIA (User-Interactive Authentication)
-    if (!auth || auth.type !== 'm.login.dummy') {
+    const authAccepted =
+      auth?.type === 'm.login.dummy' ||
+      (tokenRequired && auth?.type === 'm.login.registration_token');
+    if (!authAccepted) {
       // Return UIA requirements
       const sessionId = await generateOpaqueId(16);
       return c.json({
-        flows: [{ stages: ['m.login.dummy'] }],
+        flows: [{ stages: tokenRequired ? ['m.login.registration_token'] : ['m.login.dummy'] }],
         params: {},
         session: sessionId,
       }, 401);
@@ -395,6 +388,25 @@ app.post('/_matrix/client/v3/register', async (c) => {
   const existing = await getUserById(c.env.DB, userId);
   if (existing) {
     return Errors.userInUse().toResponse();
+  }
+
+  // Invite-only: consume the registration token only after every other check
+  // has passed, so failed or duplicate registrations never burn a token. The
+  // UPDATE is atomic, making single-use tokens safe under concurrent attempts.
+  if (tokenRequired) {
+    const candidateToken =
+      (typeof auth?.token === 'string' && auth.token) ||
+      (typeof token === 'string' && token) ||
+      (typeof body.invite_token === 'string' && body.invite_token) ||
+      c.req.query('token') ||
+      '';
+    if (!candidateToken) {
+      return Errors.forbidden('Registration token required').toResponse();
+    }
+    const consumed = await consumeRegistrationToken(c.env.DB, await hashToken(candidateToken));
+    if (!consumed) {
+      return Errors.forbidden('Invalid or expired registration token').toResponse();
+    }
   }
 
   // Hash password (null for guests)

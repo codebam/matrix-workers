@@ -28,6 +28,10 @@ export interface Env {
   SERVER_NAME: string;
   SERVER_VERSION: string;
 
+  // Invite-only registration. When "true" (or "1"), every /register call must
+  // present a valid, unspent registration token (see registration_tokens).
+  REGISTRATION_REQUIRE_TOKEN?: string;
+
   // Rate-limit IP source trust.
   // - On Cloudflare, CF-Connecting-IP is set by the edge and is authoritative.
   // - Set TRUST_FORWARDED_FOR="true" only when the worker sits behind a

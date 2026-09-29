@@ -126,7 +126,8 @@
 	],
 	"vars": {
 		"SERVER_NAME": "matrix.codebam.ca",
-		"SERVER_VERSION": "0.1.0"
+		"SERVER_VERSION": "0.1.0",
+		"REGISTRATION_REQUIRE_TOKEN": "true"
 	},
 	"routes": [
 		{

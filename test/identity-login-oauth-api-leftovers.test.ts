@@ -1410,17 +1410,17 @@ describe('login leftovers after #147 — m.login.dummy missing user field', () =
     }
   });
 
-  it('dummy missing identifier → M_MISSING_PARAM', async () => {
+  it('dummy missing identifier → M_UNRECOGNIZED', async () => {
     const res = await loginRequest(
       loginEnv(aliceLoginDb()),
       '/_matrix/client/v3/login',
       jsonInit('POST', { type: 'm.login.dummy' })
     );
     expect(res.status).toBe(400);
-    expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
-  it('dummy with deactivated user → M_USER_DEACTIVATED', async () => {
+  it('dummy with deactivated user → M_UNRECOGNIZED', async () => {
     const res = await loginRequest(
       loginEnv(aliceLoginDb({ is_deactivated: 1 })),
       '/_matrix/client/v3/login',
@@ -1429,8 +1429,8 @@ describe('login leftovers after #147 — m.login.dummy missing user field', () =
         identifier: { type: 'm.id.user', user: 'alice' },
       })
     );
-    expect(res.status).toBe(403);
-    expect(res.body.errcode).toBe('M_USER_DEACTIVATED');
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 });
 
