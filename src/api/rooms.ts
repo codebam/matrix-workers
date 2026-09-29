@@ -1132,6 +1132,8 @@ async function prepareOutboundPdu(
 } | null> {
   try {
     const source = toWireEventObject(event as unknown as Record<string, unknown>);
+    // `unsigned` is local-only and must not travel on the wire.
+    delete source['unsigned'];
     const hashes = { sha256: await calculateContentHash(source) };
     const hashed = { ...source, hashes };
     const wireId = await computeWireEventId(hashed);
@@ -1203,9 +1205,17 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
 
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  const room = await getRoom(c.env.DB, roomId);
+
+  // In the v4 event format (room versions 11+), the create event is
+  // implicitly part of every non-create event's auth chain and MUST NOT
+  // appear explicitly in auth_events -- the receiving server's parser
+  // rejects such events. Older versions require it explicitly.
+  const roomVersionNum = parseInt(String(room?.room_version ?? ''), 10);
+  const createIsImplicit = Number.isFinite(roomVersionNum) && roomVersionNum >= 11;
 
   const authEvents: string[] = [];
-  if (createEvent) authEvents.push(createEvent.event_id);
+  if (createEvent && !createIsImplicit) authEvents.push(createEvent.event_id);
   if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
   if (membership) authEvents.push(membership.eventId);
 

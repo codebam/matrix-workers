@@ -1547,6 +1547,10 @@ describe('GET members / messages / event / send', () => {
       events: [pdu({ type: 'm.room.message', event_id: '$p', depth: 7 })],
       end: 7,
     });
+    defaultState();
+    // Room v12 uses the v4 event format: the create event must not appear in
+    // auth_events (the resident server's parser rejects it).
+    getRoom.mockResolvedValue({ room_id: ROOM, room_version: '12', is_public: 0 });
     // Cloudflare's NODE-ED25519 alias must stay shimmed for signJson too.
     const restore = installNodeEd25519Shim();
     try {
@@ -1591,6 +1595,11 @@ describe('GET members / messages / event / send', () => {
       const signatures = payload.pdu.signatures as Record<string, Record<string, string>>;
       expect(signatures[SERVER]?.['ed25519:test']).toBeTruthy();
       expect(payload.pdu.content).toEqual({ msgtype: 'm.text', body: 'hello remote' });
+      // v4 event format: create is implicit in the auth chain, not explicit.
+      const authEvents = payload.pdu.auth_events as string[];
+      expect(authEvents).not.toContain('$create');
+      expect(authEvents).toContain('$pl');
+      expect(authEvents).toContain('$alice-join');
     } finally {
       restore();
     }
