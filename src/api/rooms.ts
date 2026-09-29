@@ -1225,12 +1225,11 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   // the event silently (its /send returns 200 before background processing).
   // The newest event authored by another server is the safest parent: every
   // participant already has it.
-  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 10);
-  const remoteTip = latestEvents.find((e) => {
-    const server = e.sender?.split(':')[1];
-    return server && server !== c.env.SERVER_NAME;
-  });
-  const parent = remoteTip ?? latestEvents[0];
+  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
+  const remoteTip = await c.env.DB.prepare(
+    `SELECT event_id, depth FROM events WHERE room_id = ? AND sender NOT LIKE ? ORDER BY origin_server_ts DESC LIMIT 1`
+  ).bind(roomId, `%:${c.env.SERVER_NAME}`).first<{ event_id: string; depth: number }>();
+  const parent = remoteTip ?? latestEvents[0] ?? null;
   const prevEvents = parent ? [parent.event_id] : [];
 
   const event: PDU = {

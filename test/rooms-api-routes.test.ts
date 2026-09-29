@@ -141,6 +141,7 @@ type DbOpts = {
   tsEvents?: Array<{ event_id: string; origin_server_ts: number; room_id: string }>;
   lastEvent?: { event_id: string; depth: number } | null;
   remoteJoinedUserIds?: Array<string>;
+  remoteTip?: { event_id: string; depth: number } | null;
 };
 
 function createSqlDb(opts: DbOpts = {}) {
@@ -158,6 +159,7 @@ function createSqlDb(opts: DbOpts = {}) {
   const tsEvents = opts.tsEvents ?? [];
   const lastEvent = opts.lastEvent ?? { event_id: '$last:example.com', depth: 5 };
   const remoteJoinedUserIds = opts.remoteJoinedUserIds ?? [];
+  const remoteTip = opts.remoteTip ?? null;
   const inserts: SqlCall[] = [];
   const updates: SqlCall[] = [];
   const deletes: SqlCall[] = [];
@@ -253,6 +255,10 @@ function createSqlDb(opts: DbOpts = {}) {
                 return (lastEvent
                   ? { event_id: lastEvent.event_id, depth: lastEvent.depth }
                   : null) as T;
+              }
+
+              if (sql.includes('sender NOT LIKE')) {
+                return remoteTip as T;
               }
 
               return null as T;
@@ -1564,7 +1570,7 @@ describe('GET members / messages / event / send', () => {
       const { status, body } = await request(
         `/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.message/txn-r`,
         jsonInit('PUT', { msgtype: 'm.text', body: 'hello remote' }),
-        createSqlDb({ remoteJoinedUserIds: ['@remote:remote.example'] }),
+        createSqlDb({ remoteJoinedUserIds: ['@remote:remote.example'], remoteTip: { event_id: '$r', depth: 6 } }),
         { pushWorkflow: { create: pushCreate }, fedFetch }
       );
       expect(status).toBe(200);
