@@ -30,6 +30,9 @@ vi.mock('../src/services/federation-keys', async (importOriginal) => {
 import federation from '../src/api/federation';
 import { generateSigningKeyPair, verifySignature } from '../src/utils/crypto';
 
+/** Published verify keys are standard (non-URL-safe) unpadded base64. */
+const stdB64 = (k: string) => k.replace(/-/g, '+').replace(/_/g, '/');
+
 const SERVER = 'example.com';
 const REMOTE = 'remote.example.org';
 const USER = '@alice:example.com';
@@ -656,7 +659,7 @@ describe('federation GET /_matrix/key/v2/server', () => {
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.valid_until_ts).toBe(NOW + 86_400_000);
     expect(res.body.old_verify_keys).toEqual({});
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
@@ -838,7 +841,7 @@ describe('federation GET /_matrix/key/v2/server/:keyId', () => {
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
     expect(res.body.verify_keys).toEqual({
-      [securePair.keyId]: { key: securePair.publicKey },
+      [securePair.keyId]: { key: stdB64(securePair.publicKey) },
     });
     expect(res.body.valid_until_ts).toBe(NOW + 86_400_000);
   });
@@ -955,7 +958,7 @@ describe('federation POST /_matrix/key/v2/query', () => {
     expect(res.body.server_keys).toHaveLength(1);
     expect(res.body.server_keys[0].server_name).toBe(SERVER);
     expect(res.body.server_keys[0].verify_keys[securePair.keyId]).toEqual({
-      key: securePair.publicKey,
+      key: stdB64(securePair.publicKey),
     });
     expect(res.body.server_keys[0].signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
     expect(getRemoteKeysWithNotarySignature).not.toHaveBeenCalled();
@@ -1193,7 +1196,7 @@ describe('federation GET /_matrix/key/v2/query/:serverName/:keyId', () => {
     );
     expect(res.status).toBe(200);
     expect(res.body.server_keys[0].verify_keys).toEqual({
-      [securePair.keyId]: { key: securePair.publicKey },
+      [securePair.keyId]: { key: stdB64(securePair.publicKey) },
     });
     expect(res.body.server_keys[0].signatures).toBeTruthy();
   });

@@ -66,6 +66,14 @@ app.get('/_matrix/federation/v1/version', async (c) => {
 // Version endpoint is also unauthenticated as it's used for initial contact
 app.use('/_matrix/federation/v1/*', requireFederationAuth());
 
+// Matrix publishes Ed25519 verify keys as standard (non-URL-safe) unpadded
+// base64. Keys generated here are stored URL-safe, so normalize on publish --
+// strict decoders like Synapse's treat '_'/'-' as invalid alphabet and fail
+// authentication for every signed request from us.
+function toStandardBase64Key(value: string): string {
+  return value.replace(/-/g, '+').replace(/_/g, '/').replace(/=+$/, '');
+}
+
 // GET /_matrix/key/v2/server - Get server signing keys
 app.get('/_matrix/key/v2/server', async (c) => {
   const serverName = c.env.SERVER_NAME;
@@ -142,7 +150,7 @@ app.get('/_matrix/key/v2/server', async (c) => {
 
   const verifyKeys: Record<string, { key: string }> = {};
   for (const key of signableKeys) {
-    verifyKeys[key.key_id] = { key: key.public_key };
+    verifyKeys[key.key_id] = { key: toStandardBase64Key(key.public_key) };
   }
 
   const validUntilTs = keys.results[0]?.valid_until || Date.now() + 365 * 24 * 60 * 60 * 1000;
@@ -182,7 +190,7 @@ app.get('/_matrix/key/v2/server/:keyId', async (c) => {
     server_name: serverName,
     valid_until_ts: key.valid_until || (Date.now() + 365 * 24 * 60 * 60 * 1000),
     verify_keys: {
-      [key.key_id]: { key: key.public_key },
+      [key.key_id]: { key: toStandardBase64Key(key.public_key) },
     },
     old_verify_keys: {},
   };
@@ -293,7 +301,7 @@ app.post('/_matrix/key/v2/query', async (c) => {
         let maxValidUntil = 0;
 
         for (const key of ownKeys.results) {
-          verifyKeys[key.key_id] = { key: key.public_key };
+          verifyKeys[key.key_id] = { key: toStandardBase64Key(key.public_key) };
           if (key.valid_until && key.valid_until > maxValidUntil) {
             maxValidUntil = key.valid_until;
           }
@@ -384,7 +392,7 @@ app.get('/_matrix/key/v2/query/:serverName', async (c) => {
     let maxValidUntil = 0;
 
     for (const key of ownKeys.results) {
-      verifyKeys[key.key_id] = { key: key.public_key };
+      verifyKeys[key.key_id] = { key: toStandardBase64Key(key.public_key) };
       if (key.valid_until && key.valid_until > maxValidUntil) {
         maxValidUntil = key.valid_until;
       }
@@ -470,7 +478,7 @@ app.get('/_matrix/key/v2/query/:serverName/:keyId', async (c) => {
       server_name: serverName,
       valid_until_ts: ownKey.valid_until || Date.now() + 365 * 24 * 60 * 60 * 1000,
       verify_keys: {
-        [ownKey.key_id]: { key: ownKey.public_key },
+        [ownKey.key_id]: { key: toStandardBase64Key(ownKey.public_key) },
       },
       old_verify_keys: {},
     };

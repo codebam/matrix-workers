@@ -117,6 +117,9 @@ function installNodeEd25519Shim() {
   };
 }
 
+/** Published verify keys are standard (non-URL-safe) unpadded base64. */
+const stdB64 = (k: string) => k.replace(/-/g, '+').replace(/_/g, '/');
+
 type EventRow = {
   event_id: string;
   room_id: string;
@@ -941,7 +944,7 @@ describe('federation key endpoints', () => {
       signatures?: Record<string, unknown>;
     };
     expect(b.server_name).toBe(SERVER);
-    expect(b.verify_keys[serverKeyPair.keyId]).toEqual({ key: serverKeyPair.publicKey });
+    expect(b.verify_keys[serverKeyPair.keyId]).toEqual({ key: stdB64(serverKeyPair.publicKey) });
     expect(b.signatures).toBeDefined();
   });
 

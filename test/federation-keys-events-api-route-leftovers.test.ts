@@ -29,6 +29,9 @@ vi.mock('../src/services/federation-keys', async (importOriginal) => {
 import federation from '../src/api/federation';
 import { generateSigningKeyPair } from '../src/utils/crypto';
 
+/** Published verify keys are standard (non-URL-safe) unpadded base64. */
+const stdB64 = (k: string) => k.replace(/-/g, '+').replace(/_/g, '/');
+
 const SERVER = 'example.com';
 const REMOTE = 'remote.example.org';
 const USER = '@alice:example.com';
@@ -754,7 +757,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -764,7 +767,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -774,7 +777,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -784,7 +787,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -794,7 +797,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -804,7 +807,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -814,7 +817,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -824,7 +827,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -834,7 +837,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -844,7 +847,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -854,7 +857,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -864,7 +867,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -874,7 +877,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -884,7 +887,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -894,7 +897,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 
@@ -904,7 +907,7 @@ describe('federation keys leftovers key/v2/server soft flood after #161', () => 
     const res = await request(env, '/_matrix/key/v2/server');
     expect(res.status).toBe(200);
     expect(res.body.server_name).toBe(SERVER);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
     expect(res.body.signatures?.[SERVER]?.[securePair.keyId]).toBeTruthy();
   });
 });
@@ -916,7 +919,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-1', async () => {
@@ -924,7 +927,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-2', async () => {
@@ -932,7 +935,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-3', async () => {
@@ -940,7 +943,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-4', async () => {
@@ -948,7 +951,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-5', async () => {
@@ -956,7 +959,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-6', async () => {
@@ -964,7 +967,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-7', async () => {
@@ -972,7 +975,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-8', async () => {
@@ -980,7 +983,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-9', async () => {
@@ -988,7 +991,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-10', async () => {
@@ -996,7 +999,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-11', async () => {
@@ -1004,7 +1007,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-12', async () => {
@@ -1012,7 +1015,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-13', async () => {
@@ -1020,7 +1023,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-14', async () => {
@@ -1028,7 +1031,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 
   it('keyId soft-15', async () => {
@@ -1036,7 +1039,7 @@ describe('federation keys leftovers key/v2/server/:keyId soft flood after #161',
     const env = createEnv({ db });
     const res = await request(env, `/_matrix/key/v2/server/${encodeURIComponent(securePair.keyId)}`);
     expect(res.status).toBe(200);
-    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: securePair.publicKey });
+    expect(res.body.verify_keys[securePair.keyId]).toEqual({ key: stdB64(securePair.publicKey) });
   });
 });
 
