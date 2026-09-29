@@ -56,6 +56,11 @@ export class UserKeysDurableObject extends DurableObject<Env> {
         return this.listDeviceIds();
       }
 
+      if (path === '/device-keys/delete' && request.method === 'POST') {
+        const body = await request.json() as { device_id: string };
+        return this.deleteDeviceKeys(body.device_id);
+      }
+
       // Cross-signing keys endpoints
       if (path === '/cross-signing/get' && request.method === 'GET') {
         return this.getCrossSigningKeys();
@@ -170,6 +175,23 @@ export class UserKeysDurableObject extends DurableObject<Env> {
     }
 
     console.log('[UserKeysDO] Stored device keys for device:', deviceId);
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  private async deleteDeviceKeys(deviceId: string): Promise<Response> {
+    await this.ctx.storage.delete(`device_keys:${deviceId}`);
+
+    // Stop tracking the device ID
+    const deviceIds = await this.ctx.storage.get<string[]>('device_ids') || [];
+    const index = deviceIds.indexOf(deviceId);
+    if (index >= 0) {
+      deviceIds.splice(index, 1);
+      await this.ctx.storage.put('device_ids', deviceIds);
+    }
+
+    console.log('[UserKeysDO] Deleted device keys for device:', deviceId);
     return new Response(JSON.stringify({ success: true }), {
       headers: { 'Content-Type': 'application/json' },
     });

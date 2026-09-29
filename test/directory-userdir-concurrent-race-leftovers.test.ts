@@ -226,6 +226,12 @@ function createDirectoryDb(
             ).length;
             return { count } as T;
           }
+          // Dehydrated device (MSC3814): no device stored in these fixtures,
+          // so the endpoint answers 404 M_NOT_FOUND (the "supported" signal
+          // Element probes for) instead of M_UNRECOGNIZED.
+          if (sql.includes('FROM dehydrated_devices')) {
+            return null as T;
+          }
 
           throw new Error('Unhandled first() SQL: ' + sql.slice(0, 160));
         },
@@ -3196,7 +3202,9 @@ describe('race thirdparty protocols concurrent stub after #208', () => {
   });
 });
 
-describe('dehydrated device stub concurrent soft after #208', () => {
+describe('dehydrated device endpoint concurrent soft after #208', () => {
+  // The MSC3814 endpoints replaced the old 404 stub; with no device stored the
+  // GET probe still answers 404 M_NOT_FOUND, which Element reads as "supported".
   it('parallel GET dehydrated_device all 404 M_NOT_FOUND', async () => {
     const env = createEnv(createDirectoryDb());
     const results = await Promise.all(

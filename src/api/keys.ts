@@ -83,7 +83,7 @@ async function getDeviceKeysFromDO(env: Env, userId: string, deviceId?: string):
 }
 
 // Store device keys in Durable Object (strongly consistent)
-async function putDeviceKeysToDO(env: Env, userId: string, deviceId: string, keys: any): Promise<void> {
+export async function putDeviceKeysToDO(env: Env, userId: string, deviceId: string, keys: any): Promise<void> {
   const stub = getUserKeysDO(env, userId);
   const response = await stub.fetch(new Request('http://internal/device-keys/put', {
     method: 'POST',
@@ -115,13 +115,29 @@ async function getNextStreamPosition(db: D1Database, streamName: string): Promis
   return result?.position || 1;
 }
 
-async function recordKeyChange(db: D1Database, userId: string, deviceId: string | null, changeType: string): Promise<void> {
+export async function recordKeyChange(db: D1Database, userId: string, deviceId: string | null, changeType: string): Promise<void> {
   const streamPosition = await getNextStreamPosition(db, 'device_keys');
 
   await db.prepare(`
     INSERT INTO device_key_changes (user_id, device_id, change_type, stream_position)
     VALUES (?, ?, ?, ?)
   `).bind(userId, deviceId, changeType, streamPosition).run();
+}
+
+// Remove a device's keys from the Durable Object. Used when a dehydrated
+// device is replaced or deleted so /keys/query stops returning it.
+export async function deleteDeviceKeysFromDO(env: Env, userId: string, deviceId: string): Promise<void> {
+  const stub = getUserKeysDO(env, userId);
+  const response = await stub.fetch(new Request('http://internal/device-keys/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ device_id: deviceId }),
+  }));
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => 'unknown error');
+    console.error('[keys] DO device-keys delete failed:', response.status, errorText, 'deviceId:', deviceId);
+  }
 }
 
 // ============================================
