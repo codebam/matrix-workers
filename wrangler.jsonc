@@ -13,39 +13,39 @@
 		{
 			"binding": "DB",
 			"database_name": "matrix-db",
-			"database_id": "8e82a6bc-1039-4ad0-a36e-f147bbdb643f"
+			"database_id": "20a0c96e-4689-4c3f-a13d-5c2609206001"
 		}
 	],
 	"kv_namespaces": [
 		{
 			"binding": "SESSIONS",
-			"id": "ef547d1e42674e1f9bb35c4c89848a7c"
+			"id": "d58938f6b342452f904e50d719baf287"
 		},
 		{
 			"binding": "DEVICE_KEYS",
-			"id": "53ca37df93b24b6f8f4f5a7ad490b55a"
+			"id": "a4f3fefe2fdb45ac99da508ec945cae6"
 		},
 		{
 			"binding": "CACHE",
-			"id": "9d5ceabf7d7840a9842b48d4a29766e5"
+			"id": "96b2281cd4684db69488ca123f688bdd"
 		},
 		{
 			"binding": "CROSS_SIGNING_KEYS",
-			"id": "661f21089f2148f9a73e64b522640a79"
+			"id": "277e185f16bd40aeb9be8e2a63da2eab"
 		},
 		{
 			"binding": "ACCOUNT_DATA",
-			"id": "398d160e2adf4ff6b3f8a28b4bbf0c38"
+			"id": "48ba210a0fb84acba18cc83885ea0fee"
 		},
 		{
 			"binding": "ONE_TIME_KEYS",
-			"id": "eabb6bc6f03f423aa30e0490196fa26c"
+			"id": "a553a406f9b14bb4bceab70366f56bdb"
 		}
 	],
 	"r2_buckets": [
 		{
 			"binding": "MEDIA",
-			"bucket_name": "matrix-media"
+			"bucket_name": "matrix-media-codebam"
 		}
 	],
 	"durable_objects": {
@@ -125,12 +125,12 @@
 		}
 	],
 	"vars": {
-		"SERVER_NAME": "matrix.fuzzywigg.com",
+		"SERVER_NAME": "matrix.codebam.ca",
 		"SERVER_VERSION": "0.1.0"
 	},
 	"routes": [
 		{
-			"pattern": "matrix.fuzzywigg.com",
+			"pattern": "matrix.codebam.ca",
 			"custom_domain": true
 		}
 	],
