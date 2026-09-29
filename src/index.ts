@@ -38,6 +38,7 @@ import calls from './api/calls';
 import rtc from './api/rtc';
 import appservice from './api/appservice';
 import identity from './api/identity';
+import dehydratedDevice from './api/dehydrated-device';
 // import qrLogin from './api/qr-login'; // QR feature commented out - requires MSC4108/OIDC for Element X
 import oidcAuth from './api/oidc-auth';
 import oauth from './api/oauth';
@@ -126,6 +127,7 @@ app.route('/', media);
 app.route('/', voip);
 app.route('/', keys);
 app.route('/', keyBackups);
+app.route('/', dehydratedDevice);
 app.route('/', toDevice);
 app.route('/', push);
 app.route('/', accountData);
@@ -383,13 +385,7 @@ app.get('/_matrix/client/v3/thirdparty/protocols', async (c) => {
   return c.json({});
 });
 
-// Dehydrated device (MSC3814 - stub)
-app.get('/_matrix/client/unstable/org.matrix.msc3814.v1/dehydrated_device', async (c) => {
-  return c.json({
-    errcode: 'M_NOT_FOUND',
-    error: 'No dehydrated device found',
-  }, 404);
-});
+// Dehydrated device (MSC3814) routes live in ./api/dehydrated-device
 
 // OIDC auth metadata endpoints are now handled by oidc-auth.ts
 // Legacy unstable endpoint for backwards compatibility
