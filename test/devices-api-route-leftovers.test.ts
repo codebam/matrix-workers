@@ -2861,7 +2861,6 @@ describe('devices leftovers non-password auth DELETE soft flood after #232', () 
       expect(db.devices.find((d) => d.device_id === id)).toBeUndefined();
       expect(db.deletes.map((d) => d.sql)).toEqual([
         expect.stringContaining('DELETE FROM access_tokens'),
-        expect.stringContaining('DELETE FROM device_keys'),
         expect.stringContaining('DELETE FROM devices'),
       ]);
     });
@@ -2953,10 +2952,9 @@ describe('devices leftovers cascade order soft flood after #232', () => {
         jsonInit('DELETE', { auth: { type: 'm.login.password', password: 's3cret' } })
       );
       expect(res.status).toBe(200);
-      expect(db.deletes).toHaveLength(3);
+      expect(db.deletes).toHaveLength(2);
       expect(db.deletes[0].sql).toContain('access_tokens');
-      expect(db.deletes[1].sql).toContain('device_keys');
-      expect(db.deletes[2].sql).toContain('DELETE FROM devices');
+      expect(db.deletes[1].sql).toContain('DELETE FROM devices');
       expect(db.deletes.every((d) => d.args[0] === USER && d.args[1] === id)).toBe(true);
     });
   }
@@ -3078,8 +3076,8 @@ describe('devices leftovers delete_devices null/duplicate/bulk edges after #232'
       );
       expect(res.status).toBe(200);
       expect(db.devices).toHaveLength(0);
-      // three cascade triples (tokens/keys/device) for each list entry
-      expect(db.deletes).toHaveLength(9);
+      // two cascade pairs (tokens/device) for each list entry
+      expect(db.deletes).toHaveLength(6);
     });
   }
 

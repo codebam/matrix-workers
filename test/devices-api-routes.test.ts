@@ -514,7 +514,6 @@ describe('devices DELETE /_matrix/client/v3/devices/:deviceId', () => {
     expect(verifyPassword).toHaveBeenCalledWith('s3cret', 'mockok:s3cret');
     expect(db.deletes.map((d) => d.sql.replace(/\s+/g, ' ').trim())).toEqual([
       expect.stringContaining('DELETE FROM access_tokens'),
-      expect.stringContaining('DELETE FROM device_keys'),
       expect.stringContaining('DELETE FROM devices'),
     ]);
     expect(db.devices.map((d) => d.device_id)).toEqual(['KEEP']);
@@ -664,8 +663,8 @@ describe('devices POST /_matrix/client/v3/delete_devices', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({});
     expect(db.devices.map((d) => d.device_id)).toEqual(['B']);
-    // 3 deletes per device × 2 devices
-    expect(db.deletes).toHaveLength(6);
+    // 2 deletes per device × 2 devices (device keys live in the UserKeys DO)
+    expect(db.deletes).toHaveLength(4);
   });
 
   it('accepts empty devices array with auth (no deletes)', async () => {
@@ -713,7 +712,7 @@ describe('devices POST /_matrix/client/v3/delete_devices', () => {
       })
     );
     expect(res.status).toBe(200);
-    expect(db.deletes).toHaveLength(3);
+    expect(db.deletes).toHaveLength(2);
     expect(db.devices.map((d) => d.device_id)).toEqual(['KEEP']);
   });
 });
@@ -1127,7 +1126,7 @@ describe('devices DELETE — UIA session / auth matrix', () => {
     expect(db.devices.map((d) => d.device_id)).toEqual(['OTHER']);
   });
 
-  it('DELETE cascade order is access_tokens → device_keys → devices', async () => {
+  it('DELETE cascade order is access_tokens → devices', async () => {
     const db = createDevicesDb({ devices: [seedDevice({ device_id: 'ORD' })] });
     await request(
       db,
@@ -1138,7 +1137,6 @@ describe('devices DELETE — UIA session / auth matrix', () => {
     );
     expect(db.deletes.map((d) => d.sql.replace(/\s+/g, ' ').trim())).toEqual([
       expect.stringContaining('DELETE FROM access_tokens'),
-      expect.stringContaining('DELETE FROM device_keys'),
       expect.stringContaining('DELETE FROM devices'),
     ]);
     expect(db.deletes.every((d) => d.args[0] === USER && d.args[1] === 'ORD')).toBe(true);
@@ -1285,8 +1283,8 @@ describe('devices POST delete_devices — bulk edges', () => {
       })
     );
     expect(res.status).toBe(200);
-    // 3 deletes × 2 iterations
-    expect(db.deletes).toHaveLength(6);
+    // 2 deletes × 2 iterations (no D1 device_keys cleanup anymore)
+    expect(db.deletes).toHaveLength(4);
     expect(db.devices).toHaveLength(0);
   });
 
@@ -1379,7 +1377,7 @@ describe('devices POST delete_devices — bulk edges', () => {
     );
     expect(res.status).toBe(200);
     expect(db.devices).toHaveLength(0);
-    expect(db.deletes).toHaveLength(25 * 3);
+    expect(db.deletes).toHaveLength(25 * 2);
   });
 
   it('verifyPassword receives stored hash and submitted password on bulk', async () => {
@@ -1628,7 +1626,7 @@ describe('devices SQL bind contracts — every mutating path', () => {
     expect(db.updates[0].args).toEqual(['Label', USER, 'P1']);
   });
 
-  it('single DELETE binds userId+deviceId on each of three DELETE statements', async () => {
+  it('single DELETE binds userId+deviceId on each DELETE statement', async () => {
     const db = createDevicesDb({ devices: [seedDevice({ device_id: 'P2' })] });
     await request(
       db,
@@ -1637,7 +1635,7 @@ describe('devices SQL bind contracts — every mutating path', () => {
         auth: { type: 'm.login.password', password: 's3cret' },
       })
     );
-    expect(db.deletes).toHaveLength(3);
+    expect(db.deletes).toHaveLength(2);
     for (const d of db.deletes) {
       expect(d.args).toEqual([USER, 'P2']);
     }
@@ -1656,7 +1654,7 @@ describe('devices SQL bind contracts — every mutating path', () => {
       })
     );
     const deviceIdArgs = db.deletes.map((d) => d.args[1]);
-    expect(deviceIdArgs).toEqual(['A', 'A', 'A', 'B', 'B', 'B']);
+    expect(deviceIdArgs).toEqual(['A', 'A', 'B', 'B']);
   });
 });
 
@@ -1936,8 +1934,8 @@ describe('devices bulk request validation matrix', () => {
       })
     );
     expect(res.status).toBe(200);
-    // three cascade groups
-    expect(db.deletes).toHaveLength(9);
+    // two cascade groups
+    expect(db.deletes).toHaveLength(6);
     expect(db.devices).toHaveLength(0);
   });
 

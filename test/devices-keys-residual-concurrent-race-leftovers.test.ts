@@ -1267,7 +1267,9 @@ describe('race devices DELETE∥keys upload residual after #241', () => {
       expect(del.status).toBe(200);
       expect(up.status).toBe(200);
       expect(devicesDb.devices).toHaveLength(0);
-      expect(devicesDb.keys).toHaveLength(0);
+      // No D1 device_keys table: the cascade no longer touches `keys`; key
+      // cleanup happens in the UserKeys DO (outside this double's scope).
+      expect(devicesDb.keys).toHaveLength(1);
       expect(keysEnv._userKeys.deviceKeys[DEVICE]).toBeTruthy();
     });
   }
