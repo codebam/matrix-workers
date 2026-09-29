@@ -18,6 +18,7 @@ import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
 import { generateOpaqueId } from '../utils/ids';
 import { getPasswordHash, notifyUserSync } from '../services/database';
+import { federationPost } from '../services/federation-keys';
 
 const app = new Hono<AppEnv>();
 
@@ -363,8 +364,19 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
     return deviceKey;
   }
 
+  const remoteKeyRequests: Record<string, Record<string, string[]>> = {};
+
   if (requestedKeys) {
     for (const [userId, devices] of Object.entries(requestedKeys)) {
+      // Users on other servers are resolved over federation below; the
+      // local Durable Object only knows this server's users.
+      if (!userId.endsWith(`:${c.env.SERVER_NAME}`)) {
+        const server = userId.slice(userId.indexOf(':') + 1);
+        remoteKeyRequests[server] = remoteKeyRequests[server] || {};
+        remoteKeyRequests[server][userId] = Array.isArray(devices) ? devices as string[] : [];
+        continue;
+      }
+
       deviceKeys[userId] = {};
 
       // Get device keys from Durable Object (strongly consistent)
@@ -412,6 +424,49 @@ app.post('/_matrix/client/v3/keys/query', requireAuth(), async (c) => {
     }
   }
 
+  // Proxy device-key queries for users on other servers. Without this,
+  // clients see zero devices for federated users, can never share room keys
+  // with them, and every message shows as "unable to decrypt" on the far
+  // side even though the events themselves are delivered fine.
+  for (const [server, userMap] of Object.entries(remoteKeyRequests)) {
+    try {
+      const response = await federationPost(
+        server,
+        '/_matrix/federation/v1/user/keys/query',
+        { device_keys: userMap },
+        c.env.SERVER_NAME,
+        c.env.DB,
+        c.env.CACHE
+      );
+
+      if (!response.ok) {
+        failures[server] = {
+          errcode: 'M_UNKNOWN',
+          error: `Remote server returned ${response.status}`,
+        };
+      } else {
+        const data = await response.json() as {
+          device_keys?: Record<string, Record<string, any>>;
+          master_keys?: Record<string, any>;
+          self_signing_keys?: Record<string, any>;
+        };
+        Object.assign(deviceKeys, data.device_keys ?? {});
+        Object.assign(masterKeys, data.master_keys ?? {});
+        Object.assign(selfSigningKeys, data.self_signing_keys ?? {});
+      }
+    } catch (err) {
+      failures[server] = { errcode: 'M_UNKNOWN', error: String(err) };
+    }
+
+    // Always present the requested users in device_keys (even when empty),
+    // matching the local-user branch above.
+    for (const userId of Object.keys(userMap)) {
+      if (!(userId in deviceKeys)) {
+        deviceKeys[userId] = {};
+      }
+    }
+  }
+
   return c.json({
     device_keys: deviceKeys,
     master_keys: masterKeys,
@@ -437,8 +492,18 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
   const oneTimeKeys: Record<string, Record<string, Record<string, any>>> = {};
   const failures: Record<string, any> = {};
 
+  const remoteClaimRequests: Record<string, Record<string, Record<string, string>>> = {};
+
   if (requestedKeys) {
     for (const [userId, devices] of Object.entries(requestedKeys)) {
+      // Users on other servers are claimed over federation below.
+      if (!userId.endsWith(`:${c.env.SERVER_NAME}`)) {
+        const server = userId.slice(userId.indexOf(':') + 1);
+        remoteClaimRequests[server] = remoteClaimRequests[server] || {};
+        remoteClaimRequests[server][userId] = devices as Record<string, string>;
+        continue;
+      }
+
       oneTimeKeys[userId] = {};
 
       for (const [deviceId, algorithm] of Object.entries(devices as Record<string, string>)) {
@@ -528,6 +593,42 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
             };
           }
         }
+      }
+    }
+  }
+
+  // Proxy one-time-key claims for users on other servers: establishing an
+  // Olm session with a federated device requires claiming its OTK from its
+  // homeserver.
+  for (const [server, userMap] of Object.entries(remoteClaimRequests)) {
+    try {
+      const response = await federationPost(
+        server,
+        '/_matrix/federation/v1/user/keys/claim',
+        { one_time_keys: userMap },
+        c.env.SERVER_NAME,
+        c.env.DB,
+        c.env.CACHE
+      );
+
+      if (!response.ok) {
+        failures[server] = {
+          errcode: 'M_UNKNOWN',
+          error: `Remote server returned ${response.status}`,
+        };
+      } else {
+        const data = await response.json() as {
+          one_time_keys?: Record<string, Record<string, Record<string, any>>>;
+        };
+        Object.assign(oneTimeKeys, data.one_time_keys ?? {});
+      }
+    } catch (err) {
+      failures[server] = { errcode: 'M_UNKNOWN', error: String(err) };
+    }
+
+    for (const userId of Object.keys(userMap)) {
+      if (!(userId in oneTimeKeys)) {
+        oneTimeKeys[userId] = {};
       }
     }
   }

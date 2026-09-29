@@ -165,7 +165,22 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
   }
 
   // Process each recipient user
+  const localSuffix = `:${c.env.SERVER_NAME}`;
+  const remoteByServer: Record<string, Record<string, Record<string, any>>> = {};
+
   for (const [recipientUserId, deviceMessages] of Object.entries(body.messages)) {
+    // Users on other servers cannot be delivered to locally; collect them
+    // and forward as m.direct_to_device EDUs after the local pass. Only
+    // well-formed user IDs (@localpart:server) count as remote -- junk keys
+    // fall through to the local path unchanged.
+    const colon = recipientUserId.indexOf(':');
+    if (colon > 0 && recipientUserId.startsWith('@') && !recipientUserId.endsWith(localSuffix)) {
+      const server = recipientUserId.slice(colon + 1);
+      remoteByServer[server] = remoteByServer[server] || {};
+      remoteByServer[server][recipientUserId] = deviceMessages;
+      continue;
+    }
+
     // Get list of device IDs to send to
     let targetDevices: string[];
 
@@ -198,6 +213,33 @@ app.put('/_matrix/client/v3/sendToDevice/:eventType/:txnId', requireAuth(), asyn
           streamPosition
         ).run();
       }
+    }
+  }
+
+  // Forward messages addressed to remote users over federation as
+  // m.direct_to_device EDUs. Without this, key shares (m.room_key) and
+  // verification messages targeted at users on other servers are stored
+  // locally and never delivered -- the remote side then shows everything
+  // this user sends as "unable to decrypt".
+  for (const [server, messages] of Object.entries(remoteByServer)) {
+    try {
+      const fedDO = c.env.FEDERATION.get(c.env.FEDERATION.idFromName(server));
+      await fedDO.fetch(new Request('http://internal/send-edu', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          destination: server,
+          edu_type: 'm.direct_to_device',
+          content: {
+            sender: userId,
+            type: eventType,
+            message_id: `m${Date.now()}.${Math.random().toString(36).slice(2, 10)}`,
+            messages,
+          },
+        }),
+      }));
+    } catch (fedErr) {
+      console.warn('[to-device] Failed to queue federated to-device EDU:', fedErr);
     }
   }
 

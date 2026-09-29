@@ -35,7 +35,16 @@ vi.mock('../src/utils/ids', async (importOriginal) => {
   };
 });
 
+vi.mock('../src/services/federation-keys', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/federation-keys')>();
+  return {
+    ...actual,
+    federationPost: vi.fn(async () => new Response('{}', { status: 200 })),
+  };
+});
+
 import keysApp from '../src/api/keys';
+import { federationPost } from '../src/services/federation-keys';
 
 const USER = '@alice:example.com';
 const BOB = '@bob:example.com';
@@ -2586,5 +2595,127 @@ describe('keys TOKENMAXX leftovers after #99/#101', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ failures: {} });
     expect(db.keyChanges.length).toBeGreaterThan(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Federated key queries (client -> federation proxy for remote users)
+// ---------------------------------------------------------------------------
+
+describe('keys federated queries', () => {
+  const REMOTE_USER = `@remote:${REMOTE}`;
+
+  beforeEach(() => {
+    vi.mocked(federationPost).mockReset();
+    vi.mocked(federationPost).mockResolvedValue(new Response('{}', { status: 200 }));
+  });
+
+  it('proxies /keys/query for remote users over federation and merges their keys', async () => {
+    vi.mocked(federationPost).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          device_keys: {
+            [REMOTE_USER]: {
+              REMOTEDEV: { user_id: REMOTE_USER, device_id: 'REMOTEDEV', keys: { 'ed25519:REMOTEDEV': 'abc' } },
+            },
+          },
+          master_keys: { [REMOTE_USER]: { usage: ['master'] } },
+          self_signing_keys: { [REMOTE_USER]: { usage: ['self_signing'] } },
+        }),
+        { status: 200 }
+      )
+    );
+
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/query',
+      jsonInit('POST', { device_keys: { [REMOTE_USER]: [] } })
+    );
+
+    expect(res.status).toBe(200);
+    const call = vi.mocked(federationPost).mock.calls[0];
+    expect(call[0]).toBe(REMOTE);
+    expect(call[1]).toBe('/_matrix/federation/v1/user/keys/query');
+    expect(call[2]).toEqual({ device_keys: { [REMOTE_USER]: [] } });
+
+    const body = res.body as any;
+    expect(body.device_keys[REMOTE_USER]).toMatchObject({
+      REMOTEDEV: { device_id: 'REMOTEDEV' },
+    });
+    expect(body.master_keys[REMOTE_USER]).toEqual({ usage: ['master'] });
+    expect(body.self_signing_keys[REMOTE_USER]).toEqual({ usage: ['self_signing'] });
+    expect(body.failures).toEqual({});
+  });
+
+  it('records a failure entry when the remote /keys/query fails', async () => {
+    vi.mocked(federationPost).mockRejectedValue(new Error('boom'));
+
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/query',
+      jsonInit('POST', { device_keys: { [REMOTE_USER]: [] } })
+    );
+
+    expect(res.status).toBe(200);
+    const body = res.body as any;
+    expect(body.failures[REMOTE]).toBeTruthy();
+    expect(body.device_keys[REMOTE_USER]).toEqual({});
+  });
+
+  it('proxies /keys/claim for remote users and merges one-time keys', async () => {
+    vi.mocked(federationPost).mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          one_time_keys: {
+            [REMOTE_USER]: { REMOTEDEV: { 'signed_curve25519:AAAA': { key: 'k' } } },
+          },
+        }),
+        { status: 200 }
+      )
+    );
+
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/claim',
+      jsonInit('POST', { one_time_keys: { [REMOTE_USER]: { REMOTEDEV: 'signed_curve25519' } } })
+    );
+
+    expect(res.status).toBe(200);
+    const call = vi.mocked(federationPost).mock.calls[0];
+    expect(call[0]).toBe(REMOTE);
+    expect(call[1]).toBe('/_matrix/federation/v1/user/keys/claim');
+    expect(call[2]).toEqual({
+      one_time_keys: { [REMOTE_USER]: { REMOTEDEV: 'signed_curve25519' } },
+    });
+
+    const body = res.body as any;
+    expect(body.one_time_keys[REMOTE_USER].REMOTEDEV['signed_curve25519:AAAA']).toEqual({ key: 'k' });
+    expect(body.failures).toEqual({});
+  });
+
+  it('serves local users from the Durable Object while proxying remote users', async () => {
+    const userKeys = createUserKeysStub({
+      deviceKeys: { [DEVICE]: deviceKeysPayload() },
+    });
+    const env = createEnv({ userKeys });
+
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/query',
+      jsonInit('POST', { device_keys: { [USER]: [], [REMOTE_USER]: [] } })
+    );
+
+    expect(res.status).toBe(200);
+    const body = res.body as any;
+    expect(body.device_keys[USER][DEVICE]).toBeTruthy();
+    expect(body.device_keys[REMOTE_USER]).toEqual({});
+    // Only the remote user triggered a federation call.
+    expect(vi.mocked(federationPost)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(federationPost).mock.calls[0][2]).toEqual({
+      device_keys: { [REMOTE_USER]: [] },
+    });
   });
 });

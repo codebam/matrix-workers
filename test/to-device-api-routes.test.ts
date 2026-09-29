@@ -182,11 +182,12 @@ function createToDeviceDb(opts: {
 
 type ToDeviceDb = ReturnType<typeof createToDeviceDb>;
 
-function createEnv(db?: ToDeviceDb) {
+function createEnv(db?: ToDeviceDb, federation?: unknown) {
   const d = db ?? createToDeviceDb();
   return {
     DB: d as unknown as D1Database,
     SERVER_NAME: 'example.com',
+    FEDERATION: federation,
     _db: d,
   } as unknown as Env & { _db: ToDeviceDb };
 }
@@ -635,5 +636,52 @@ describe('PUT /sendToDevice/:eventType/:txnId', () => {
       jsonInit('PUT', { messages: { [BOB]: { DEVZ: {} } } })
     );
     expect(db.messages[0].message_id.startsWith(`${USER}_id-txn_${BOB}_DEVZ_`)).toBe(true);
+  });
+
+  it('federates messages addressed to remote users as m.direct_to_device EDUs', async () => {
+    const db = createToDeviceDb();
+    const fedCalls: Array<{ id: string; url: string; body: any }> = [];
+    const federation = {
+      idFromName: (name: string) => name,
+      get: (name: string) => ({
+        fetch: async (req: Request) => {
+          fedCalls.push({ id: name, url: req.url, body: await req.json() });
+          return new Response('Queued');
+        },
+      }),
+    };
+    const env = createEnv(db, federation);
+    const remote = '@remote:remote.example.org';
+
+    const res = await request(
+      env,
+      sendPath(EVENT_TYPE, 'txn-fed'),
+      jsonInit('PUT', {
+        messages: {
+          [BOB]: { DEVZ: { to: 'bob' } },
+          [remote]: { REMOTEDEV1: { key: 'k' }, REMOTEDEV2: { key: 'k2' } },
+        },
+      })
+    );
+    expect(res.status).toBe(200);
+
+    // Local recipients are still stored locally...
+    expect(db.messages.filter((m) => m.recipient_user_id === BOB)).toHaveLength(1);
+    // ...but remote recipients are not (they cannot sync locally).
+    expect(db.messages.filter((m) => m.recipient_user_id === remote)).toHaveLength(0);
+
+    expect(fedCalls).toHaveLength(1);
+    expect(fedCalls[0].id).toBe('remote.example.org');
+    expect(fedCalls[0].url).toContain('/send-edu');
+    expect(fedCalls[0].body).toMatchObject({
+      destination: 'remote.example.org',
+      edu_type: 'm.direct_to_device',
+      content: {
+        sender: USER,
+        type: EVENT_TYPE,
+        messages: { [remote]: { REMOTEDEV1: { key: 'k' }, REMOTEDEV2: { key: 'k2' } } },
+      },
+    });
+    expect(typeof fedCalls[0].body.content.message_id).toBe('string');
   });
 });
