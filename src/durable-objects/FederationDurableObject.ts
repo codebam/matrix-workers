@@ -338,6 +338,11 @@ export class FederationDurableObject extends DurableObject<Env> {
           // If response body is not JSON, treat all as accepted
         }
 
+        console.log(
+          `[federation] Transaction ${txnId} results from ${destination}: ` +
+            JSON.stringify(responseBody?.pdus ?? {}).slice(0, 1200)
+        );
+
         // Remove accepted events from queue, re-queue rejected ones
         const pduResults = responseBody?.pdus || {};
         for (const event of events) {
