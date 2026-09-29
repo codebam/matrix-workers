@@ -57,7 +57,8 @@ async function purgeDehydratedDevice(env: Env, userId: string, deviceId: string)
   await env.DEVICE_KEYS.delete(`device:${userId}:${deviceId}`);
   await env.ONE_TIME_KEYS.delete(`otk:${userId}:${deviceId}`);
 
-  await db.prepare(`DELETE FROM device_keys WHERE user_id = ? AND device_id = ?`).bind(userId, deviceId).run();
+  // NOTE: there is no `device_keys` D1 table (device keys live only in the
+  // UserKeys Durable Object), so nothing else to delete here.
   await db.prepare(`DELETE FROM one_time_keys WHERE user_id = ? AND device_id = ?`).bind(userId, deviceId).run();
   await deleteDevice(db, userId, deviceId);
   await recordKeyChange(db, userId, deviceId, 'delete');
