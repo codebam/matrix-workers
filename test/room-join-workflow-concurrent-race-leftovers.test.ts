@@ -23,6 +23,7 @@ vi.mock('cloudflare:workers', () => ({
 }));
 
 const storeEvent = vi.fn(async () => 1);
+const storeEventIdempotent = vi.fn(async () => ({ inserted: true, streamOrdering: 1 }));
 const updateMembership = vi.fn(async () => undefined);
 const getRoomMembers = vi.fn(async () => [] as Array<{ userId: string }>);
 const getStateEvent = vi.fn(async () => null as { event_id: string } | null);
@@ -36,6 +37,7 @@ const generateEventId = vi.fn(async () => '$generated:example.com');
 
 vi.mock('../src/services/database', () => ({
   storeEvent: (...args: unknown[]) => storeEvent(...args),
+  storeEventIdempotent: (...args: unknown[]) => storeEventIdempotent(...args),
   updateMembership: (...args: unknown[]) => updateMembership(...args),
   getRoomMembers: (...args: unknown[]) => getRoomMembers(...args),
   getStateEvent: (...args: unknown[]) => getStateEvent(...args),

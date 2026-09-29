@@ -830,6 +830,31 @@ describe('POST /rooms/:roomId/join', () => {
     });
   });
 
+  it('remote invited room: accept routes through the federation workflow', async () => {
+    getRoom.mockResolvedValue({ room_id: REMOTE_ROOM, room_version: '10' });
+    getMembership.mockResolvedValue({ membership: 'invite', eventId: '$invite:remote.org' });
+    const workflow = createWorkflowStub({ status: 'running' });
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${REMOTE_ENC}/join`,
+      jsonInit('POST', {}),
+      createSqlDb(),
+      { workflow }
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ room_id: REMOTE_ROOM });
+    expect(workflow.creates[0]).toMatchObject({
+      params: {
+        roomId: REMOTE_ROOM,
+        userId: USER,
+        isRemote: true,
+        remoteServer: 'remote.org',
+      },
+    });
+    // The join must be registered by the workflow's make_join/send_join
+    // handshake, not by the local join path.
+    expect(storeEventIdempotent).not.toHaveBeenCalled();
+  });
+
   it('remote missing room: succeeds when workflow complete+success', async () => {
     getRoom.mockResolvedValue(null);
     const workflow = createWorkflowStub({

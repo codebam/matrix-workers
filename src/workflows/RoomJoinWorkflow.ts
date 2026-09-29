@@ -11,6 +11,7 @@ import type { Env } from '../types';
 import { generateEventId } from '../utils/ids';
 import {
   storeEvent,
+  storeEventIdempotent,
   updateMembership,
   getRoomMembers,
   getStateEvent,
@@ -97,8 +98,9 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       }) as SerializableEvent;
 
       // Step 3: For remote joins, send signed event to remote server
+      let sendJoinResponse: { auth_chain?: any[]; state?: any[]; event?: any } | null = null;
       if (isRemote && remoteServer && joinEventData) {
-        await step.do('send-join', {
+        sendJoinResponse = (await step.do('send-join', {
           retries: {
             limit: 3,
             delay: 5000,
@@ -107,6 +109,24 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           timeout: 30000,
         }, async () => {
           return await this.sendJoinRequest(remoteServer, roomId, joinEventData);
+        })) as { auth_chain?: any[]; state?: any[]; event?: any };
+      }
+
+      // Step 3b: Persist the room state the remote server returned with the
+      // accepted join (v2 send_join: auth_chain + state + counter-signed
+      // event). Without it, events the remote server later relays to us
+      // can't be authorized locally -- auth checks need the full state.
+      if (sendJoinResponse) {
+        await step.do('store-remote-state', async () => {
+          const remoteEvents = [
+            ...(Array.isArray(sendJoinResponse?.auth_chain) ? sendJoinResponse.auth_chain : []),
+            ...(Array.isArray(sendJoinResponse?.state) ? sendJoinResponse.state : []),
+            ...(sendJoinResponse?.event ? [sendJoinResponse.event] : []),
+          ];
+          for (const ev of remoteEvents) {
+            if (!ev || typeof ev !== 'object' || !ev.event_id || !ev.type) continue;
+            await storeEventIdempotent(this.env.DB, ev);
+          }
         });
       }
 
@@ -254,7 +274,7 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   ): Promise<any> {
     console.log('[RoomJoinWorkflow] Sending send_join request', { remoteServer, roomId, eventId: joinEvent.event_id });
 
-    const path = `/_matrix/federation/v1/send_join/${encodeURIComponent(roomId)}/${encodeURIComponent(joinEvent.event_id)}`;
+    const path = `/_matrix/federation/v2/send_join/${encodeURIComponent(roomId)}/${encodeURIComponent(joinEvent.event_id)}`;
 
     const response = await federationPut(
       remoteServer,
@@ -270,8 +290,9 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       throw new Error(`send_join failed: ${response.status} ${error}`);
     }
 
-    const result = await response.json();
-    return result;
+    // v2 send_join returns { auth_chain, origin, state, event }: the join
+    // counter-signed by the resident server plus the room's current state.
+    return await response.json();
   }
 
   // Notify a batch of members about the join
