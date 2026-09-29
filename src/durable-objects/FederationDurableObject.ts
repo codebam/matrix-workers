@@ -4,6 +4,7 @@ import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../types';
 import { getServerSigningKey, signFederationRequest } from '../services/federation-keys';
 import { discoverServer, buildServerUrl } from '../services/server-discovery';
+import { federationFetch } from '../services/federation-http';
 
 interface FederationTarget {
   serverName: string;
@@ -314,7 +315,7 @@ export class FederationDurableObject extends DurableObject<Env> {
         serverUrl = `https://${destination}`;
       }
 
-      const response = await fetch(`${serverUrl}${path}`, {
+      const response = await federationFetch(`${serverUrl}${path}`, {
         method: 'PUT',
         headers,
         body: JSON.stringify(content),

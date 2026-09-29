@@ -4,6 +4,7 @@
 
 import { verifySignature, signJson, base64UrlDecode } from '../utils/crypto';
 import { discoverServer, buildServerUrl } from './server-discovery';
+import { federationFetch } from './federation-http';
 
 export interface ServerKeyResponse {
   server_name: string;
@@ -162,7 +163,7 @@ async function fetchKeysFromRemote(
   const discovery = await discoverServer(serverName, cache);
   const serverUrl = buildServerUrl(discovery);
 
-  const response = await fetch(`${serverUrl}/_matrix/key/v2/server`, {
+  const response = await federationFetch(`${serverUrl}/_matrix/key/v2/server`, {
     headers: {
       Accept: 'application/json',
     },
@@ -264,7 +265,7 @@ export async function fetchRawServerKeyResponse(
     const discovery = await discoverServer(serverName, cache);
     const serverUrl = buildServerUrl(discovery);
 
-    const response = await fetch(`${serverUrl}/_matrix/key/v2/server`, {
+    const response = await federationFetch(`${serverUrl}/_matrix/key/v2/server`, {
       headers: {
         Accept: 'application/json',
       },
@@ -613,7 +614,7 @@ export async function makeFederationRequest(
     options.body = JSON.stringify(body);
   }
 
-  return fetch(`${serverUrl}${path}`, options);
+  return federationFetch(`${serverUrl}${path}`, options);
 }
 
 /**
