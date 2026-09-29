@@ -1496,8 +1496,9 @@ app.post('/admin/api/users/:userId/login-token', requireAuth(), requireAdmin, as
     return c.json({ errcode: 'M_USER_DEACTIVATED', error: 'User is deactivated' }, 400);
   }
 
-  // Parse optional TTL from request body (default 10 minutes)
-  let ttlMinutes = 10;
+  // Parse optional TTL from request body (default 5 minutes — audit 010.6:
+  // login tokens are bearer credentials and should be short-lived by default)
+  let ttlMinutes = 5;
   try {
     const body = await c.req.json();
     if (body.ttl_minutes && typeof body.ttl_minutes === 'number') {
@@ -1528,6 +1529,15 @@ app.post('/admin/api/users/:userId/login-token', requireAuth(), requireAdmin, as
   const protocol = c.req.url.startsWith('https') ? 'https' : 'https'; // Always use https for production
   const host = c.req.header('host') || c.env.SERVER_NAME;
   const qrUrl = `${protocol}://${host}/login/qr/${loginToken}`;
+
+  // Never let intermediaries or the browser cache a response carrying a live
+  // login token (audit 010.6), and record the issuance in the admin audit log.
+  c.header('Cache-Control', 'no-store');
+  await logAdminAction(c, {
+    action: 'user.login-token.create',
+    target: userId,
+    details: { ttl_seconds: ttlMinutes * 60, expires_at: expiresAt },
+  });
 
   return c.json({
     success: true,

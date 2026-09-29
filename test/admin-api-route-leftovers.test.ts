@@ -4208,7 +4208,7 @@ describe('admin leftovers media DELETE / login-token clamp / federation-test sof
     it(`login-token TTL clamp soft-${i}`, async () => {
       const sessions = mockKv();
       const cases = [
-        { ttl: 0, expectSec: 600 },
+        { ttl: 0, expectSec: 300 },
         { ttl: 0.5, expectSec: 60 },
         { ttl: 120, expectSec: 3600 },
         { ttl: 999, expectSec: 3600 },
@@ -4227,6 +4227,25 @@ describe('admin leftovers media DELETE / login-token clamp / federation-test sof
       expect(sessions.puts[0].options?.expirationTtl).toBe(c.expectSec);
     });
   }
+
+  it('login-token default is 5 minutes, no-store, and audited', async () => {
+    const sessions = mockKv();
+    const db = createAdminDb();
+    const res = await req(
+      `/admin/api/users/${encodeURIComponent(BOB)}/login-token`,
+      jsonInit('POST', {}),
+      createEnv({ sessions, db })
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(sessions.puts[0].options?.expirationTtl).toBe(300);
+    const entry = db.audit.find(
+      (a: { action?: string; target?: string | null; actor_user_id?: string }) =>
+        a.action === 'user.login-token.create'
+    );
+    expect(entry?.target).toBe(BOB);
+    expect(entry?.actor_user_id).toBe(ADMIN);
+  });
 
   for (let i = 0; i < 8; i++) {
     it(`federation/test all-success soft-${i}`, async () => {

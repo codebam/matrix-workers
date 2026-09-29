@@ -172,6 +172,8 @@ function createOidcDb(opts: {
   streamPositions?: Record<string, number>;
   failCrossSigningDelete?: boolean;
   failStreamUpdate?: boolean;
+  failLinkInsert?: boolean;
+  recentResets?: number[];
 } = {}) {
   const providers = opts.providers ? [...opts.providers] : [];
   const links = opts.links ? [...opts.links] : [];
@@ -234,6 +236,18 @@ function createOidcDb(opts: {
                 const pos = streamPositions[name];
                 return (pos !== undefined ? { position: pos } : null) as T;
               }
+              if (
+                sql.includes('FROM device_key_changes') &&
+                sql.includes('cross_signing_reset') &&
+                sql.includes('COUNT(*)')
+              ) {
+                const since = args[1] as number;
+                const recent = (opts.recentResets ?? []).filter((t) => t > since);
+                return ({
+                  count: recent.length,
+                  oldest: recent.length ? Math.min(...recent) : null,
+                }) as T;
+              }
               return null;
             },
             async run() {
@@ -255,6 +269,9 @@ function createOidcDb(opts: {
               }
               if (sql.includes('INSERT INTO idp_user_links')) {
                 inserts.push({ sql, args });
+                if (opts.failLinkInsert) {
+                  throw new Error('idp link insert failed');
+                }
                 const [providerId, externalId, userId, email, name] = args as [
                   string,
                   string,
@@ -862,5 +879,45 @@ describe('oidc leftovers login soft reliability after #147', () => {
     const { status } = await request(`/auth/oidc/${id}/login`, {}, envFor({ db, sessions }));
     expect(status).toBe(302);
     expect(JSON.parse(sessions.puts[0].value).providerId).toBe(id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MSC3861 identity reset rate limit (audit 007.3)
+// ---------------------------------------------------------------------------
+
+describe('oidc leftovers identity reset rate limit (3/hour)', () => {
+  it('allows resets below the cap and performs the destruction', async () => {
+    const db = createOidcDb({ recentResets: [NOW - 2_000, NOW - 1_000] });
+    const userKeys = createUserKeysStub();
+    const { status, body } = await request(RESET_PATH, { method: 'POST' }, envFor({ db, userKeys }));
+    expect(status).toBe(200);
+    expect(body).toEqual({});
+    expect(userKeys.fetches).toHaveLength(1);
+    expect(db.deletes.some((d) => d.sql.includes('cross_signing_keys'))).toBe(true);
+  });
+
+  it('rate-limits the fourth reset within the hour before touching key material', async () => {
+    const db = createOidcDb({ recentResets: [NOW - 3_000, NOW - 2_000, NOW - 1_000] });
+    const userKeys = createUserKeysStub();
+    const { status, body } = await request(RESET_PATH, { method: 'POST' }, envFor({ db, userKeys }));
+    expect(status).toBe(429);
+    expect(body).toMatchObject({
+      errcode: 'M_LIMIT_EXCEEDED',
+      retry_after_ms: 3_600_000 - 3_000,
+    });
+    // Destructive work must not have started
+    expect(userKeys.fetches).toHaveLength(0);
+    expect(db.deletes).toHaveLength(0);
+  });
+
+  it('ignores resets older than the one-hour window', async () => {
+    const db = createOidcDb({
+      recentResets: [NOW - 3_600_001, NOW - 3_600_002, NOW - 3_600_003, NOW - 3_600_004],
+    });
+    const userKeys = createUserKeysStub();
+    const { status } = await request(RESET_PATH, { method: 'POST' }, envFor({ db, userKeys }));
+    expect(status).toBe(200);
+    expect(userKeys.fetches).toHaveLength(1);
   });
 });
