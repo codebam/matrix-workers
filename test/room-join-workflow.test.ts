@@ -351,8 +351,8 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
       'make-join',
       'create-event',
       'send-join',
-      'store-remote-state',
       'persist',
+      'store-remote-state',
       'get-members',
     ]);
     const getArgs = federationGet.mock.calls[0];

@@ -124,10 +124,19 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
         })) as { auth_chain?: any[]; state?: any[]; event?: any };
       }
 
-      // Step 3b: Persist the room state the remote server returned with the
+      // Step 4: Persist event and membership locally
+      await step.do('persist', async () => {
+        await storeEvent(this.env.DB, joinEventData);
+        await updateMembership(this.env.DB, roomId, userId, 'join', joinEventData.event_id);
+      });
+
+      // Step 4b: Persist the room state the remote server returned with the
       // accepted join (v2 send_join: auth_chain + state + counter-signed
       // event). Without it, events the remote server later relays to us
       // can't be authorized locally -- auth checks need the full state.
+      // This runs after `persist` so the join event already exists locally;
+      // when the response echoes the counter-signed join event, the
+      // idempotent store simply skips the duplicate.
       if (sendJoinResponse) {
         await step.do('store-remote-state', async () => {
           const remoteEvents = [
@@ -162,12 +171,6 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           }
         });
       }
-
-      // Step 4: Persist event and membership locally
-      await step.do('persist', async () => {
-        await storeEvent(this.env.DB, joinEventData);
-        await updateMembership(this.env.DB, roomId, userId, 'join', joinEventData.event_id);
-      });
 
       // Step 5: Get room members for notification
       const members = await step.do('get-members', async () => {
