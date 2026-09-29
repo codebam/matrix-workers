@@ -602,6 +602,13 @@ describe('race membership×endpoint matrix concurrent after #190', () => {
       if (m === 'join') {
         expect(results.every((r) => r.status === 200)).toBe(true);
         expect(storeEvent).toHaveBeenCalled();
+      } else if (m === 'invite') {
+        expect(results.every((r) => r.status === 200)).toBe(true);
+        expect(storeEvent).toHaveBeenCalled();
+      } else if (m === 'leave') {
+        // Idempotent: already left -> 200 without storing another event.
+        expect(results.every((r) => r.status === 200)).toBe(true);
+        expect(storeEvent).not.toHaveBeenCalled();
       } else {
         expect(results.every((r) => r.status === 403)).toBe(true);
         expect(storeEvent).not.toHaveBeenCalled();

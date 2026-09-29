@@ -604,7 +604,20 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
 
   // Check current membership
   const currentMembership = await getMembership(c.env.DB, roomId, userId);
-  if (!currentMembership || currentMembership.membership !== 'join') {
+  if (!currentMembership) {
+    return Errors.forbidden('Not a member of this room').toResponse();
+  }
+
+  // Leaving is idempotent: a client that missed the transition (e.g. the
+  // user left from another device, or an earlier leave response was lost)
+  // must get 200 -- otherwise it wedges on the stale room and 403-loops on
+  // every room endpoint.
+  if (currentMembership.membership === 'leave') {
+    return c.json({});
+  }
+
+  // Rejecting an invite is also a leave; bans cannot be left.
+  if (currentMembership.membership !== 'join' && currentMembership.membership !== 'invite') {
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 

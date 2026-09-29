@@ -988,8 +988,56 @@ describe('POST /rooms/:roomId/join', () => {
 });
 
 describe('POST /rooms/:roomId/leave', () => {
-  it('forbids leave when not joined', async () => {
+  it('leaving an invite is allowed (rejects the invite)', async () => {
     getMembership.mockResolvedValue({ membership: 'invite', eventId: '$i' });
+    getRoomEvents.mockResolvedValue({ events: [], end: 0 });
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({});
+    expect(storeEvent).toHaveBeenCalled();
+    const stored = storeEvent.mock.calls[0][1] as PDU;
+    expect(stored).toMatchObject({
+      type: 'm.room.member',
+      state_key: USER,
+      content: { membership: 'leave' },
+    });
+    expect(updateMembership).toHaveBeenCalledWith(
+      expect.anything(),
+      ROOM,
+      USER,
+      'leave',
+      '$evt:example.com'
+    );
+  });
+
+  it('repeated leave is an idempotent no-op', async () => {
+    getMembership.mockResolvedValue({ membership: 'leave', eventId: '$l-old' });
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({});
+    expect(storeEvent).not.toHaveBeenCalled();
+    expect(updateMembership).not.toHaveBeenCalled();
+  });
+
+  it('forbids leave when never a member', async () => {
+    getMembership.mockResolvedValue(null);
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(403);
+    expect(body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    expect(storeEvent).not.toHaveBeenCalled();
+  });
+
+  it('forbids leave when banned', async () => {
+    getMembership.mockResolvedValue({ membership: 'ban', eventId: '$b' });
     const { status, body } = await request(
       `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
       jsonInit('POST', {})

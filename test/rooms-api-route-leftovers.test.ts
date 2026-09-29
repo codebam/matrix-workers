@@ -972,14 +972,25 @@ describe('join leftovers — join_rule matrix / remote workflow soft statuses', 
 });
 
 describe('leave / knock leftovers', () => {
-  it('leave forbids invite-only membership (not join)', async () => {
+  it('leave on an invite rejects the invite', async () => {
     getMembership.mockResolvedValue({ membership: 'invite', eventId: '$inv' });
     const { status, body } = await request(
       `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
       jsonInit('POST', {})
     );
-    expect(status).toBe(403);
-    expect(body).toMatchObject({ error: 'Not a member of this room' });
+    expect(status).toBe(200);
+    expect(body).toEqual({});
+  });
+
+  it('leave is an idempotent no-op when already left', async () => {
+    getMembership.mockResolvedValue({ membership: 'leave', eventId: '$old' });
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({});
+    expect(storeEvent).not.toHaveBeenCalled();
   });
 
   it('leave forbids ban membership', async () => {

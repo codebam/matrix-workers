@@ -574,10 +574,12 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     response.rooms!.invite![roomId] = invitedRoom;
   }
 
-  // Get left rooms (rooms user left since last sync)
-  // Check if filter allows left rooms (default: false per spec)
-  const includeLeave = filter?.room?.include_leave ?? false;
-  if (sincePosition > 0 && (includeLeave || !filter)) {
+  // Get left rooms (rooms the user left since last sync). Deliberately not
+  // gated on the include_leave filter flag: a room left on another device
+  // otherwise lingers in an open session (every room endpoint 403s) until a
+  // full client reload. Bounded by the leave event's stream position vs
+  // `since`, so each client sees a given leave exactly once.
+  if (sincePosition > 0) {
     const leftRoomIds = await getUserRooms(c.env.DB, userId, 'leave');
     for (const roomId of leftRoomIds) {
       // Check if room should be included based on filter

@@ -1094,16 +1094,37 @@ describe('GET /sync — left rooms', () => {
     expect((body.rooms as { leave: object }).leave).toEqual({});
   });
 
-  it('skips leave rooms when filter.room.include_leave is false', async () => {
+  it('checks left rooms even without include_leave (empty when no fresh leave event)', async () => {
     getUserRooms.mockImplementation(async (_db, _u, membership?: string) => {
       if (membership === 'leave') return [LEFT_ROOM];
       return [];
     });
+    getEventsSince.mockResolvedValue([]);
     const filter = encodeURIComponent(JSON.stringify({ room: { include_leave: false } }));
     const env = createEnv();
     const { body } = await syncRequest(env, `since=s8_td0&filter=${filter}`);
-    expect(getUserRooms.mock.calls.some((c) => c[2] === 'leave')).toBe(false);
+    expect(getUserRooms.mock.calls.some((c) => c[2] === 'leave')).toBe(true);
     expect((body.rooms as { leave: object }).leave).toEqual({});
+  });
+
+  it('delivers a fresh self-leave even without include_leave', async () => {
+    getUserRooms.mockImplementation(async (_db, _u, membership?: string) => {
+      if (membership === 'leave') return [LEFT_ROOM];
+      return [];
+    });
+    getEventsSince.mockResolvedValue([
+      makePdu({
+        type: 'm.room.member',
+        event_id: '$leave-fresh:example.com',
+        room_id: LEFT_ROOM,
+        state_key: USER,
+        content: { membership: 'leave' },
+      }),
+    ]);
+    const filter = encodeURIComponent(JSON.stringify({ room: { include_leave: false } }));
+    const env = createEnv();
+    const { body } = await syncRequest(env, `since=s8_td0&filter=${filter}`);
+    expect(Object.keys((body.rooms as { leave: object }).leave)).toEqual([LEFT_ROOM]);
   });
 
   it('includes leave rooms when filter.room.include_leave is true', async () => {
