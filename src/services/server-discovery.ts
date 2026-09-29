@@ -30,7 +30,9 @@ interface CloudflareDNSResponse {
 
 // Cache key prefix for server discovery
 const DISCOVERY_CACHE_PREFIX = 'discovery:';
-const DISCOVERY_CACHE_TTL = 3600; // 1 hour
+// 5 minutes (audit 007.6): bounds how long a hostile .well-known can pin our
+// federation traffic at an arbitrary target host.
+const DISCOVERY_CACHE_TTL = 300;
 
 /**
  * Discover the actual Matrix server endpoint for a given server name.
@@ -139,7 +141,9 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
   try {
     const response = await fetch(wellKnownUrl, {
       headers: { Accept: 'application/json' },
-      cf: { cacheTtl: 3600, cacheEverything: true },
+      // 5-minute edge cache (audit 007.6): a long TTL on an attacker-controlled
+      // .well-known amplifies redirects at the delegated target.
+      cf: { cacheTtl: 300, cacheEverything: true },
     });
 
     if (!response.ok) {

@@ -528,9 +528,49 @@ function getUserKeysDO(env: any, userId: string) {
 // 1. Requires OIDC re-authentication (valid access token)
 // 2. Deletes all cross-signing keys for the user
 // 3. Returns 200 on success
+// Identity reset (MSC3861) hardening — audit 007.3: cross-signing resets are
+// destructive to E2EE trust, so cap them per user. The device_key_changes
+// INSERT inside the handler doubles as the durable audit trail this reads.
+const IDENTITY_RESET_LIMIT = 3;
+const IDENTITY_RESET_WINDOW_MS = 60 * 60 * 1000;
+
 app.post('/_matrix/client/unstable/org.matrix.msc3861/account/identity/reset', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const db = c.env.DB;
+
+  // Per-user rate limit: 3 resets per hour. D1-backed so the window holds
+  // across isolates — the shared RateLimit DO evicts windows older than
+  // ~2 minutes, so it cannot enforce an hourly limit.
+  try {
+    const recent = await db
+      .prepare(
+        `SELECT COUNT(*) as count, MIN(created_at) as oldest FROM device_key_changes
+         WHERE user_id = ? AND change_type = 'cross_signing_reset' AND created_at > ?`
+      )
+      .bind(userId, Date.now() - IDENTITY_RESET_WINDOW_MS)
+      .first<{ count: number; oldest: number | null }>();
+    const count = recent?.count ?? 0;
+    if (count >= IDENTITY_RESET_LIMIT) {
+      const retryAfterMs =
+        recent?.oldest != null
+          ? recent.oldest + IDENTITY_RESET_WINDOW_MS - Date.now()
+          : IDENTITY_RESET_WINDOW_MS;
+      console.warn(`[OIDC] Identity reset rate-limited for ${userId} (${count} in window)`);
+      return c.json(
+        {
+          errcode: 'M_LIMIT_EXCEEDED',
+          error: 'Too many identity resets',
+          retry_after_ms: retryAfterMs,
+        },
+        429
+      );
+    }
+  } catch (err) {
+    // Fail open: if the count query fails, the destructive operations below
+    // surface the real D1 problem; blocking here would take identity reset
+    // down during a database blip.
+    console.warn('[OIDC] Identity reset rate-limit check failed:', err);
+  }
 
   try {
     // Delete cross-signing keys from Durable Object (primary storage)

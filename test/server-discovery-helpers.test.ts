@@ -239,7 +239,7 @@ describe('server-discovery TOKENMAXX edge paths after #57', () => {
 
 
 describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
-  const DISCOVERY_TTL = 3600;
+  const DISCOVERY_TTL = 300;
 
   function mockKv(data: Record<string, string> = {}) {
     const puts: Array<{ key: string; value: string; options?: { expirationTtl?: number } }> = [];
@@ -303,7 +303,7 @@ describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it('uses .well-known m.server with an explicit port and caches with expirationTtl 3600', async () => {
+  it('uses .well-known m.server with an explicit port and caches with expirationTtl 300', async () => {
     const kv = mockKv();
     (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
       if (String(url).includes('/.well-known/matrix/server')) {

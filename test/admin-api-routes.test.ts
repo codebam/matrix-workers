@@ -2767,7 +2767,7 @@ describe('admin TOKENMAXX auth/whois/keys/login-token leftovers after #102', () 
     });
   });
 
-  it('login-token defaults ttl to 10 minutes on missing/invalid JSON body', async () => {
+  it('login-token defaults ttl to 5 minutes on missing/invalid JSON body', async () => {
     const sessions = mockKv();
     const env = createEnv({ sessions });
     const res = await req(
@@ -2777,8 +2777,8 @@ describe('admin TOKENMAXX auth/whois/keys/login-token leftovers after #102', () 
     );
     expect(res.status).toBe(200);
     const body = await res.json();
-    expect(body.ttl_seconds).toBe(600);
-    expect(sessions.puts[0].options?.expirationTtl).toBe(600);
+    expect(body.ttl_seconds).toBe(300);
+    expect(sessions.puts[0].options?.expirationTtl).toBe(300);
   });
 
   it('login-token clamps ttl_minutes 0 and 0.5 up to 1 minute', async () => {
@@ -2795,9 +2795,9 @@ describe('admin TOKENMAXX auth/whois/keys/login-token leftovers after #102', () 
         env
       );
       expect(res.status).toBe(200);
-      // 0 is falsy → default 10; 0.5 is truthy number → clamp max(0.5,1)=1
+      // 0 is falsy → default 5; 0.5 is truthy number → clamp max(0.5,1)=1
       if (ttl === 0) {
-        expect((await res.json()).ttl_seconds).toBe(600);
+        expect((await res.json()).ttl_seconds).toBe(300);
       } else {
         expect((await res.json()).ttl_seconds).toBe(60);
         expect(sessions.puts[0].options?.expirationTtl).toBe(60);

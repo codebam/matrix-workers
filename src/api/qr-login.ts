@@ -382,6 +382,8 @@ function generateQrLandingPage(
 
 // Landing page for QR code login
 app.get('/login/qr/:token', async (c) => {
+  // The URL embeds a live login token: never cache this response (audit 010.6).
+  c.header('Cache-Control', 'no-store');
   const token = c.req.param('token');
 
   // Validate token format
@@ -433,6 +435,7 @@ h1{color:#f59e0b;}</style></head>
 
 // API endpoint to check token validity (for JS-based login)
 app.get('/login/qr/:token/check', async (c) => {
+  c.header('Cache-Control', 'no-store');
   const token = c.req.param('token');
 
   if (!token || !token.startsWith('mlt_')) {
