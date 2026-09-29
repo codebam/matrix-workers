@@ -1152,7 +1152,7 @@ async function getJoinedRemoteServers(db: D1Database, roomId: string, serverName
 // room versions 11+): attach the content hash, derive the reference-hash
 // event ID, and sign the redacted event. Returns null when no signing key is
 // available (delivery is skipped; the event stays local-only).
-async function prepareOutboundPdu(
+export async function prepareOutboundPdu(
   env: Env,
   event: PDU
 ): Promise<{

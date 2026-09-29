@@ -36,11 +36,13 @@ vi.mock('../src/middleware/federation-auth', () => ({
 }));
 
 const getRemoteKeysWithNotarySignature = vi.fn();
+const getServerSigningKey = vi.fn();
 const verifyRemoteSignature = vi.fn();
 
 vi.mock('../src/services/federation-keys', () => ({
   getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
     getRemoteKeysWithNotarySignature(...args),
+  getServerSigningKey: (...args: unknown[]) => getServerSigningKey(...args),
   verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
 }));
 
@@ -64,6 +66,7 @@ import federation, {
 } from '../src/api/federation';
 import { generateSigningKeyPair, calculateContentHash } from '../src/utils/crypto';
 import { computeWireEventId } from '../src/utils/event-signing';
+import { prepareOutboundPdu } from '../src/api/rooms';
 
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
@@ -270,6 +273,7 @@ function createFedDb(opts: FedDbOptions = {}) {
             stateKeyVal,
             content,
             originServerTs,
+            ,
             depth,
             authEvents,
             prevEvents,
@@ -283,6 +287,7 @@ function createFedDb(opts: FedDbOptions = {}) {
             string | null,
             string,
             number,
+            string | null,
             number,
             string,
             string,
@@ -688,6 +693,24 @@ function createFedDb(opts: FedDbOptions = {}) {
                 signature: s.signature,
               })) as T[],
           };
+        }
+        if (
+          sql.includes('SELECT event_id, room_id, sender, event_type, state_key, content') &&
+          sql.includes('WHERE room_id = ?')
+        ) {
+          const [roomId] = args as [string];
+          const list = [...events.values()]
+            .filter((e) => e.room_id === roomId)
+            .map(toPduSelect);
+          return { results: list as T[] };
+        }
+        if (sql.includes('SELECT event_id FROM room_state') && sql.includes('WHERE room_id = ?')) {
+          const [roomId] = args as [string];
+          const results: Array<{ event_id: string }> = [];
+          for (const [k, eid] of roomState) {
+            if (k.startsWith(`${roomId}|`)) results.push({ event_id: eid });
+          }
+          return { results: results as T[] };
         }
         return { results: [] as T[] };
       }
@@ -2858,6 +2881,167 @@ describe('federation route method probes', () => {
     expect([404, 405]).toContain(r2.status);
     const r3 = await req('GET', '/_matrix/federation/v1/publicRooms', env);
     expect(r3.status).toBe(200);
+  });
+});
+
+describe('make_join / send_join for v11+ (derived event IDs)', () => {
+  function v12Room() {
+    return seedBasicRoom({
+      rooms: [{ room_id: ROOM, room_version: '12', is_public: 1, created_at: 1000 }],
+    });
+  }
+
+  it('make_join v12: template omits create and references derived wire IDs', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({
+        keyId: kp.keyId,
+        privateKeyJwk: kp.privateKeyJwk,
+      });
+
+      const db = v12Room();
+      const env = makeEnv(db);
+      const { status, body } = await req(
+        'GET',
+        `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+        env
+      );
+
+      expect(status).toBe(200);
+      const b = body as {
+        room_version: string;
+        event: { auth_events: string[]; prev_events: string[]; type: string };
+      };
+      expect(b.room_version).toBe('12');
+      expect(b.event.type).toBe('m.room.member');
+
+      // The create event is implicit in v11+: it must not be listed.
+      expect(b.event.auth_events).not.toContain('$create:example.com');
+      // References are derived wire IDs, never the locally stored IDs.
+      expect(b.event.auth_events).not.toContain('$pl:example.com');
+      expect(b.event.auth_events).not.toContain('$jr:example.com');
+      expect(b.event.auth_events).toHaveLength(2);
+
+      // They match the derivation that federation actually exchanges.
+      const preparedPl = await prepareOutboundPdu(env, {
+        event_id: '$pl:example.com',
+        room_id: ROOM,
+        sender: LOCAL_USER,
+        type: 'm.room.power_levels',
+        state_key: '',
+        content: { users: { [LOCAL_USER]: 100 } },
+        origin_server_ts: 1_700_000_000_000,
+        depth: 3,
+        auth_events: [],
+        prev_events: [],
+      });
+      expect(preparedPl).not.toBeNull();
+      expect(b.event.auth_events).toContain(preparedPl!.wireId);
+
+      // prev_events points at the newest event's derived ID (the member row).
+      expect(b.event.prev_events).toHaveLength(1);
+      expect(b.event.prev_events[0]).not.toBe('$member:example.com');
+      expect(b.event.prev_events[0].startsWith('$')).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('send_join v2 v12: countersigns and stores the join, serves wire state', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({
+        keyId: kp.keyId,
+        privateKeyJwk: kp.privateKeyJwk,
+      });
+
+      const db = v12Room();
+      const env = makeEnv(db);
+
+      const joinEvent = {
+        room_id: ROOM,
+        sender: REMOTE_USER,
+        type: 'm.room.member',
+        state_key: REMOTE_USER,
+        content: { membership: 'join', displayname: 'Bob' },
+        origin_server_ts: 1_700_000_001_000,
+        depth: 6,
+        auth_events: [],
+        prev_events: [],
+        hashes: { sha256: 'abc' },
+        signatures: { 'remote.example.com': { 'ed25519:r1': 'sigr' } },
+      };
+      const persistedId = await computeWireEventId({ ...joinEvent });
+
+      const { status, body } = await req(
+        'PUT',
+        `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/%24jv12`,
+        env,
+        joinEvent
+      );
+
+      expect(status).toBe(200);
+
+      // The join was persisted under its derived wire ID and the membership
+      // row updated -- previously the join was never stored at all.
+      expect(
+        db.inserts.some(
+          (i) => i.sql.includes('INSERT INTO events') && i.args[0] === persistedId
+        )
+      ).toBe(true);
+      expect(
+        db.inserts.some(
+          (i) =>
+            i.sql.includes('room_memberships') &&
+            i.args[0] === ROOM &&
+            i.args[1] === REMOTE_USER &&
+            i.args[2] === 'join'
+        )
+      ).toBe(true);
+
+      const resp = body as {
+        state: Array<Record<string, unknown>>;
+        auth_chain: Array<Record<string, unknown>>;
+        event: Record<string, unknown>;
+        members_omitted: boolean;
+        servers_in_room: string[];
+      };
+
+      // Wire form: no explicit event_id anywhere, create present in state,
+      // every event signed by this server.
+      for (const ev of [...resp.state, ...resp.auth_chain]) {
+        expect(ev.event_id).toBeUndefined();
+        expect(ev.hashes).toBeDefined();
+        expect((ev.signatures as Record<string, unknown>)[SERVER]).toBeDefined();
+      }
+      expect(resp.state.some((e) => e.type === 'm.room.create')).toBe(true);
+
+      // The joining user's membership event is served, carrying both the
+      // joining server's signature and ours.
+      const memberEv = resp.state.find(
+        (e) => e.type === 'm.room.member' && e.state_key === REMOTE_USER
+      );
+      expect(memberEv).toBeDefined();
+      const memberSigs = memberEv!.signatures as Record<string, unknown>;
+      expect(Object.keys(memberSigs)).toEqual(
+        expect.arrayContaining(['remote.example.com', SERVER])
+      );
+
+      // Servers in room reflects the new join; the echo event has no
+      // explicit event_id (v4 wire form).
+      expect(resp.members_omitted).toBe(false);
+      expect(resp.servers_in_room).toEqual(
+        expect.arrayContaining(['example.com', 'remote.example.com'])
+      );
+      expect(resp.event.event_id).toBeUndefined();
+      expect(Object.keys(resp.event.signatures as Record<string, unknown>)).toEqual(
+        expect.arrayContaining(['remote.example.com', SERVER])
+      );
+    } finally {
+      restore();
+    }
   });
 });
 
