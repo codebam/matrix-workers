@@ -93,6 +93,8 @@ export class FederationDurableObject extends DurableObject<Env> {
     const key = `queue:${data.destination}:${data.event_id}`;
     await this.ctx.storage.put(key, outboundEvent);
 
+    console.log(`[federation] Queued PDU ${data.event_id} for ${data.destination}`);
+
     // Try to send immediately
     await this.processFederationQueue(data.destination);
 
@@ -321,6 +323,11 @@ export class FederationDurableObject extends DurableObject<Env> {
         body: JSON.stringify(content),
         signal: AbortSignal.timeout(30000), // 30 second timeout
       });
+
+      console.log(
+        `[federation] Transaction ${txnId} to ${destination}: HTTP ${response.status} ` +
+          `(${events.length} PDU(s), ${edus.length} EDU(s))`
+      );
 
       if (response.ok) {
         // Parse the response to check for per-PDU failures
