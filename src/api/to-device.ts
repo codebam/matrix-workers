@@ -9,9 +9,10 @@
 // Messages are delivered via /sync and sliding sync extensions
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { notifyUserSync } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -59,6 +60,76 @@ async function getUserDevices(db: D1Database, userId: string): Promise<string[]>
   `).bind(userId).all<{ device_id: string }>();
 
   return devices.results.map(d => d.device_id);
+}
+
+// ============================================
+// Inbound federation delivery (m.direct_to_device EDUs)
+// ============================================
+
+// Deliver an inbound `m.direct_to_device` EDU (received over federation in a
+// /_matrix/federation/v1/send transaction) to the target users' local
+// devices. Mirrors the PUT /sendToDevice path above so clients process
+// federated and locally-sent to-device messages identically: one row per
+// device in `to_device_messages`, the shared 'to_device' stream counter for
+// ordering, and a SyncDO wake so long-polling syncs deliver promptly.
+//
+// The EDU content shape is { message_id, sender, type, messages } where
+// `messages[userId][deviceId]` holds the per-device payload and `deviceId`
+// may be '*' for all of a user's devices.
+export async function deliverInboundToDevice(env: Env, content: any): Promise<number> {
+  const db = env.DB;
+  const messages = content?.messages;
+  const sender = typeof content?.sender === 'string' ? content.sender : '';
+  const eventType = typeof content?.type === 'string' ? content.type : 'm.room.encrypted';
+  if (!messages || typeof messages !== 'object' || !sender) return 0;
+
+  const eduMessageId = typeof content?.message_id === 'string' ? content.message_id : `edu-${Date.now()}`;
+  const localSuffix = `:${env.SERVER_NAME}`;
+  const notified = new Set<string>();
+  let stored = 0;
+
+  for (const [recipientUserId, deviceMessages] of Object.entries(messages as Record<string, any>)) {
+    // Only local users can be delivered to; anything else is not ours.
+    if (!recipientUserId.endsWith(localSuffix)) continue;
+    if (!deviceMessages || typeof deviceMessages !== 'object') continue;
+
+    for (const [deviceId, deviceContent] of Object.entries(deviceMessages as Record<string, any>)) {
+      const targetDevices = deviceId === '*'
+        ? await getUserDevices(db, recipientUserId)
+        : [deviceId];
+
+      for (const targetDeviceId of targetDevices) {
+        const streamPosition = await getNextStreamPosition(db, 'to_device');
+        const messageId = `${eduMessageId}_${recipientUserId}_${targetDeviceId}`;
+
+        await db.prepare(`
+          INSERT INTO to_device_messages (
+            recipient_user_id, recipient_device_id, sender_user_id,
+            event_type, content, message_id, stream_position
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT (recipient_user_id, recipient_device_id, message_id) DO NOTHING
+        `).bind(
+          recipientUserId,
+          targetDeviceId,
+          sender,
+          eventType,
+          JSON.stringify(deviceContent),
+          messageId,
+          streamPosition
+        ).run();
+        stored++;
+      }
+      notified.add(recipientUserId);
+    }
+  }
+
+  // Wake recipients' sync loops so the messages are delivered immediately
+  // instead of waiting out the long-poll timeout.
+  for (const userId of notified) {
+    await notifyUserSync(env, userId, 'to_device');
+  }
+
+  return stored;
 }
 
 // ============================================

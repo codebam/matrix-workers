@@ -1227,6 +1227,43 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
     expect(status).toBe(200);
     expect((body as { pdus: Record<string, unknown> }).pdus['$ok2']).toEqual({});
   });
+
+  it('delivers m.direct_to_device EDUs to local devices', async () => {
+    const db = createFedDb();
+    const { status, body } = await req('PUT', '/_matrix/federation/v1/send/txn-edu', makeEnv(db), {
+      pdus: [],
+      edus: [
+        {
+          edu_type: 'm.direct_to_device',
+          content: {
+            sender: REMOTE_USER,
+            type: 'm.room.encrypted',
+            message_id: 'edu-msg-1',
+            messages: {
+              [LOCAL_USER]: {
+                DEVICEA: {
+                  algorithm: 'm.olm.v1.curve25519-aes-sha2',
+                  ciphertext: { k: { body: 'x', type: 0 } },
+                },
+              },
+              '@someone:other.example.com': {
+                DEVICEZ: { algorithm: 'm.olm.v1.curve25519-aes-sha2', ciphertext: {} },
+              },
+            },
+          },
+        },
+      ],
+    });
+    expect(status).toBe(200);
+    expect(body).toEqual({ pdus: {} });
+    // Only the local recipient's device gets a row.
+    const rows = db.inserts.filter((i) => i.sql.includes('INSERT INTO to_device_messages'));
+    expect(rows.length).toBe(1);
+    expect(rows[0].args[0]).toBe(LOCAL_USER);
+    expect(rows[0].args[1]).toBe('DEVICEA');
+    expect(rows[0].args[2]).toBe(REMOTE_USER);
+    expect(rows[0].args[3]).toBe('m.room.encrypted');
+  });
 });
 
 describe('event / state / state_ids / event_auth', () => {
@@ -1840,6 +1877,74 @@ describe('invite v1/v2', () => {
     );
     expect(ok.status).toBe(200);
     expect((ok.body as { event: { signatures: unknown } }).event.signatures).toBeDefined();
+  });
+
+  it('invite v2 persists the room, stripped state, and membership for the local invitee', async () => {
+    const db = createFedDb({
+      users: [{ user_id: LOCAL_USER }],
+      serverKeys: [
+        {
+          key_id: serverKeyPair.keyId,
+          public_key: serverKeyPair.publicKey,
+          private_key_jwk: JSON.stringify(serverKeyPair.privateKeyJwk),
+          key_version: 2,
+          valid_from: 1,
+          valid_until: Date.now() + 100000,
+          is_current: 1,
+        },
+      ],
+    });
+    const env = makeEnv(db);
+    const remoteRoom = '!dm-store:remote.example.com';
+    const invite = {
+      event_id: '$storev2',
+      room_id: remoteRoom,
+      sender: REMOTE_USER,
+      type: 'm.room.member',
+      state_key: LOCAL_USER,
+      content: { membership: 'invite', is_direct: true },
+      origin_server_ts: 1700000000000,
+      depth: 4,
+      auth_events: [],
+      prev_events: [],
+    };
+    const { status } = await req(
+      'PUT',
+      `/_matrix/federation/v2/invite/${encodeURIComponent(remoteRoom)}/%24storev2`,
+      env,
+      {
+        room_version: '10',
+        event: invite,
+        invite_room_state: [
+          {
+            type: 'm.room.create',
+            state_key: '',
+            content: { room_version: '10' },
+            sender: REMOTE_USER,
+          },
+          { type: 'm.room.name', state_key: '', content: { name: 'DM' }, sender: REMOTE_USER },
+        ],
+      }
+    );
+    expect(status).toBe(200);
+    // Room row created for the remote room.
+    expect(db.inserts.some((i) => i.sql.includes('INSERT INTO rooms'))).toBe(true);
+    // Stripped invite_room_state persisted as synthetic state events.
+    expect([...db.events.keys()].some((k) => k.startsWith('$invite_state_'))).toBe(true);
+    expect(
+      [...db.roomState.keys()].some((k) => k.startsWith(`${remoteRoom}|m.room.create`))
+    ).toBe(true);
+    // The invite event itself and the invitee's membership row.
+    expect(db.events.has('$storev2')).toBe(true);
+    expect(
+      db.inserts.some(
+        (i) =>
+          i.sql.includes('room_memberships') &&
+          i.args[0] === remoteRoom &&
+          i.args[1] === LOCAL_USER &&
+          i.args[2] === 'invite'
+      )
+    ).toBe(true);
   });
 });
 
