@@ -369,7 +369,7 @@ function passwordLoginBody(
 }
 
 describe('login GET /login', () => {
-  it('lists password, token, and dummy flows', async () => {
+  it('lists password and token flows', async () => {
     const env = envFor(createLoginDb());
     const res = await request(env, '/_matrix/client/v3/login');
     expect(res.status).toBe(200);
@@ -377,7 +377,6 @@ describe('login GET /login', () => {
       flows: [
         { type: 'm.login.password' },
         { type: 'm.login.token' },
-        { type: 'm.login.dummy' },
       ],
     });
   });
@@ -821,7 +820,7 @@ describe('login POST /login — dummy flow', () => {
       jsonInit('POST', { type: 'm.login.dummy' }, '')
     );
     expect(res.status).toBe(400);
-    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+    expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
   });
 
   it('rejects unknown identifier type', async () => {
@@ -842,7 +841,7 @@ describe('login POST /login — dummy flow', () => {
     expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
   });
 
-  it('logs in with localpart without password verification', async () => {
+  it('rejects localpart login (no password check reached)', async () => {
     const db = createLoginDb({
       users: new Map([
         [
@@ -869,11 +868,11 @@ describe('login POST /login — dummy flow', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ user_id: USER, device_id: DEVICE });
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
-  it('logs in with full MXID identifier', async () => {
+  it('rejects full MXID dummy login', async () => {
     const db = createLoginDb({
       users: new Map([[USER, seedAlice()]]),
     });
@@ -891,11 +890,11 @@ describe('login POST /login — dummy flow', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
-    expect((res.body as { user_id: string }).user_id).toBe(USER);
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
-  it('rejects dummy login for unknown user', async () => {
+  it('unknown user does not matter — dummy login is rejected', async () => {
     const env = envFor(createLoginDb());
     const res = await request(
       env,
@@ -910,8 +909,8 @@ describe('login POST /login — dummy flow', () => {
         ''
       )
     );
-    expect(res.status).toBe(403);
-    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 });
 
@@ -1853,8 +1852,8 @@ describe('login TOKENMAXX edge leftovers after #101', () => {
         ''
       )
     );
-    expect(res.status).toBe(403);
-    expect(res.body).toMatchObject({ errcode: 'M_USER_DEACTIVATED' });
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
   });
 
   it('token login rejects when user missing after redeem', async () => {
@@ -2355,7 +2354,7 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
     expect((res.body as { user_id: string }).user_id).toBe(USER);
   });
 
-  it('lockout does not block m.login.dummy for the same user', async () => {
+  it('lockout state does not matter — m.login.dummy is not a login type', async () => {
     const sessions = mockKv({
       [`lockout:${USER}`]: JSON.stringify({
         attempts: 5,
@@ -2377,7 +2376,8 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('lockout is keyed by resolved full MXID not localpart', async () => {
@@ -2550,10 +2550,10 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
       jsonInit('POST', { type: 'm.login.dummy', identifier: null }, '')
     );
     expect(res.status).toBe(400);
-    expect(res.body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+    expect(res.body).toMatchObject({ errcode: 'M_UNRECOGNIZED' });
   });
 
-  it('dummy login with empty-string device_id generates one', async () => {
+  it('dummy login with empty-string device_id is still rejected', async () => {
     const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
     const env = envFor(db);
     const res = await request(
@@ -2569,11 +2569,11 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
-    expect((res.body as { device_id: string }).device_id).toBeTruthy();
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
-  it('dummy login does not call verifyPassword', async () => {
+  it('dummy login does not reach verifyPassword (rejected earlier)', async () => {
     const db = createLoginDb({ users: new Map([[USER, seedAlice()]]) });
     const env = envFor(db);
     vi.mocked(verifyPassword).mockClear();
@@ -2591,7 +2591,8 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
     expect(verifyPassword).not.toHaveBeenCalled();
   });
 
@@ -3301,7 +3302,7 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
 
   // ---------- GET /login shape ----------
 
-  it('GET /login returns exactly three flow types in order', async () => {
+  it('GET /login returns exactly two flow types in order', async () => {
     const env = envFor(createLoginDb());
     const res = await request(env, '/_matrix/client/v3/login');
     expect(res.status).toBe(200);
@@ -3309,7 +3310,6 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
     expect(flows.map((f) => f.type)).toEqual([
       'm.login.password',
       'm.login.token',
-      'm.login.dummy',
     ]);
     for (const f of flows) {
       expect(Object.keys(f)).toEqual(['type']);
@@ -3423,7 +3423,7 @@ describe('login TOKENMAXX edge leftovers after #124 devices', () => {
         status: 400,
       },
       { body: { type: 'm.login.token' }, errcode: 'M_MISSING_PARAM', status: 400 },
-      { body: { type: 'm.login.dummy' }, errcode: 'M_MISSING_PARAM', status: 400 },
+      { body: { type: 'm.login.dummy' }, errcode: 'M_UNRECOGNIZED', status: 400 },
     ];
     for (const c of cases) {
       const res = await request(

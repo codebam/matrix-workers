@@ -3719,8 +3719,9 @@ describe('register leftovers dummy login after guest register', () => {
         ''
       )
     );
-    expect(dummy.status).toBe(200);
-    expect(dummy.body.user_id).toBe(userId);
+    // m.login.dummy is no longer a login type: the impersonation shortcut is gone.
+    expect(dummy.status).toBe(400);
+    expect(dummy.body.errcode).toBe('M_UNRECOGNIZED');
   });
 });
 

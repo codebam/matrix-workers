@@ -130,6 +130,14 @@ export async function generateAccessToken(): Promise<string> {
   return `syt_${base64UrlEncode(bytes)}`;
 }
 
+// Generate a registration (invite) token. Shown once at creation; only its
+// SHA-256 hash is stored.
+export async function generateRegistrationToken(): Promise<string> {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return `mrt_${base64UrlEncode(bytes)}`;
+}
+
 // Generate a transaction ID
 export async function generateTransactionId(): Promise<string> {
   const timestamp = Date.now().toString(36);

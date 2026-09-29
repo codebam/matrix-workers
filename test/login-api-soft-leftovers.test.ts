@@ -397,7 +397,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -408,7 +407,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -419,7 +417,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -430,7 +427,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -441,7 +437,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -452,7 +447,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -463,7 +457,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -474,7 +467,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -485,7 +477,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -496,7 +487,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -507,7 +497,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 
@@ -518,7 +507,6 @@ describe('login soft leftovers GET /login flows shape after #142', () => {
     expect(body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
   });
 });
@@ -1066,7 +1054,7 @@ describe('login soft leftovers password success device_id soft flood after #142'
   });
 });
 
-describe('login soft leftovers dummy login success soft flood after #142', () => {
+describe('login soft leftovers dummy login rejection soft flood after #142', () => {
 
   it('dummy login soft-0', async () => {
     const db = createLoginDb({ users: aliceUser() });
@@ -1080,9 +1068,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM0',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM0');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-1', async () => {
@@ -1097,9 +1084,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM1',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM1');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-2', async () => {
@@ -1114,9 +1100,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM2',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM2');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-3', async () => {
@@ -1131,9 +1116,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM3',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM3');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-4', async () => {
@@ -1148,9 +1132,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM4',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM4');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-5', async () => {
@@ -1165,9 +1148,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM5',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM5');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-6', async () => {
@@ -1182,9 +1164,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM6',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM6');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-7', async () => {
@@ -1199,9 +1180,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM7',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM7');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-8', async () => {
@@ -1216,9 +1196,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM8',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM8');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-9', async () => {
@@ -1233,9 +1212,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM9',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM9');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-10', async () => {
@@ -1250,9 +1228,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM10',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM10');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-11', async () => {
@@ -1267,9 +1244,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM11',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM11');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-12', async () => {
@@ -1284,9 +1260,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM12',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM12');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-13', async () => {
@@ -1301,9 +1276,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM13',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM13');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('dummy login soft-14', async () => {
@@ -1318,9 +1292,8 @@ describe('login soft leftovers dummy login success soft flood after #142', () =>
         device_id: 'DUM14',
       }, '')
     );
-    expect(status).toBe(200);
-    expect(body.user_id).toBe(USER);
-    expect(body.device_id).toBe('DUM14');
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_UNRECOGNIZED');
   });
 });
 

@@ -59,7 +59,7 @@ Leave `d1_databases[0].database_name` as `matrix-db` — the `db:migrate` npm sc
 npm run db:migrate
 ```
 
-This applies `migrations/schema.sql` (the base schema) to your remote D1 database. The numbered migration files (`migrations/002_*.sql` … `migrations/019_*.sql`) are **not** applied by this script — apply them in order afterwards:
+This applies `migrations/schema.sql` (the base schema) to your remote D1 database. The numbered migration files (`migrations/002_*.sql` … `migrations/020_*.sql`) are **not** applied by this script — apply them in order afterwards:
 
 ```bash
 for f in $(ls migrations/0*.sql | sort); do
@@ -85,6 +85,44 @@ wrangler secret put TURN_API_TOKEN
 wrangler secret put LIVEKIT_API_SECRET
 wrangler secret put EMAIL_FROM        # e.g. "noreply@matrix.fuzzywigg.com"
 ```
+
+## Optional: Invite-Only Registration
+
+Set `REGISTRATION_REQUIRE_TOKEN` to `"true"` in the `vars` block of `wrangler.jsonc` to require a registration token for every `/register` call (users and guests alike):
+
+```jsonc
+"vars": {
+  "SERVER_NAME": "matrix.example.com",
+  "REGISTRATION_REQUIRE_TOKEN": "true"
+}
+```
+
+Admins mint, list, and revoke invite tokens through the admin API (requires an admin access token):
+
+```bash
+# Mint a single-use token (defaults: uses=1, expires in 7 days)
+curl -X POST https://matrix.example.com/admin/api/registration-tokens \
+  -H "Authorization: Bearer <admin-access-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"note":"for a friend","uses":1,"expires_in_hours":168}'
+# → {"id":"...","token":"mrt_...","uses":1,"expires_at":...}  (raw token shown once)
+
+# List tokens (hashes omitted)
+curl https://matrix.example.com/admin/api/registration-tokens -H "Authorization: Bearer <admin-access-token>"
+
+# Revoke a token
+curl -X DELETE https://matrix.example.com/admin/api/registration-tokens/<id> -H "Authorization: Bearer <admin-access-token>"
+```
+
+Users register in Element (the UIA flow asks for the token) or via curl:
+
+```bash
+curl -X POST https://matrix.example.com/_matrix/client/v3/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"newuser","password":"...","auth":{"type":"m.login.registration_token","token":"mrt_..."}}'
+```
+
+With invite-only mode on, the UIA flow advertises `m.login.registration_token`; tokens are stored hashed (SHA-256), single- or multi-use, expiring and revocable. Note that `m.login.dummy` is accepted **only** as the registration UIA stage — it is not a login type and `POST /login` rejects it.
 
 ## Step 6: Deploy
 

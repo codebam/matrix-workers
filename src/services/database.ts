@@ -934,3 +934,66 @@ export async function notifyUsersOfEvent(
     console.error('[database] Failed to notify users of event:', error);
   }
 }
+
+// Registration token (invite) operations
+
+export interface RegistrationTokenRow {
+  id: string;
+  token_hash: string;
+  note: string | null;
+  created_by: string | null;
+  created_at: number;
+  expires_at: number | null;
+  uses_remaining: number;
+  revoked: number;
+}
+
+export async function createRegistrationToken(
+  db: D1Database,
+  id: string,
+  tokenHash: string,
+  note: string | null,
+  createdBy: string,
+  expiresAt: number | null,
+  uses: number
+): Promise<void> {
+  await db.prepare(
+    `INSERT INTO registration_tokens (id, token_hash, note, created_by, created_at, expires_at, uses_remaining, revoked)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 0)`
+  ).bind(id, tokenHash, note, createdBy, Date.now(), expiresAt, uses).run();
+}
+
+/** List tokens without the secret hash — the raw token is shown once at creation. */
+export async function listRegistrationTokens(
+  db: D1Database
+): Promise<Array<Omit<RegistrationTokenRow, 'token_hash'>>> {
+  const result = await db.prepare(
+    `SELECT id, note, created_by, created_at, expires_at, uses_remaining, revoked
+     FROM registration_tokens ORDER BY created_at DESC LIMIT 100`
+  ).all<Omit<RegistrationTokenRow, 'token_hash'>>();
+  return result.results;
+}
+
+export async function revokeRegistrationToken(db: D1Database, id: string): Promise<boolean> {
+  const result = await db.prepare(
+    `UPDATE registration_tokens SET revoked = 1 WHERE id = ?`
+  ).bind(id).run();
+  return result.meta.changes > 0;
+}
+
+/**
+ * Atomically consume one use of a registration token. Returns true when the
+ * token existed, was not revoked, not expired, and had uses left.
+ */
+export async function consumeRegistrationToken(
+  db: D1Database,
+  tokenHash: string
+): Promise<boolean> {
+  const result = await db.prepare(
+    `UPDATE registration_tokens
+     SET uses_remaining = uses_remaining - 1
+     WHERE token_hash = ? AND revoked = 0 AND uses_remaining > 0
+       AND (expires_at IS NULL OR expires_at > ?)`
+  ).bind(tokenHash, Date.now()).run();
+  return result.meta.changes > 0;
+}

@@ -385,13 +385,12 @@ afterEach(() => {
 // ===========================================================================
 
 describe('login edges GET /login response shape', () => {
-  it('returns exactly three flows with only type fields', async () => {
+  it('returns exactly two flows with only type fields', async () => {
     const res = await request(envFor(createLoginDb()), '/_matrix/client/v3/login');
     expect(res.status).toBe(200);
     expect(res.body.flows).toEqual([
       { type: 'm.login.password' },
       { type: 'm.login.token' },
-      { type: 'm.login.dummy' },
     ]);
     for (const flow of res.body.flows) {
       expect(Object.keys(flow)).toEqual(['type']);
@@ -404,7 +403,7 @@ describe('login edges GET /login response shape', () => {
       '/_matrix/client/v3/login?access_token=nope'
     );
     expect(res.status).toBe(200);
-    expect(res.body.flows).toHaveLength(3);
+    expect(res.body.flows).toHaveLength(2);
   });
 });
 
@@ -1484,7 +1483,7 @@ describe('login edges m.login.token', () => {
   });
 });
 
-describe('login edges m.login.dummy', () => {
+describe('login edges m.login.dummy is rejected', () => {
   it('rejects null identifier', async () => {
     const env = envFor(aliceDb());
     const res = await request(
@@ -1493,7 +1492,7 @@ describe('login edges m.login.dummy', () => {
       jsonInit('POST', { type: 'm.login.dummy', identifier: null }, '')
     );
     expect(res.status).toBe(400);
-    expect(res.body.errcode).toBe('M_MISSING_PARAM');
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('rejects thirdparty identifier type', async () => {
@@ -1514,7 +1513,7 @@ describe('login edges m.login.dummy', () => {
     expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
-  it('logs in with localpart and ignores password field if present', async () => {
+  it('rejects a localpart login (password field irrelevant)', async () => {
     const db = aliceDb();
     const env = envFor(db);
     const res = await request(
@@ -1531,12 +1530,11 @@ describe('login edges m.login.dummy', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
-    expect(res.body.user_id).toBe(USER);
-    expect(res.body.device_id).toBe('DUM1');
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
-  it('formats localpart for custom SERVER_NAME', async () => {
+  it('rejects dummy login regardless of SERVER_NAME', async () => {
     const custom = 'edge.test';
     const userId = `@alice:${custom}`;
     const db = createLoginDb({
@@ -1554,9 +1552,8 @@ describe('login edges m.login.dummy', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
-    expect(res.body.user_id).toBe(userId);
-    expect(res.body.home_server).toBe(custom);
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('generates device_id when omitted', async () => {
@@ -1570,9 +1567,8 @@ describe('login edges m.login.dummy', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
-    expect(typeof res.body.device_id).toBe('string');
-    expect(res.body.device_id.length).toBeGreaterThan(0);
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 });
 
@@ -2147,7 +2143,7 @@ describe('login edges TOKENMAXX cross-flow leftovers after #125', () => {
     expect(who.body.user_id).toBe(USER);
   });
 
-  it('dummy login response includes home_server matching env', async () => {
+  it('dummy login never reaches home_server (rejected)', async () => {
     const env = envFor(aliceDb(), mockKv(), 'matrix.example.org');
     // user id still @alice:example.com in DB — dummy with full MXID
     const res = await request(
@@ -2163,8 +2159,8 @@ describe('login edges TOKENMAXX cross-flow leftovers after #125', () => {
         ''
       )
     );
-    expect(res.status).toBe(200);
-    expect(res.body.home_server).toBe('matrix.example.org');
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 
   it('password failure does not create devices or tokens', async () => {

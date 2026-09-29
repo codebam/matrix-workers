@@ -5,8 +5,8 @@ import { createMiddleware } from 'hono/factory';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { getUserById } from '../services/database';
-import { generateLoginToken, generateOpaqueId } from '../utils/ids';
+import { getUserById, createRegistrationToken, listRegistrationTokens, revokeRegistrationToken } from '../services/database';
+import { generateLoginToken, generateOpaqueId, generateRegistrationToken } from '../utils/ids';
 import { base64UrlDecode, hashToken, verifySignature } from '../utils/crypto';
 import { encryptSecret } from './oidc-auth';
 import { fetchOIDCDiscovery } from '../services/oidc';
@@ -1131,6 +1131,59 @@ app.post('/admin/api/users/create', requireAuth(), requireAdmin, async (c) => {
   await invalidateStatsCache(c.env);
 
   return c.json({ success: true, user_id: userId });
+});
+
+// POST /admin/api/registration-tokens - Mint an invite token.
+// The raw token is returned exactly once; only its SHA-256 hash is stored.
+app.post('/admin/api/registration-tokens', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  let body: { note?: string; expires_in_hours?: number; uses?: number } = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    // No body or invalid JSON: use defaults.
+  }
+
+  const note = typeof body.note === 'string' ? body.note.slice(0, 200) : null;
+  const uses = Number.isFinite(body.uses)
+    ? Math.min(Math.max(Math.floor(body.uses as number), 1), 100)
+    : 1;
+  const expiresInHours = Number.isFinite(body.expires_in_hours)
+    ? Math.min(Math.max(body.expires_in_hours as number, 1), 24 * 365)
+    : 24 * 7;
+  const expiresAt = Date.now() + expiresInHours * 60 * 60 * 1000;
+
+  const id = await generateOpaqueId(16);
+  const token = await generateRegistrationToken();
+  await createRegistrationToken(db, id, await hashToken(token), note, c.get('userId'), expiresAt, uses);
+
+  // The token is a bearer credential; never let it be cached, and record the
+  // issuance in the admin audit log.
+  c.header('Cache-Control', 'no-store');
+  await logAdminAction(c, {
+    action: 'registration_token.create',
+    target: id,
+    details: { uses, expires_at: expiresAt, note },
+  });
+
+  return c.json({ id, token, note, uses, expires_at: expiresAt });
+});
+
+// GET /admin/api/registration-tokens - List invite tokens (hashes omitted)
+app.get('/admin/api/registration-tokens', requireAuth(), requireAdmin, async (c) => {
+  const tokens = await listRegistrationTokens(c.env.DB);
+  return c.json({ tokens });
+});
+
+// DELETE /admin/api/registration-tokens/:id - Revoke an invite token
+app.delete('/admin/api/registration-tokens/:id', requireAuth(), requireAdmin, async (c) => {
+  const id = c.req.param('id');
+  const revoked = await revokeRegistrationToken(c.env.DB, id);
+  if (!revoked) {
+    return Errors.notFound('Registration token not found').toResponse();
+  }
+  await logAdminAction(c, { action: 'registration_token.revoke', target: id });
+  return c.json({ revoked: true });
 });
 
 // GET /admin/api/users/:userId/sessions - Get user sessions/tokens

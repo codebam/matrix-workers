@@ -1409,12 +1409,12 @@ describe('login+qr leftovers cross-path reliability', () => {
 // =============================================================================
 
 describe('login leftovers GET /login flow catalog', () => {
-  it('lists password, token, dummy exactly once each', async () => {
+  it('lists password and token exactly once each', async () => {
     const env = envFor(aliceDb());
     const res = await loginRequest(env, '/_matrix/client/v3/login', { method: 'GET' });
     expect(res.status).toBe(200);
     const flows = (res.body.flows as Array<{ type: string }>).map((f) => f.type);
-    expect(flows).toEqual(['m.login.password', 'm.login.token', 'm.login.dummy']);
+    expect(flows).toEqual(['m.login.password', 'm.login.token']);
   });
 
   it('GET is idempotent across 20 calls', async () => {
@@ -1422,12 +1422,12 @@ describe('login leftovers GET /login flow catalog', () => {
     for (let i = 0; i < 20; i++) {
       const res = await loginRequest(env, '/_matrix/client/v3/login', { method: 'GET' });
       expect(res.status).toBe(200);
-      expect((res.body.flows as unknown[]).length).toBe(3);
+      expect((res.body.flows as unknown[]).length).toBe(2);
     }
   });
 });
 
-describe('login leftovers m.login.dummy reliability flood', () => {
+describe('login leftovers m.login.dummy rejection flood', () => {
   const users = ['alice', '@alice:example.com', 'bob', '@bob:example.com'];
 
   for (const user of users) {
@@ -1442,13 +1442,12 @@ describe('login leftovers m.login.dummy reliability flood', () => {
           device_id: 'DUM',
         })
       );
-      expect(res.status).toBe(200);
-      expect(res.body.access_token).toMatch(/^syt_/);
-      expect(res.body.refresh_token).toMatch(/^syr_/);
+      expect(res.status).toBe(400);
+      expect(res.body.errcode).toBe('M_UNRECOGNIZED');
     });
   }
 
-  it('dummy ignores wrong password and still issues tokens', async () => {
+  it('dummy login is rejected even with a supplied password', async () => {
     const env = envFor(aliceDb());
     const res = await loginRequest(
       env,
@@ -1460,7 +1459,8 @@ describe('login leftovers m.login.dummy reliability flood', () => {
         device_id: 'DUM2',
       })
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 });
 
@@ -1942,8 +1942,8 @@ describe('login leftovers deactivated user password path', () => {
         identifier: { type: 'm.id.user', user: 'alice' },
       })
     );
-    expect(res.status).toBe(403);
-    expect(res.body.errcode).toBe('M_USER_DEACTIVATED');
+    expect(res.status).toBe(400);
+    expect(res.body.errcode).toBe('M_UNRECOGNIZED');
   });
 });
 
