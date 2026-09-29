@@ -28,7 +28,7 @@ vi.mock('../src/services/federation-keys', async (importOriginal) => {
 });
 
 import federation from '../src/api/federation';
-import { generateSigningKeyPair } from '../src/utils/crypto';
+import { generateSigningKeyPair, verifySignature } from '../src/utils/crypto';
 
 const SERVER = 'example.com';
 const REMOTE = 'remote.example.org';
@@ -755,6 +755,64 @@ describe('federation GET /_matrix/key/v2/server', () => {
     expect(Object.keys(res.body.verify_keys).sort()).toEqual(
       [securePair.keyId, other.keyId].sort()
     );
+  });
+
+  it('signs every published verify key while hiding legacy currents without JWKs', async () => {
+    // Mirrors the live failure that broke the Matrix Federation Tester:
+    // legacy v1 rows stayed is_current = 1, were advertised as verify_keys,
+    // but only one key signed the response (AllEd25519ChecksOK false).
+    const db = createFedDb({
+      serverKeys: [
+        {
+          key_id: 'ed25519:legacy1',
+          public_key: 'legacyPub1',
+          private_key: null,
+          private_key_jwk: null,
+          key_version: 1,
+          valid_from: NOW - 1000,
+          valid_until: NOW + 86_400_000,
+          is_current: 1,
+        },
+        seedSecureKey(securePair),
+        {
+          key_id: 'ed25519:legacy2',
+          public_key: 'legacyPub2',
+          private_key: null,
+          private_key_jwk: null,
+          key_version: 1,
+          valid_from: NOW - 1000,
+          valid_until: NOW + 86_400_000,
+          is_current: 1,
+        },
+      ],
+    });
+    const env = createEnv({ db });
+    const res = await request(env, '/_matrix/key/v2/server');
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body.verify_keys)).toEqual([securePair.keyId]);
+    for (const [keyId, entry] of Object.entries(
+      res.body.verify_keys as Record<string, { key: string }>
+    )) {
+      expect(await verifySignature(res.body, SERVER, keyId, entry.key)).toBe(true);
+    }
+  });
+
+  it('signs all current secure keys when several exist (generation race state)', async () => {
+    const other = await generateSigningKeyPair();
+    const db = createFedDb({
+      serverKeys: [seedSecureKey(securePair), seedSecureKey(other, { key_version: 2 })],
+    });
+    const env = createEnv({ db });
+    const res = await request(env, '/_matrix/key/v2/server');
+    expect(Object.keys(res.body.verify_keys).sort()).toEqual(
+      [securePair.keyId, other.keyId].sort()
+    );
+    for (const [keyId, entry] of Object.entries(
+      res.body.verify_keys as Record<string, { key: string }>
+    )) {
+      expect(res.body.signatures?.[SERVER]?.[keyId]).toBeTruthy();
+      expect(await verifySignature(res.body, SERVER, keyId, entry.key)).toBe(true);
+    }
   });
 });
 
