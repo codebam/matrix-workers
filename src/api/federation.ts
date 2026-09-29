@@ -738,10 +738,18 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       // If room exists, store the event
       if (room) {
         try {
-          await c.env.DB.prepare(
+          // Allocate a stream position first: /sync delivers events by
+          // stream_ordering, and a NULL ordering makes an event invisible to
+          // every client even though it is stored.
+          const positionResult = await c.env.DB.prepare(
+            `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
+          ).first<{ position: number }>();
+          const streamOrdering = positionResult?.position ?? 1;
+
+          const insertResult = await c.env.DB.prepare(
             `INSERT OR IGNORE INTO events
-             (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             eventId,
             roomId,
@@ -754,7 +762,8 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             JSON.stringify(pdu.auth_events || []),
             JSON.stringify(pdu.prev_events || []),
             pdu.hashes ? JSON.stringify(pdu.hashes) : null,
-            pdu.signatures ? JSON.stringify(pdu.signatures) : null
+            pdu.signatures ? JSON.stringify(pdu.signatures) : null,
+            streamOrdering
           ).run();
 
           // Update room state
@@ -814,6 +823,17 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
               membership === 'knock'
             ) {
               await updateMembership(c.env.DB, roomId, pdu.state_key, membership, eventId);
+            }
+          }
+
+          // Wake local members' sync loops so the new event is delivered
+          // promptly instead of waiting out a long-poll timeout.
+          if ((insertResult.meta?.changes ?? 0) > 0) {
+            const localMembers = await c.env.DB.prepare(
+              `SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join' AND user_id LIKE ?`
+            ).bind(roomId, `%:${c.env.SERVER_NAME}`).all<{ user_id: string }>();
+            for (const member of localMembers.results ?? []) {
+              await notifyUserSync(c.env, member.user_id, 'events');
             }
           }
         } catch (e) {
@@ -2765,10 +2785,15 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
 
   // Store the knock event
   try {
+    const knockPosition = await db.prepare(
+      `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
+    ).first<{ position: number }>();
+    const knockStreamOrdering = knockPosition?.position ?? 1;
+
     await db.prepare(`
       INSERT OR IGNORE INTO events
-      (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       eventId,
       roomId,
@@ -2781,7 +2806,8 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
       JSON.stringify(body.auth_events || []),
       JSON.stringify(body.prev_events || []),
       body.hashes ? JSON.stringify(body.hashes) : null,
-      body.signatures ? JSON.stringify(body.signatures) : null
+      body.signatures ? JSON.stringify(body.signatures) : null,
+      knockStreamOrdering
     ).run();
 
     // Update room state
@@ -3701,10 +3727,15 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
 
   // Store the event
   try {
+    const invitePosition = await db.prepare(
+      `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
+    ).first<{ position: number }>();
+    const inviteStreamOrdering = invitePosition?.position ?? 1;
+
     await db.prepare(`
       INSERT OR IGNORE INTO events
-      (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, signatures)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, signatures, stream_ordering)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       eventId,
       roomId,
@@ -3716,7 +3747,8 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
       depth,
       JSON.stringify(authEvents),
       JSON.stringify(prevEvents),
-      JSON.stringify((signedEvent as any).signatures)
+      JSON.stringify((signedEvent as any).signatures),
+      inviteStreamOrdering
     ).run();
 
     // Update room state

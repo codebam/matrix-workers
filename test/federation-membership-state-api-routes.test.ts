@@ -372,6 +372,13 @@ function createMembershipDb(opts: {
             return (eventById(args[0] as string) ?? null) as T;
           }
 
+          if (
+            sql.includes('UPDATE stream_positions') &&
+            sql.includes('RETURNING position')
+          ) {
+            return { position: 1 } as T;
+          }
+
           throw new Error(`Unhandled first() SQL: ${sql.slice(0, 180)}`);
         },
 
