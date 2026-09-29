@@ -10,6 +10,7 @@ vi.mock('cloudflare:workers', () => ({
 }));
 
 const storeEvent = vi.fn(async () => 1);
+const storeEventIdempotent = vi.fn(async () => ({ inserted: true, streamOrdering: 1 }));
 const updateMembership = vi.fn(async () => undefined);
 const getRoomMembers = vi.fn(async () => [] as Array<{ userId: string }>);
 const getStateEvent = vi.fn(async () => null as { event_id: string } | null);
@@ -21,6 +22,7 @@ const generateEventId = vi.fn(async () => '$generated:example.com');
 
 vi.mock('../src/services/database', () => ({
   storeEvent: (...args: unknown[]) => storeEvent(...args),
+  storeEventIdempotent: (...args: unknown[]) => storeEventIdempotent(...args),
   updateMembership: (...args: unknown[]) => updateMembership(...args),
   getRoomMembers: (...args: unknown[]) => getRoomMembers(...args),
   getStateEvent: (...args: unknown[]) => getStateEvent(...args),
@@ -103,6 +105,7 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     vi.useFakeTimers();
     vi.setSystemTime(NOW);
     storeEvent.mockClear();
+    storeEventIdempotent.mockClear();
     updateMembership.mockClear();
     getRoomMembers.mockReset();
     getStateEvent.mockReset();
@@ -234,7 +237,67 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     federationGet.mockResolvedValue(
       new Response(JSON.stringify(template), { status: 200 })
     );
-    federationPut.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
+    federationPut.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          origin: 'remote.example',
+          auth_chain: [
+            {
+              event_id: '$ac1:remote.example',
+              type: 'm.room.create',
+              room_id: ROOM,
+              sender: '@r:remote.example',
+              state_key: '',
+              content: {},
+              origin_server_ts: 1,
+              depth: 1,
+              auth_events: [],
+              prev_events: [],
+            },
+            {
+              event_id: '$ac2:remote.example',
+              type: 'm.room.member',
+              room_id: ROOM,
+              sender: '@r:remote.example',
+              state_key: '@r:remote.example',
+              content: { membership: 'join' },
+              origin_server_ts: 1,
+              depth: 2,
+              auth_events: [],
+              prev_events: [],
+            },
+          ],
+          state: [
+            {
+              event_id: '$st1:remote.example',
+              type: 'm.room.power_levels',
+              room_id: ROOM,
+              sender: '@r:remote.example',
+              state_key: '',
+              content: {},
+              origin_server_ts: 2,
+              depth: 3,
+              auth_events: [],
+              prev_events: [],
+            },
+          ],
+          event: {
+            event_id: '$generated:example.com',
+            type: 'm.room.member',
+            room_id: ROOM,
+            sender: USER,
+            state_key: USER,
+            content: { membership: 'join' },
+            origin_server_ts: 3,
+            depth: 4,
+            auth_events: [],
+            prev_events: [],
+            signatures: { 'remote.example': { 'ed25519:1': 'sig' } },
+          },
+        }),
+        { status: 200 }
+      )
+    );
 
     const env = createSyncEnv();
     const step = mockStep();
@@ -256,6 +319,7 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
       'make-join',
       'create-event',
       'send-join',
+      'store-remote-state',
       'persist',
       'get-members',
     ]);
@@ -272,8 +336,18 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     expect(stored.depth).toBe(7);
     expect(federationPut).toHaveBeenCalled();
     const putPath = federationPut.mock.calls[0][1];
-    expect(putPath).toContain('/_matrix/federation/v1/send_join/');
+    expect(putPath).toContain('/_matrix/federation/v2/send_join/');
     expect(putPath).toContain(encodeURIComponent('$generated:example.com'));
+    // Remote state + auth chain + counter-signed join persisted for auth checks.
+    const idempotentIds = storeEventIdempotent.mock.calls.map(
+      (c) => (c[1] as { event_id: string }).event_id
+    );
+    expect(idempotentIds).toEqual([
+      '$ac1:remote.example',
+      '$ac2:remote.example',
+      '$st1:remote.example',
+      '$generated:example.com',
+    ]);
   });
 
   it('remote template with missing auth/prev/depth falls back to [] / [] / 1', async () => {

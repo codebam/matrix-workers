@@ -462,8 +462,15 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   // Check if room exists locally
   const room = await getRoom(c.env.DB, roomId);
 
-  // For remote rooms that don't exist locally, use the workflow for federation
-  if (!room && isRemoteRoom && roomServer) {
+  // Remote rooms go through the workflow for the federation handshake: either
+  // the room is unknown locally, or we only hold invite state received from
+  // the remote server and this join must be registered with it
+  // (make_join/send_join) before it will relay the room's events to us.
+  const localMembership =
+    room && isRemoteRoom ? await getMembership(c.env.DB, roomId, userId) : null;
+  const needsFederationJoin =
+    isRemoteRoom && roomServer && (!room || localMembership?.membership === 'invite');
+  if (needsFederationJoin && roomServer) {
     console.log('[rooms] Remote room join via workflow', { roomId, roomServer, userId });
 
     // Trigger the RoomJoinWorkflow for durable federation handling
