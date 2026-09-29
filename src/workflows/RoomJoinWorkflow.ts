@@ -21,6 +21,12 @@ import {
 import { federationGet, federationPut } from '../services/federation-keys';
 import { validateRemoteJoinTemplate } from './join-template-validation';
 
+// Room versions this homeserver can participate in. make_join must advertise
+// these via ?ver= or resident servers reject modern rooms (e.g. v12) with
+// M_INCOMPATIBLE_ROOM_VERSION. Keep in sync with the federation API's
+// SUPPORTED_ROOM_VERSIONS.
+const SUPPORTED_ROOM_VERSIONS = ['12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1'];
+
 // Parameters passed when triggering the workflow
 export interface JoinParams {
   roomId: string;
@@ -178,7 +184,10 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   ): Promise<{ room_version: string; event: any }> {
     console.log('[RoomJoinWorkflow] Making make_join request', { remoteServer, roomId, userId });
 
-    const path = `/_matrix/federation/v1/make_join/${encodeURIComponent(roomId)}/${encodeURIComponent(userId)}`;
+    // Advertise support for our room versions: resident servers intersect this
+    // list with the room's version when deciding whether to accept the join.
+    const versions = SUPPORTED_ROOM_VERSIONS.map((v) => `ver=${encodeURIComponent(v)}`).join('&');
+    const path = `/_matrix/federation/v1/make_join/${encodeURIComponent(roomId)}/${encodeURIComponent(userId)}?${versions}`;
 
     const response = await federationGet(
       remoteServer,

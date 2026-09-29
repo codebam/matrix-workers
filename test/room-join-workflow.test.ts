@@ -323,13 +323,15 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
       'persist',
       'get-members',
     ]);
-    expect(federationGet).toHaveBeenCalledWith(
-      'remote.example',
-      `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(USER)}`,
-      'example.com',
-      env.DB,
-      env.CACHE
+    const getArgs = federationGet.mock.calls[0];
+    expect(getArgs[0]).toBe('remote.example');
+    expect(getArgs[1]).toContain(
+      `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(USER)}`
     );
+    expect(getArgs[1]).toContain('ver=12');
+    expect(getArgs[2]).toBe('example.com');
+    expect(getArgs[3]).toBe(env.DB);
+    expect(getArgs[4]).toBe(env.CACHE);
     const stored = storeEvent.mock.calls[0][1];
     expect(stored.auth_events).toEqual(template.event.auth_events);
     expect(stored.prev_events).toEqual(template.event.prev_events);

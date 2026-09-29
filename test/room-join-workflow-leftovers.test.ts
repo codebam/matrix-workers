@@ -698,9 +698,10 @@ describe('room-join leftovers content / clock / gate soft flood after #171', () 
         } as any,
         mockStep() as any
       );
-      expect(federationGet.mock.calls[0][1]).toBe(
+      expect(federationGet.mock.calls[0][1]).toContain(
         `/_matrix/federation/v1/make_join/${encodeURIComponent(roomId)}/${encodeURIComponent(userId)}`
       );
+      expect(federationGet.mock.calls[0][1]).toContain('ver=12');
       expect(federationPut.mock.calls[0][1]).toContain(encodeURIComponent(roomId));
       expect(federationPut.mock.calls[0][1]).toContain(
         encodeURIComponent('$generated:example.com')
