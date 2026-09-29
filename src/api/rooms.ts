@@ -1172,6 +1172,7 @@ async function queueFederationPdu(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ destination, event_id: eventId, room_id: roomId, pdu }),
       }));
+      console.log(`[rooms] Federation DO accepted delivery for ${destination}: ${eventId}`);
     } catch (err) {
       console.error(`[rooms] Federation queueing failed for ${destination}:`, err);
     }
@@ -1237,6 +1238,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
       (event as unknown as Record<string, unknown>).hashes = prepared.hashes;
       (event as unknown as Record<string, unknown>).signatures = prepared.signatures;
       wirePdu = prepared.wire;
+      console.log(`[rooms] Federation wire PDU prepared for ${prepared.wireId} -> ${remoteServers.join(', ')}`);
     }
   }
 
