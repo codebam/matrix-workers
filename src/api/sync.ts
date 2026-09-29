@@ -225,17 +225,35 @@ async function getDeviceListChanges(
 const app = new Hono<AppEnv>();
 
 // GET /_matrix/client/v3/sync - Sync with server
-// Parse composite sync token: "s{events}_td{to_device}" or legacy plain number
+// Parse composite sync token:
+//   "s{events}_td{to_device}"                      (legacy composite)
+//   "s{events}_td{to_device}_ad{account_data}_dk{device_keys}"  (current)
+//   plain number                                    (legacy)
+// The account-data and device-keys streams have their own counters (see the
+// stream_positions table); omitting their positions would compare them against
+// the events position, which redelivers their changes on every sync.
 /** Exported for unit tests. */
-export function parseSyncToken(token: string | undefined): { events: number; toDevice: number } {
+export function parseSyncToken(token: string | undefined): {
+  events: number;
+  toDevice: number;
+  accountData?: number;
+  deviceKeys?: number;
+} {
   if (!token) {
     return { events: 0, toDevice: 0 };
   }
 
-  // Try composite format first: s84_td119
-  const match = token.match(/^s(\d+)_td(\d+)$/);
+  // Composite format, with optional per-stream positions for account data
+  // and device keys: s84_td119_ad33_dk7
+  const match = token.match(/^s(\d+)_td(\d+)(?:_ad(\d+)_dk(\d+))?$/);
   if (match) {
-    return { events: parseInt(match[1]), toDevice: parseInt(match[2]) };
+    const parsed: { events: number; toDevice: number; accountData?: number; deviceKeys?: number } = {
+      events: parseInt(match[1]),
+      toDevice: parseInt(match[2]),
+    };
+    if (match[3] !== undefined) parsed.accountData = parseInt(match[3]);
+    if (match[4] !== undefined) parsed.deviceKeys = parseInt(match[4]);
+    return parsed;
   }
 
   // Legacy format: plain number (use for both streams for backwards compat)
@@ -247,10 +265,36 @@ export function parseSyncToken(token: string | undefined): { events: number; toD
   return { events: 0, toDevice: 0 };
 }
 
-// Build composite sync token
+// Build composite sync token. The account-data / device-keys suffix is only
+// emitted when either position is non-zero, so accounts that never wrote to
+// those streams keep the compact legacy format.
 /** Exported for unit tests. */
-export function buildSyncToken(eventsPos: number, toDevicePos: number): string {
-  return `s${eventsPos}_td${toDevicePos}`;
+export function buildSyncToken(
+  eventsPos: number,
+  toDevicePos: number,
+  accountDataPos: number = 0,
+  deviceKeysPos: number = 0
+): string {
+  const base = `s${eventsPos}_td${toDevicePos}`;
+  if (accountDataPos === 0 && deviceKeysPos === 0) {
+    return base;
+  }
+  return `${base}_ad${accountDataPos}_dk${deviceKeysPos}`;
+}
+
+// Read the current value of a named stream counter (see stream_positions;
+// written by account-data.ts / keys.ts / to-device.ts). Missing rows and
+// absent tables both mean "position 0" — e.g. in minimal test doubles.
+async function getStreamPosition(db: D1Database, streamName: string): Promise<number> {
+  try {
+    const row = await db
+      .prepare(`SELECT position FROM stream_positions WHERE stream_name = ?`)
+      .bind(streamName)
+      .first<{ position: number }>();
+    return row?.position ?? 0;
+  } catch {
+    return 0;
+  }
 }
 
 app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
@@ -268,8 +312,22 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     console.log('[sync] Using no filter (filter not found or invalid)');
   }
 
-  // Parse composite sync token (separate positions for events and to-device)
-  const { events: sincePosition, toDevice: sinceToDevice } = parseSyncToken(since);
+  // Parse composite sync token (separate positions per stream)
+  const {
+    events: sincePosition,
+    toDevice: sinceToDevice,
+    accountData: sinceAccountData,
+    deviceKeys: sinceDeviceKeys,
+  } = parseSyncToken(since);
+  // A token was supplied iff this is an incremental sync. Position values
+  // alone are not enough: accounts with no room events always sit at s0, and
+  // treating their incremental syncs as initial ones redelivers every
+  // account-data / device-list change on every request.
+  const hasSinceToken = since !== undefined;
+  // Legacy tokens carry no account-data / device-keys positions; fall back to
+  // the events position so their behaviour is unchanged during the transition.
+  const sinceAccountDataPos = sinceAccountData ?? sincePosition;
+  const sinceDeviceKeysPos = sinceDeviceKeys ?? sincePosition;
 
   // Get current position
   const currentPosition = await getLatestStreamPosition(c.env.DB);
@@ -315,7 +373,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     response.device_unused_fallback_key_types = await getUnusedFallbackKeyTypes(c.env.DB, userId, deviceId);
 
     // Debug E2EE state for first sync
-    if (sincePosition === 0) {
+    if (!hasSinceToken) {
       console.log('[sync] Initial sync E2EE state for', userId, ':', {
         otk_counts: response.device_one_time_keys_count,
         fallback_types: response.device_unused_fallback_key_types,
@@ -325,8 +383,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   }
 
   // Get device list changes (users whose keys have changed since last sync)
-  if (sincePosition > 0) {
-    const deviceListChanges = await getDeviceListChanges(c.env.DB, userId, sincePosition);
+  if (hasSinceToken) {
+    const deviceListChanges = await getDeviceListChanges(c.env.DB, userId, sinceDeviceKeysPos);
     if (deviceListChanges.changed.length > 0 || deviceListChanges.left.length > 0) {
       response.device_lists = deviceListChanges;
     }
@@ -347,14 +405,14 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   let globalAccountData = await getGlobalAccountData(
     c.env.DB,
     userId,
-    sincePosition > 0 ? sincePosition : undefined
+    hasSinceToken ? sinceAccountDataPos : undefined
   );
   // Apply account_data filter to global account data
   globalAccountData = applyEventFilter(globalAccountData, filter?.account_data);
   response.account_data!.events = globalAccountData;
 
   // Debug: Log global account_data that will be returned (for initial sync)
-  if (sincePosition === 0) {
+  if (!hasSinceToken) {
     console.log('[sync] Initial sync account_data for', userId, ':',
       globalAccountData.length > 0 ? globalAccountData.map(e => e.type) : 'none');
   }
@@ -410,7 +468,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
 
     // Include full state if requested or initial sync
-    if (fullState || sincePosition === 0) {
+    if (fullState || !hasSinceToken) {
       const state = await getRoomState(c.env.DB, roomId);
       for (const event of state) {
         const clientEvent = {
@@ -442,7 +500,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       c.env.DB,
       userId,
       roomId,
-      sincePosition > 0 ? sincePosition : undefined
+      hasSinceToken ? sinceAccountDataPos : undefined
     );
     // Apply account_data filter to room account data
     roomAccountData = applyEventFilter(roomAccountData, filter?.room?.account_data);
@@ -557,7 +615,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   const timeout = Math.min(parseInt(c.req.query('timeout') || '0'), 30000);
 
   // If no changes and timeout > 0, wait for events via Durable Object
-  if (!hasChanges && timeout > 0 && sincePosition > 0) {
+  if (!hasChanges && timeout > 0 && hasSinceToken) {
     console.log('[sync] Entering DO wait for', userId, 'timeout:', timeout);
     const syncDO = c.env.SYNC;
     const doId = syncDO.idFromName(userId);
@@ -581,15 +639,26 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       // We intentionally do NOT advance next_batch here, so the client
       // re-syncs from the same position and actually sees the events
     }
-  } else if (timeout > 0 && sincePosition > 0) {
+  } else if (timeout > 0 && hasSinceToken) {
     console.log('[sync] Skipping DO wait for', userId, '- hasChanges:', hasChanges,
       'roomChanges:', hasRoomChanges, 'invites:', hasInvites, 'leaves:', hasLeaves,
       'toDevice:', hasToDevice, 'accountData:', hasAccountData);
   }
 
-  // Build composite next_batch token with separate positions for each stream
+  // Build composite next_batch token with separate positions for each stream.
+  // The account-data / device-keys positions advance to the current stream
+  // counters, so changes already delivered above are not sent again.
   if (!response.next_batch) {
-    response.next_batch = buildSyncToken(currentPosition, currentToDevicePos);
+    const [currentAccountDataPos, currentDeviceKeysPos] = await Promise.all([
+      getStreamPosition(c.env.DB, 'account_data'),
+      getStreamPosition(c.env.DB, 'device_keys'),
+    ]);
+    response.next_batch = buildSyncToken(
+      currentPosition,
+      currentToDevicePos,
+      currentAccountDataPos,
+      currentDeviceKeysPos
+    );
   }
 
   return c.json(response);

@@ -413,3 +413,58 @@ describe('sync filters TOKENMAXX leftovers after #78 (client sync filter helpers
     ]);
   });
 });
+
+describe('sync tokens — account-data and device-key stream positions', () => {
+  it('parses the extended composite form with all four positions', () => {
+    expect(parseSyncToken('s84_td119_ad33_dk7')).toEqual({
+      events: 84,
+      toDevice: 119,
+      accountData: 33,
+      deviceKeys: 7,
+    });
+  });
+
+  it('parses zero-valued extended tokens', () => {
+    expect(parseSyncToken('s0_td0_ad0_dk0')).toEqual({
+      events: 0,
+      toDevice: 0,
+      accountData: 0,
+      deviceKeys: 0,
+    });
+  });
+
+  it('keeps the two-position legacy composite form untouched', () => {
+    expect(parseSyncToken('s84_td119')).toEqual({ events: 84, toDevice: 119 });
+  });
+
+  it('rejects partially suffixed and trailing-garbage extended tokens', () => {
+    expect(parseSyncToken('s1_td2_ad3')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s1_td2_ad3_dk4_extra')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s1_td2_adx_dk4')).toEqual({ events: 0, toDevice: 0 });
+  });
+
+  it('emits the extended form only when a stream position is non-zero', () => {
+    expect(buildSyncToken(0, 0)).toBe('s0_td0');
+    expect(buildSyncToken(0, 0, 49, 0)).toBe('s0_td0_ad49_dk0');
+    expect(buildSyncToken(100, 55, 0, 34)).toBe('s100_td55_ad0_dk34');
+    expect(buildSyncToken(100, 55, 3, 34)).toBe('s100_td55_ad3_dk34');
+  });
+
+  it('round-trips extended tokens', () => {
+    const token = buildSyncToken(7, 8, 49, 34);
+    expect(token).toBe('s7_td8_ad49_dk34');
+    expect(parseSyncToken(token)).toEqual({
+      events: 7,
+      toDevice: 8,
+      accountData: 49,
+      deviceKeys: 34,
+    });
+  });
+
+  it('round-trips compact tokens without adding undefined fields', () => {
+    // toEqual ignores undefined-valued keys, but the compact form must not
+    // carry any extra keys at all so legacy expectations stay exact.
+    const parsed = parseSyncToken(buildSyncToken(5, 6));
+    expect(Object.keys(parsed)).toEqual(['events', 'toDevice']);
+  });
+});

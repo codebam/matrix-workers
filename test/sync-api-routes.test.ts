@@ -160,11 +160,13 @@ function createSyncDb(opts: {
   fallbackAlgos?: FallbackAlgo[];
   deviceKeyChanges?: DeviceKeyChange[];
   sharedRoomUsers?: string[];
+  streamPositions?: Record<string, number>;
 } = {}) {
   const otkCounts = opts.otkCounts ?? [];
   const fallbackAlgos = opts.fallbackAlgos ?? [];
   const deviceKeyChanges = opts.deviceKeyChanges ?? [];
   const sharedRoomUsers = new Set(opts.sharedRoomUsers ?? [BOB, CAROL]);
+  const streamPositions = opts.streamPositions ?? {};
   const selects: SqlCall[] = [];
 
   const db = {
@@ -172,6 +174,7 @@ function createSyncDb(opts: {
     fallbackAlgos,
     deviceKeyChanges,
     sharedRoomUsers,
+    streamPositions,
     selects,
     prepare(sql: string) {
       return {
@@ -180,16 +183,17 @@ function createSyncDb(opts: {
             async first<T>() {
               selects.push({ sql, args });
 
-              if (
-                sql.includes('FROM device_key_changes') &&
-                sql.includes('COUNT(*)') &&
-                sql.includes('dkc.user_id = ?')
-              ) {
+              if (sql.includes('FROM device_key_changes') && sql.includes('COUNT(*)') && sql.includes('dkc.user_id = ?')) {
                 const [sincePos, userId] = args as [number, string];
                 const count = deviceKeyChanges.filter(
                   (c) => c.user_id === userId && c.stream_position > sincePos
                 ).length;
                 return { count } as T;
+              }
+
+              if (sql.includes('FROM stream_positions') && sql.includes('stream_name = ?')) {
+                const [streamName] = args as [string];
+                return { position: streamPositions[streamName] ?? 0 } as T;
               }
 
               throw new Error(`Unhandled first() SQL: ${sql.slice(0, 160)}`);
@@ -364,10 +368,12 @@ describe('GET /_matrix/client/v3/sync — empty baseline', () => {
     expect(body.device_lists).toEqual({ changed: [USER], left: [] });
   });
 
-  it('includes self in device_lists.changed when since=0 / legacy zero', async () => {
+  it('does not send the initial self-hint for legacy zero since tokens (token present = incremental)', async () => {
     const env = createEnv();
     const { body } = await syncRequest(env, 'since=0');
-    expect(body.device_lists).toEqual({ changed: [USER], left: [] });
+    // The token is present, so this is an incremental sync: the self hint is
+    // only for token-less initial syncs. Nothing changed in the mock → absent.
+    expect(body.device_lists).toBeUndefined();
   });
 
   it('calls getLatestStreamPosition once per request', async () => {
@@ -429,7 +435,8 @@ describe('GET /sync — sync tokens and next_batch', () => {
     const env = createEnv();
     const { body } = await syncRequest(env, 'since=not-a-token');
     expect(body.next_batch).toBe('s3_td0');
-    expect(body.device_lists).toEqual({ changed: [USER], left: [] });
+    // Token present → incremental sync → no initial-sync self hint.
+    expect(body.device_lists).toBeUndefined();
   });
 
   it('keeps to-device position when nextBatch is non-numeric', async () => {
@@ -1664,8 +1671,9 @@ describe('GET /sync — query parameter edges', () => {
     getLatestStreamPosition.mockResolvedValue(1);
     const env = createEnv();
     const { body } = await syncRequest(env, 'since=s10');
-    // parseInt('s10') is NaN → zeros → initial device_lists path
-    expect(body.device_lists).toEqual({ changed: [USER], left: [] });
+    // parseInt('s10') is NaN → zero positions; the token is still present, so
+    // this is an incremental sync (no initial-sync self hint).
+    expect(body.device_lists).toBeUndefined();
     expect(body.next_batch).toBe('s1_td0');
   });
 });
@@ -2289,5 +2297,58 @@ describe('GET /sync — KV filter keyed per user', () => {
     const env = createEnv({ cache });
     const { body } = await syncRequest(env, 'filter=fid1');
     expect(Object.keys((body.rooms as { join: object }).join)).toEqual([ROOM2]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-stream sync token positions (account data / device keys)
+// ---------------------------------------------------------------------------
+
+describe('GET /sync — per-stream token positions', () => {
+  it('advances account-data and device-key positions in next_batch', async () => {
+    getLatestStreamPosition.mockResolvedValue(0);
+    const db = createSyncDb({ streamPositions: { account_data: 49, device_keys: 34 } });
+    const env = createEnv({ db });
+    const { body } = await syncRequest(env, 'since=s0_td0');
+    expect(body.next_batch).toBe('s0_td0_ad49_dk34');
+  });
+
+  it('keeps the compact two-position token when both streams are at zero', async () => {
+    getLatestStreamPosition.mockResolvedValue(0);
+    const env = createEnv();
+    const { body } = await syncRequest(env, 'since=s0_td0');
+    expect(body.next_batch).toBe('s0_td0');
+  });
+
+  it('compares account data against its own stream position, not the events position', async () => {
+    const env = createEnv();
+    await syncRequest(env, 'since=s5_td1_ad49_dk34');
+    expect(getGlobalAccountData).toHaveBeenCalledWith(env.DB, USER, 49);
+  });
+
+  it('falls back to the events position for legacy tokens (parity during transition)', async () => {
+    const env = createEnv();
+    await syncRequest(env, 'since=s9_td1');
+    expect(getGlobalAccountData).toHaveBeenCalledWith(env.DB, USER, 9);
+  });
+
+  it('does not redeliver device-list changes at or below the device-keys position', async () => {
+    const db = createSyncDb({
+      deviceKeyChanges: [{ user_id: BOB, stream_position: 34 }],
+      streamPositions: { account_data: 0, device_keys: 34 },
+    });
+    const env = createEnv({ db });
+    const { body } = await syncRequest(env, 'since=s0_td0_ad0_dk34');
+    expect(body.device_lists).toBeUndefined();
+  });
+
+  it('reports device-list changes newer than the device-keys position', async () => {
+    const db = createSyncDb({
+      deviceKeyChanges: [{ user_id: BOB, stream_position: 35 }],
+      streamPositions: { account_data: 0, device_keys: 35 },
+    });
+    const env = createEnv({ db });
+    const { body } = await syncRequest(env, 'since=s0_td0_ad0_dk34');
+    expect(body.device_lists).toEqual({ changed: [BOB], left: [] });
   });
 });
