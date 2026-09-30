@@ -10,7 +10,7 @@ import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-
 import { calculateContentHash, signJson } from '../utils/crypto';
 import { computeEventReferenceHash, computeWireEventId, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
 import { getServerSigningKey } from '../services/federation-keys';
-import { getEffectiveUserPowerLevel } from '../services/event-auth';
+import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
 import {
   createRoom,
   getRoom,
@@ -92,8 +92,7 @@ export function validateStateEvent(event: any, index: number): StateEventValidat
 // BEGIN/COMMIT, but batches execute atomically — partial failure cannot leave
 // a room with missing fundamental state events.
 async function createInitialRoomEvents(
-  db: D1Database,
-  serverName: string,
+  env: Env,
   roomId: string,
   roomVersion: string,
   creatorId: string,
@@ -108,6 +107,8 @@ async function createInitialRoomEvents(
   },
   prebuiltCreate?: { eventId: string; pduBase: Record<string, unknown>; hashes: Record<string, string> }
 ): Promise<string> {
+  const db = env.DB;
+  const serverName = env.SERVER_NAME;
   const now = Date.now();
 
   interface PlannedEvent {
@@ -125,12 +126,83 @@ async function createInitialRoomEvents(
   const prevEvents: string[] = [];
   let depth = 0;
 
+  // MSC4291 (v12): a room's event IDs are reference hashes of the exact
+  // bytes federation will see. The creation batch must therefore be stored
+  // in that same derived space — IDs derived, references translated to
+  // derived IDs, auth_events reduced to the receiving server's expected
+  // selection — or the stored room and the served room diverge into two ID
+  // spaces and remote servers cannot resolve references into either.
+  const plannedRefTargets = new Map<string, { type: string; stateKey: string }>();
+
+  const reduceAuthRefs = (
+    refs: string[],
+    type: string,
+    stateKey: string | undefined,
+    content: any
+  ): string[] => {
+    const expected = expectedAuthTypes(type, creatorId, stateKey, content);
+    const kept: string[] = [];
+    const seen = new Set<string>();
+    const push = (id: string): void => {
+      if (!seen.has(id)) {
+        seen.add(id);
+        kept.push(id);
+      }
+    };
+    for (const ref of refs) {
+      const target = plannedRefTargets.get(ref);
+      if (!target) {
+        push(ref);
+        continue;
+      }
+      if (target.type === 'm.room.create') continue;
+      if (expected.has(`${target.type}\u0000${target.stateKey}`)) push(ref);
+    }
+    return kept;
+  };
+
   async function plan(
     type: string,
     content: any,
     stateKey: string | undefined,
     membership?: { userId: string; state: 'join' | 'invite' }
   ): Promise<string> {
+    if (createIsImplicit) {
+      // Derive the wire form first (reduced refs, reference-hash ID, content
+      // hash, server signature) and store that exact form, so the stored
+      // event is byte-identical to what the serving derivation produces.
+      const pdu: PDU = {
+        // Placeholder: the real ID is the derived wire ID assigned below
+        // (prepareOutboundPdu strips event_id before hashing anyway).
+        event_id: '',
+        room_id: roomId,
+        sender: creatorId,
+        type,
+        state_key: stateKey,
+        content,
+        origin_server_ts: now,
+        depth: depth++,
+        auth_events: reduceAuthRefs([...authEvents], type, stateKey, content),
+        prev_events: [...prevEvents],
+      };
+      const prepared = await prepareOutboundPdu(env, pdu, roomVersion);
+      if (!prepared) {
+        throw new Error('[createRoom] cannot derive v12 event ID without a signing key');
+      }
+      pdu.event_id = prepared.wireId;
+      pdu.hashes = prepared.hashes as PDU['hashes'];
+      pdu.signatures = prepared.signatures as PDU['signatures'];
+      validateEventSize(pdu);
+      planned.push({ pdu, membership });
+      if (stateKey !== undefined && type !== 'm.room.create') {
+        authEvents.push(prepared.wireId);
+        plannedRefTargets.set(prepared.wireId, { type, stateKey: stateKey ?? '' });
+      }
+      prevEvents.length = 0;
+      prevEvents.push(prepared.wireId);
+      return prepared.wireId;
+    }
+
     const eventId = await generateEventId(serverName, roomVersion);
     const pdu: PDU = {
       event_id: eventId,
@@ -421,7 +493,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
   // Create initial room events atomically.
   let createEventId: string;
   try {
-    createEventId = await createInitialRoomEvents(c.env.DB, c.env.SERVER_NAME, roomId, version, userId, {
+    createEventId = await createInitialRoomEvents(c.env, roomId, version, userId, {
       name,
       topic,
       preset,

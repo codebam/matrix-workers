@@ -54,6 +54,42 @@ function getPowerLevels(state: RoomStateMap): RoomPowerLevelsContent {
   };
 }
 
+/**
+ * The auth events a receiving server's auth selection expects for an event of
+ * the given shape: the power_levels plus the sender's membership, extended
+ * for membership events (join_rules for join/invite/knock, the target's own
+ * membership, third-party invites, and the authorising user for restricted
+ * joins). Used both when deriving served wire events and when creating v12
+ * room events, so the stored form matches the served form exactly.
+ */
+export function expectedAuthTypes(
+  type: string,
+  sender: string,
+  stateKey: string | undefined,
+  content: Record<string, unknown>
+): Set<string> {
+  const out = new Set<string>();
+  if (type === 'm.room.create') return out;
+  out.add('m.room.power_levels\u0000');
+  out.add(`m.room.member\u0000${sender}`);
+  if (type === 'm.room.member') {
+    const membership = content['membership'];
+    if (membership === 'join' || membership === 'invite' || membership === 'knock') {
+      out.add('m.room.join_rules\u0000');
+    }
+    if (typeof stateKey === 'string') out.add(`m.room.member\u0000${stateKey}`);
+    const tpi = content['third_party_invite'] as { signed?: { token?: string } } | undefined;
+    if (membership === 'invite' && tpi?.signed?.token) {
+      out.add(`m.room.third_party_invite\u0000${tpi.signed.token}`);
+    }
+    const authorising = content['join_authorised_via_users_server'];
+    if (membership === 'join' && typeof authorising === 'string') {
+      out.add(`m.room.member\u0000${authorising}`);
+    }
+  }
+  return out;
+}
+
 /** MSC4289 (room v12): room creators have implicit power level 2^53,
  *  matching Synapse's CREATOR_POWER_LEVEL constant. */
 export const CREATOR_POWER_LEVEL = 2 ** 53;

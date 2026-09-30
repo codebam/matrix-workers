@@ -56,9 +56,13 @@ vi.mock('../src/services/database', async (importOriginal) => {
 });
 
 const checkEventAuth = vi.fn(() => ({ allowed: true }));
-vi.mock('../src/services/event-auth', () => ({
-  checkEventAuth: (...args: unknown[]) => checkEventAuth(...args),
-}));
+vi.mock('../src/services/event-auth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/event-auth')>();
+  return {
+    ...actual,
+    checkEventAuth: (...args: unknown[]) => (checkEventAuth as (...a: unknown[]) => unknown)(...args),
+  };
+});
 
 import federation, {
   isModernRoomVersion,

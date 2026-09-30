@@ -10,6 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env, PDU } from '../src/types';
 import { hashToken, generateSigningKeyPair } from '../src/utils/crypto';
+import { computeWireEventId } from '../src/utils/event-signing';
 
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => {
@@ -179,6 +180,8 @@ function createSqlDb(opts: DbOpts = {}) {
       return {
         bind(...args: unknown[]) {
           return {
+            sql,
+            args,
             async first<T>() {
               selects.push({ sql, args });
 
@@ -823,6 +826,147 @@ describe('POST /createRoom', () => {
           (e) => e.type === 'm.room.member' && e.state_key === USER
         )
       ).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('v12: stores the creation batch in the derived id space (stored form == served form)', async () => {
+    const USER_ = USER;
+    getRoom.mockResolvedValue({ room_id: '!newroom:example.com', room_version: '12', is_public: 0 });
+    getStateEvent.mockImplementation(async (dbArg: unknown, _room, type: string, stateKey = '') => {
+      if (type === 'm.room.create') {
+        return pdu({ type: 'm.room.create', event_id: '$create', state_key: '' });
+      }
+      if (type === 'm.room.join_rules') {
+        return pdu({ type: 'm.room.join_rules', event_id: '$jr', state_key: '', content: { join_rule: 'invite' } });
+      }
+      if (type === 'm.room.power_levels') {
+        return pdu({ type: 'm.room.power_levels', event_id: '$pl', state_key: '', content: { users: { [USER_]: 100 }, invite: 50 } });
+      }
+      if (type === 'm.room.member' && stateKey === '@carol:remote.example') {
+        // Mirror the real flow: the invite is read back from the store, so
+        // return the exact row the creation batch wrote.
+        const stmts = ((dbArg as { batches?: unknown[][] })?.batches?.[0] ?? []) as Array<{
+          sql: string;
+          args: unknown[];
+        }>;
+        const ins = stmts.find(
+          (s) =>
+            s.sql.includes('INSERT INTO events') &&
+            s.args[3] === 'm.room.member' &&
+            s.args[4] === '@carol:remote.example'
+        );
+        if (ins) {
+          const a = ins.args;
+          return pdu({
+            type: 'm.room.member',
+            event_id: a[0] as string,
+            state_key: '@carol:remote.example',
+            content: JSON.parse(a[5] as string),
+            auth_events: JSON.parse(a[9] as string),
+            prev_events: JSON.parse(a[10] as string),
+            depth: a[8] as number,
+            origin_server_ts: a[6] as number,
+            hashes: JSON.parse(a[11] as string),
+          });
+        }
+        return pdu({ type: 'm.room.member', event_id: '$carol-invite', state_key: '@carol:remote.example', content: { membership: 'invite' } });
+      }
+      if (type === 'm.room.member' && stateKey === USER_) {
+        return pdu({ type: 'm.room.member', event_id: '$alice-join', state_key: USER_, content: { membership: 'join' } });
+      }
+      return null;
+    });
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({ keyId: 'ed25519:test', privateKeyJwk: kp.privateKeyJwk });
+      const db = createSqlDb();
+      const fedFetch = vi.fn(async (_req: Request) => new Response('Queued'));
+      const { status } = await request(
+        '/_matrix/client/v3/createRoom',
+        jsonInit('POST', { room_version: '12', name: 'Derived', invite: ['@carol:remote.example'] }),
+        db,
+        { fedFetch }
+      );
+      expect(status).toBe(200);
+
+      // The creation batch is the room's stored form. Every stored event ID
+      // must be the reference hash of that exact form (so remote servers
+      // derive the same IDs), and auth_events must already be reduced to the
+      // receiving server's expected selection (never the union of prior
+      // state).
+      const stmts = db.batches[0] as Array<{ sql: string; args: unknown[] }>;
+      const rows = stmts
+        .filter((s) => s.sql.includes('INSERT INTO events'))
+        .map((s) => {
+          const a = s.args;
+          return {
+            event_id: a[0] as string,
+            room_id: a[1] as string,
+            sender: a[2] as string,
+            type: a[3] as string,
+            state_key: (a[4] as string | null) ?? undefined,
+            content: JSON.parse(a[5] as string),
+            origin_server_ts: a[6] as number,
+            depth: a[8] as number,
+            auth_events: JSON.parse(a[9] as string) as string[],
+            prev_events: JSON.parse(a[10] as string) as string[],
+            hashes: JSON.parse(a[11] as string) as Record<string, string>,
+          };
+        });
+      expect(rows.length).toBeGreaterThanOrEqual(8);
+
+      const byKey = new Map(rows.map((r) => [`${r.type}\u0000${r.state_key ?? ''}`, r]));
+      const member = byKey.get(`m.room.member\u0000${USER_}`)!;
+      const pl = byKey.get('m.room.power_levels\u0000')!;
+      const jr = byKey.get('m.room.join_rules\u0000')!;
+      const invite = byKey.get('m.room.member\u0000@carol:remote.example')!;
+      expect(member && pl && jr && invite).toBeTruthy();
+
+      // Stored IDs are reference hashes of the stored forms, so remote
+      // servers derive the same IDs from the served bytes.
+      for (const r of rows) {
+        const form: Record<string, unknown> = {
+          type: r.type,
+          sender: r.sender,
+          content: r.content,
+          origin_server_ts: r.origin_server_ts,
+          depth: r.depth,
+          auth_events: r.auth_events,
+          prev_events: r.prev_events,
+          hashes: r.hashes,
+        };
+        if (r.state_key !== undefined) form.state_key = r.state_key;
+        if (r.type === 'm.room.create') {
+          // MSC4291: the create carries no room_id; its ID is the room ID.
+          expect(r.event_id).toBe(`$${r.room_id.slice(1)}`);
+        } else {
+          form.room_id = r.room_id;
+        }
+        await expect(computeWireEventId(form)).resolves.toBe(r.event_id);
+      }
+
+      // Auth refs are reduced to the expected selection: the founder's
+      // member event lists nothing; the power_levels lists the member; the
+      // invite lists member + power_levels + join_rules and nothing else.
+      expect(member.auth_events).toEqual([]);
+      expect(pl.auth_events).toEqual([member.event_id]);
+      expect(invite.auth_events).toEqual([member.event_id, pl.event_id, jr.event_id]);
+      // The create is never listed (MSC4291).
+      const create = rows.find((r) => r.type === 'm.room.create')!;
+      for (const r of rows) {
+        expect(r.auth_events).not.toContain(create.event_id);
+      }
+      // The invite delivered to the remote server carries the same derived
+      // refs as the stored event.
+      const inviteCall = fedFetch.mock.calls
+        .map((c) => c[0] as Request)
+        .find((r) => new URL(r.url).pathname === '/invite');
+      expect(inviteCall).toBeTruthy();
+      const payload = JSON.parse(await inviteCall!.text()) as { event: Record<string, unknown> };
+      expect(payload.event.auth_events).toEqual([member.event_id, pl.event_id, jr.event_id]);
     } finally {
       restore();
     }

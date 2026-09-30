@@ -13,7 +13,7 @@ import {
   type ServerKeyResponse,
 } from '../services/federation-keys';
 import { validateUrl } from '../utils/url-validator';
-import { checkEventAuth } from '../services/event-auth';
+import { checkEventAuth, expectedAuthTypes } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync } from '../services/database';
 import { deliverInboundToDevice } from './to-device';
 import { prepareOutboundPdu } from './rooms';
@@ -1478,37 +1478,9 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
 // outbound use (make_join templates, send_join state) must translate.
 // Returns null for room versions whose event IDs are not derived (v1-v10
 // keep the legacy wire format).
-// Auth event types the receiving server's selection algorithm expects for a
-// given event (mirrors synapse's auth_types_for_event, used by its
-// "unexpected auth_event" receipt check). The create event is implicit in
-// MSC4291 and is never listed on the wire.
-function expectedAuthTypes(
-  type: string,
-  sender: string,
-  stateKey: string | undefined,
-  content: Record<string, unknown>
-): Set<string> {
-  const out = new Set<string>();
-  if (type === 'm.room.create') return out;
-  out.add('m.room.power_levels\u0000');
-  out.add(`m.room.member\u0000${sender}`);
-  if (type === 'm.room.member') {
-    const membership = content['membership'];
-    if (membership === 'join' || membership === 'invite' || membership === 'knock') {
-      out.add('m.room.join_rules\u0000');
-    }
-    if (typeof stateKey === 'string') out.add(`m.room.member\u0000${stateKey}`);
-    const tpi = content['third_party_invite'] as { signed?: { token?: string } } | undefined;
-    if (membership === 'invite' && tpi?.signed?.token) {
-      out.add(`m.room.third_party_invite\u0000${tpi.signed.token}`);
-    }
-    const authorising = content['join_authorised_via_users_server'];
-    if (membership === 'join' && typeof authorising === 'string') {
-      out.add(`m.room.member\u0000${authorising}`);
-    }
-  }
-  return out;
-}
+// Auth event types the receiving server's selection algorithm expects come
+// from services/event-auth (expectedAuthTypes) so the creation path and the
+// serving derivation cannot drift apart.
 
 // Derive the wire form of every event in a room for MSC4291 room versions
 // (12): the create event's ID is "$" + its reference hash (never carrying a
