@@ -138,3 +138,28 @@ export function toWireEventObject(event: Record<string, unknown>): Record<string
   delete wire['event_id'];
   return wire;
 }
+
+/**
+ * True when the room version uses MSC4291 "room IDs as hashes" plus the
+ * event_id-less wire format: the create event's ID is derived from its
+ * reference hash ("$" + refhash), the room ID is "!" + refhash + ":" + server,
+ * the create event carries no room_id, and auth_events never list the create.
+ * This is room version 12 (and the unstable org.matrix.hydra.11). Plain
+ * version 11 uses the ordinary v4 format (explicit event IDs) — only its
+ * create's `creator` field became implicit.
+ */
+export function isMsc4291RoomVersion(roomVersion: string): boolean {
+  if (roomVersion === 'org.matrix.hydra.11') return true;
+  const num = parseInt(roomVersion, 10);
+  return Number.isFinite(num) && num >= 12;
+}
+
+/** MSC4291: the create event's ID is "$" + its reference hash. */
+export function msc4291CreateEventId(refHash: string): string {
+  return `$${refHash}`;
+}
+
+/** MSC4291: the room ID is "!" + the create event's reference hash + server. */
+export function msc4291RoomId(refHash: string, serverName: string): string {
+  return `!${refHash}:${serverName}`;
+}

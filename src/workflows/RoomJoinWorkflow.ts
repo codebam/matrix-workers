@@ -12,6 +12,7 @@ import { generateEventId } from '../utils/ids';
 import { calculateContentHash, signJson } from '../utils/crypto';
 import {
   computeWireEventId,
+  isMsc4291RoomVersion,
   redactEventForSigning,
   toWireEventObject,
 } from '../utils/event-signing';
@@ -328,15 +329,14 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       prev_events: prevEvents,
     };
 
-    // Room versions using the v4+ event format (11 and up) do not carry an
-    // `event_id` on the wire — the resident server derives it as the
-    // reference hash — and signatures cover the redacted event, not the
-    // full one. Sending an explicit event_id gets the whole join rejected
-    // with "Invalid event JSON". Earlier room versions keep the legacy
-    // shape.
+    // MSC4291 room versions (12+) do not carry an `event_id` on the wire —
+    // the resident server derives it as the reference hash — and signatures
+    // cover the redacted event, not the full one. Sending an explicit
+    // event_id gets the whole join rejected with "Invalid event JSON".
+    // Earlier room versions (including plain 11) keep the legacy shape.
     const wireFormat =
       !!remoteEventTemplate?.event &&
-      parseInt(remoteEventTemplate.room_version, 10) >= 11;
+      isMsc4291RoomVersion(String(remoteEventTemplate.room_version));
 
     if (wireFormat) {
       const hashed = {

@@ -793,7 +793,10 @@ describe('POST /createRoom', () => {
         { fedFetch }
       );
       expect(status).toBe(200);
-      expect(body).toMatchObject({ room_id: '!newroom:example.com' });
+      // MSC4291 (room version 12): the room ID is derived from the create
+      // event's reference hash, not generated randomly.
+      const body2 = body as { room_id: string };
+      expect(body2.room_id).toMatch(/^![A-Za-z0-9_-]{43}:example\.com$/);
       expect(fedFetch).toHaveBeenCalledTimes(1);
       const sent = fedFetch.mock.calls[0][0] as Request;
       expect(new URL(sent.url).pathname).toBe('/invite');
@@ -806,7 +809,7 @@ describe('POST /createRoom', () => {
         invite_room_state: Array<Record<string, unknown>>;
       };
       expect(payload.destination).toBe('remote.example');
-      expect(payload.room_id).toBe('!newroom:example.com');
+      expect(payload.room_id).toBe(body2.room_id);
       expect(payload.room_version).toBe('12');
       expect(payload.event.event_id).toBeUndefined();
       expect(payload.event.state_key).toBe('@carol:remote.example');

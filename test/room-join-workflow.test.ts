@@ -53,6 +53,7 @@ vi.mock('../src/utils/crypto', () => ({
 }));
 
 const computeWireEventId = vi.fn(async (..._args: unknown[]) => '$wire:reference-hash' as string);
+const isMsc4291RoomVersion = vi.fn((v: string) => v === '12');
 const redactEventForSigning = vi.fn((e: Record<string, unknown>) => e);
 const toWireEventObject = vi.fn((e: Record<string, unknown>) => {
   const wire = { ...e };
@@ -61,6 +62,7 @@ const toWireEventObject = vi.fn((e: Record<string, unknown>) => {
 });
 vi.mock('../src/utils/event-signing', () => ({
   computeWireEventId: (...args: unknown[]) => computeWireEventId(...args),
+  isMsc4291RoomVersion: (...args: unknown[]) => isMsc4291RoomVersion(...(args as [string])),
   redactEventForSigning: (...args: unknown[]) =>
     redactEventForSigning(...(args as [Record<string, unknown>])),
   toWireEventObject: (...args: unknown[]) =>

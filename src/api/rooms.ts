@@ -8,7 +8,7 @@ import { generateRoomId, generateEventId, generateDeterministicEventId, formatRo
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
 import { calculateContentHash, signJson } from '../utils/crypto';
-import { computeWireEventId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
+import { computeEventReferenceHash, computeWireEventId, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
 import { getServerSigningKey } from '../services/federation-keys';
 import {
   createRoom,
@@ -104,7 +104,8 @@ async function createInitialRoomEvents(
     initial_state?: Array<{ type: string; state_key?: string; content: any }>;
     invite?: string[];
     room_alias_local_part?: string;
-  }
+  },
+  prebuiltCreate?: { eventId: string; pduBase: Record<string, unknown>; hashes: Record<string, string> }
 ): Promise<string> {
   const now = Date.now();
 
@@ -113,10 +114,10 @@ async function createInitialRoomEvents(
     membership?: { userId: string; state: 'join' | 'invite' };
   }
 
-  // In the v4 event format (room versions 11+) the create event is implicit
-  // in every event's auth chain and MUST NOT be listed in auth_events.
-  const roomVersionNum = parseInt(roomVersion, 10);
-  const createIsImplicit = Number.isFinite(roomVersionNum) && roomVersionNum >= 11;
+  // In MSC4291 (room version 12) the create event is implicit in every
+  // event's auth chain and MUST NOT be listed in auth_events. Plain version
+  // 11 keeps the ordinary v4 format, where the create IS listed.
+  const createIsImplicit = isMsc4291RoomVersion(roomVersion);
 
   const planned: PlannedEvent[] = [];
   const authEvents: string[] = [];
@@ -159,11 +160,27 @@ async function createInitialRoomEvents(
   }
 
   // 1. m.room.create
-  const createContent: RoomCreateContent = {
-    creator: creatorId,
-    room_version: roomVersion,
-  };
-  const createEventId = await plan('m.room.create', createContent, '');
+  let createEventId: string;
+  if (prebuiltCreate) {
+    // MSC4291: the room ID and create event ID are derived from the create's
+    // own reference hash, computed by the caller before the room row exists.
+    createEventId = prebuiltCreate.eventId;
+    const createPdu = {
+      event_id: createEventId,
+      room_id: roomId,
+      ...prebuiltCreate.pduBase,
+      hashes: prebuiltCreate.hashes,
+    } as unknown as PDU;
+    validateEventSize(createPdu);
+    planned.push({ pdu: createPdu });
+    prevEvents.push(createEventId);
+  } else {
+    const createContent: RoomCreateContent = {
+      creator: creatorId,
+      room_version: roomVersion,
+    };
+    createEventId = await plan('m.room.create', createContent, '');
+  }
 
   // 2. m.room.member (creator joins)
   const memberContent: RoomMemberContent = { membership: 'join' };
@@ -381,8 +398,15 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     return Errors.unsupportedRoomVersion(`Room version '${version}' is not supported`).toResponse();
   }
 
+  // MSC4291 (room version 12): the room ID and the create event's ID are
+  // both derived from the create event's reference hash, so the create must
+  // be built before the room row exists.
+  const prebuiltCreate = isMsc4291RoomVersion(version)
+    ? await buildMsc4291CreateEvent(c.env.SERVER_NAME, version, userId)
+    : null;
+
   // Generate room ID
-  const roomId = await generateRoomId(c.env.SERVER_NAME);
+  const roomId = prebuiltCreate ? prebuiltCreate.roomId : await generateRoomId(c.env.SERVER_NAME);
 
   console.log('[createRoom] Creating room:', roomId, 'for user:', userId);
 
@@ -402,7 +426,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
       initial_state,
       invite,
       room_alias_local_part,
-    });
+    }, prebuiltCreate ?? undefined);
     console.log('[createRoom] Initial room events created successfully');
 
     await c.env.DB.prepare(`
@@ -1154,7 +1178,8 @@ async function getJoinedRemoteServers(db: D1Database, roomId: string, serverName
 // available (delivery is skipped; the event stays local-only).
 export async function prepareOutboundPdu(
   env: Env,
-  event: PDU
+  event: PDU,
+  roomVersion?: string
 ): Promise<{
   wireId: string;
   hashes: Record<string, string>;
@@ -1165,6 +1190,12 @@ export async function prepareOutboundPdu(
     const source = toWireEventObject(event as unknown as Record<string, unknown>);
     // `unsigned` is local-only and must not travel on the wire.
     delete source['unsigned'];
+    // MSC4291: the create event carries no room_id (its ID is derived from
+    // the room ID), so neither the content hash nor the reference hash may
+    // cover one.
+    if (roomVersion && isMsc4291RoomVersion(roomVersion) && event.type === 'm.room.create') {
+      delete source['room_id'];
+    }
     const hashes = { sha256: await calculateContentHash(source) };
     const hashed = { ...source, hashes };
     const wireId = await computeWireEventId(hashed);
@@ -1186,6 +1217,47 @@ export async function prepareOutboundPdu(
     console.error('[rooms] prepareOutboundPdu failed:', err);
     return null;
   }
+}
+
+/**
+ * Build the initial m.room.create event for an MSC4291 room (version 12):
+ * the create carries no room_id, its ID is "$" + reference hash of the create
+ * itself, and the room ID is "!" + that reference hash + ":" + server. The
+ * reference hash is computed over the exact bytes federation will see (no
+ * room_id, no event_id, no signatures/unsigned), so remote servers derive
+ * the same IDs.
+ */
+export async function buildMsc4291CreateEvent(
+  serverName: string,
+  roomVersion: string,
+  creatorId: string,
+  predecessor?: { room_id: string; event_id: string }
+): Promise<{ roomId: string; eventId: string; pduBase: Record<string, unknown>; hashes: Record<string, string> }> {
+  const content: Record<string, unknown> = {
+    creator: creatorId,
+    room_version: roomVersion,
+  };
+  if (predecessor) {
+    content.predecessor = predecessor;
+  }
+  const pduBase: Record<string, unknown> = {
+    sender: creatorId,
+    type: 'm.room.create',
+    state_key: '',
+    content,
+    origin_server_ts: Date.now(),
+    depth: 0,
+    auth_events: [],
+    prev_events: [],
+  };
+  const hashes = { sha256: await calculateContentHash(pduBase) };
+  const refHash = await computeEventReferenceHash({ ...pduBase, hashes });
+  return {
+    roomId: msc4291RoomId(refHash, serverName),
+    eventId: msc4291CreateEventId(refHash),
+    pduBase,
+    hashes,
+  };
 }
 
 // Hand a wire PDU to the per-destination Federation DO, which signs the
@@ -1240,14 +1312,13 @@ async function federateInvite(env: Env, roomId: string, inviteEvent: PDU): Promi
 
     const room = await getRoom(env.DB, roomId);
     const roomVersion = String(room?.room_version ?? '10');
-    const roomVersionNum = parseInt(roomVersion, 10);
-    const createIsImplicit = Number.isFinite(roomVersionNum) && roomVersionNum >= 11;
+    const createIsImplicit = isMsc4291RoomVersion(roomVersion);
     const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
     const createEventId = createEvent?.event_id;
 
-    // v4 event format (room versions 11+): the create event is implicit and
-    // must not appear in auth_events. Strip it from a copy, before hashing
-    // and signing, so the prepared wire event is self-consistent.
+    // MSC4291 (room version 12): the create event is implicit and must not
+    // appear in auth_events. Strip it from a copy, before hashing and
+    // signing, so the prepared wire event is self-consistent.
     const forWire = (event: PDU): PDU => {
       if (!createIsImplicit || !createEventId) return event;
       return {
@@ -1256,7 +1327,7 @@ async function federateInvite(env: Env, roomId: string, inviteEvent: PDU): Promi
       };
     };
 
-    const preparedInvite = await prepareOutboundPdu(env, forWire(inviteEvent));
+    const preparedInvite = await prepareOutboundPdu(env, forWire(inviteEvent), roomVersion);
     if (!preparedInvite) return false;
 
     const inviteRoomState: Record<string, unknown>[] = [];
@@ -1267,7 +1338,7 @@ async function federateInvite(env: Env, roomId: string, inviteEvent: PDU): Promi
     for (const [type, stateKey] of stateEntries) {
       const stateEvent = await getStateEvent(env.DB, roomId, type, stateKey);
       if (!stateEvent) continue;
-      const preparedState = await prepareOutboundPdu(env, forWire(stateEvent));
+      const preparedState = await prepareOutboundPdu(env, forWire(stateEvent), roomVersion);
       if (!preparedState) continue;
       inviteRoomState.push(preparedState.wire);
     }
@@ -1325,12 +1396,12 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
   const room = await getRoom(c.env.DB, roomId);
 
-  // In the v4 event format (room versions 11+), the create event is
-  // implicitly part of every non-create event's auth chain and MUST NOT
-  // appear explicitly in auth_events -- the receiving server's parser
-  // rejects such events. Older versions require it explicitly.
-  const roomVersionNum = parseInt(String(room?.room_version ?? ''), 10);
-  const createIsImplicit = Number.isFinite(roomVersionNum) && roomVersionNum >= 11;
+  // In MSC4291 (room version 12), the create event is implicitly part of
+  // every non-create event's auth chain and MUST NOT appear explicitly in
+  // auth_events -- the receiving server's parser rejects such events. Older
+  // versions require it explicitly.
+  const roomVersionStr = String(room?.room_version ?? '');
+  const createIsImplicit = isMsc4291RoomVersion(roomVersionStr);
 
   const authEvents: string[] = [];
   if (createEvent && !createIsImplicit) authEvents.push(createEvent.event_id);
@@ -1370,7 +1441,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   const remoteServers = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
   let wirePdu: Record<string, unknown> | null = null;
   if (remoteServers.length > 0) {
-    const prepared = await prepareOutboundPdu(c.env, event);
+    const prepared = await prepareOutboundPdu(c.env, event, roomVersionStr);
     if (prepared) {
       event.event_id = prepared.wireId;
       (event as unknown as Record<string, unknown>).hashes = prepared.hashes;
@@ -1466,14 +1537,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
 
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
-  // v4 event format (room versions 11+): the create event is implicit in the
-  // auth chain and must not be listed explicitly.
-  const inviteRoomVersionNum = parseInt(
-    String((await getRoom(c.env.DB, roomId))?.room_version ?? ''),
-    10
-  );
-  const inviteCreateIsImplicit =
-    Number.isFinite(inviteRoomVersionNum) && inviteRoomVersionNum >= 11;
+  // MSC4291 (room version 12): the create event is implicit in the auth
+  // chain and must not be listed explicitly.
+  const inviteRoom = await getRoom(c.env.DB, roomId);
+  const inviteRoomVersion = String(inviteRoom?.room_version ?? '10');
+  const inviteCreateIsImplicit = isMsc4291RoomVersion(inviteRoomVersion);
 
   const authEvents: string[] = [];
   if (createEvent && !inviteCreateIsImplicit) authEvents.push(createEvent.event_id);
@@ -2420,13 +2488,24 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   const currentState = await getRoomState(db, oldRoomId);
   const now = Date.now();
 
-  // Generate new room ID
-  const newRoomId = await generateRoomId(serverName);
-
   // Get the last event ID from old room for predecessor
   const lastEvent = await db.prepare(`
     SELECT event_id FROM events WHERE room_id = ? ORDER BY depth DESC LIMIT 1
   `).bind(oldRoomId).first<{ event_id: string }>();
+
+  const predecessor = {
+    room_id: oldRoomId,
+    event_id: lastEvent?.event_id || '',
+  };
+
+  // MSC4291 (room version 12): derive the new room ID and create event ID
+  // from the create event's reference hash.
+  const prebuiltCreate = isMsc4291RoomVersion(body.new_version)
+    ? await buildMsc4291CreateEvent(serverName, body.new_version, userId, predecessor)
+    : null;
+
+  // Generate new room ID
+  const newRoomId = prebuiltCreate ? prebuiltCreate.roomId : await generateRoomId(serverName);
 
   // Create the new room
   await createRoom(db, newRoomId, body.new_version, userId, false);
@@ -2463,15 +2542,24 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   }
 
   // 1. Create m.room.create with predecessor
-  const createContent: RoomCreateContent = {
-    creator: userId,
-    room_version: body.new_version,
-    predecessor: {
-      room_id: oldRoomId,
-      event_id: lastEvent?.event_id || '',
-    },
-  };
-  await createNewRoomEvent('m.room.create', createContent, '');
+  if (prebuiltCreate) {
+    const createPdu = {
+      event_id: prebuiltCreate.eventId,
+      room_id: newRoomId,
+      ...prebuiltCreate.pduBase,
+      hashes: prebuiltCreate.hashes,
+    } as unknown as PDU;
+    await storeEvent(db, createPdu);
+    depth = 1;
+    prevEvents.push(prebuiltCreate.eventId);
+  } else {
+    const createContent: RoomCreateContent = {
+      creator: userId,
+      room_version: body.new_version,
+      predecessor,
+    };
+    await createNewRoomEvent('m.room.create', createContent, '');
+  }
 
   // 2. Creator joins
   const joinEventId = await createNewRoomEvent('m.room.member', { membership: 'join' }, userId);

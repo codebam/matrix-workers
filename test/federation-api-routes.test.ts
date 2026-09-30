@@ -3043,6 +3043,135 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
       restore();
     }
   });
+
+  it('make_join v12: template auth_events include the invitee membership when invited', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({
+        keyId: kp.keyId,
+        privateKeyJwk: kp.privateKeyJwk,
+      });
+
+      const db = v12Room();
+      const invite = makeEvent({
+        event_id: '$rmember-invite:example.com',
+        event_type: 'm.room.member',
+        state_key: REMOTE_USER,
+        sender: LOCAL_USER,
+        content: JSON.stringify({ membership: 'invite' }),
+        depth: 6,
+      });
+      db.events.set(invite.event_id, invite);
+      db.roomState.set(stateKey(ROOM, 'm.room.member', REMOTE_USER), invite.event_id);
+
+      const env = makeEnv(db);
+      const { status, body } = await req(
+        'GET',
+        `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+        env
+      );
+
+      expect(status).toBe(200);
+      const b = body as { event: { auth_events: string[] } };
+
+      // power_levels + invitee's invite + join_rules -- the create stays
+      // implicit, and the invitee's membership must be referenced by its
+      // derived wire ID (the receiving server's auth checks require it).
+      expect(b.event.auth_events).toHaveLength(3);
+      expect(b.event.auth_events).not.toContain('$rmember-invite:example.com');
+      // Mirror the derivation's input shape (parsed content, no row fields).
+      const preparedInvite = await prepareOutboundPdu(
+        env,
+        {
+          event_id: invite.event_id,
+          room_id: ROOM,
+          sender: invite.sender,
+          type: 'm.room.member',
+          state_key: REMOTE_USER,
+          content: { membership: 'invite' },
+          origin_server_ts: invite.origin_server_ts,
+          depth: invite.depth,
+          auth_events: [],
+          prev_events: [],
+        },
+        '12'
+      );
+      expect(preparedInvite).not.toBeNull();
+      expect(b.event.auth_events).toContain(preparedInvite!.wireId);
+    } finally {
+      restore();
+    }
+  });
+
+  it('send_join v2 v12: create wire form omits room_id; auth refs reduced to the expected set', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({
+        keyId: kp.keyId,
+        privateKeyJwk: kp.privateKeyJwk,
+      });
+
+      const db = v12Room();
+      // Point the local member's prev_events at the create so the create's
+      // derived ID can be asserted on the wire.
+      const seededMember = db.events.get('$member:example.com')!;
+      seededMember.prev_events = JSON.stringify(['$create:example.com']);
+
+      const env = makeEnv(db);
+      const joinEvent = {
+        room_id: ROOM,
+        sender: REMOTE_USER,
+        type: 'm.room.member',
+        state_key: REMOTE_USER,
+        content: { membership: 'join' },
+        origin_server_ts: 1_700_000_001_000,
+        depth: 6,
+        auth_events: [],
+        prev_events: [],
+        hashes: { sha256: 'abc' },
+        signatures: { 'remote.example.com': { 'ed25519:r1': 'sigr' } },
+      };
+
+      const { status, body } = await req(
+        'PUT',
+        `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/%24jv12b`,
+        env,
+        joinEvent
+      );
+      expect(status).toBe(200);
+      const resp = body as { state: Array<Record<string, unknown>> };
+
+      // MSC4291: the create event must not carry a room_id on the wire.
+      const servedCreate = resp.state.find((e) => e.type === 'm.room.create')!;
+      expect(servedCreate).toBeDefined();
+      expect(servedCreate.room_id).toBeUndefined();
+      expect(servedCreate.event_id).toBeUndefined();
+
+      // References to the create use the derived reference-hash ID.
+      const servedCreateId = await computeWireEventId(servedCreate);
+      const servedMember = resp.state.find(
+        (e) => e.type === 'm.room.member' && e.state_key === LOCAL_USER
+      )!;
+      expect(servedMember.prev_events).toContain(servedCreateId);
+      expect((servedMember.prev_events as string[]).every((r) => r !== '$create:example.com')).toBe(
+        true
+      );
+
+      // Auth references reduced: the stored [create, jr, pl] becomes
+      // [derived jr, derived pl] -- the create is implicit and extras are
+      // rejected by the receiving server.
+      expect(servedMember.auth_events).toHaveLength(2);
+      const servedJr = resp.state.find((e) => e.type === 'm.room.join_rules')!;
+      const servedPl = resp.state.find((e) => e.type === 'm.room.power_levels')!;
+      const jrId = await computeWireEventId(servedJr);
+      const plId = await computeWireEventId(servedPl);
+      expect(servedMember.auth_events).toEqual(expect.arrayContaining([jrId, plId]));
+    } finally {
+      restore();
+    }
+  });
 });
 
 afterEach(() => {
