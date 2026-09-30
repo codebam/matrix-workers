@@ -68,6 +68,11 @@ app.get('/_matrix/federation/v1/version', async (c) => {
 // Version endpoint is also unauthenticated as it's used for initial contact
 app.use('/_matrix/federation/v1/*', requireFederationAuth());
 
+// The v2 endpoints (send_join / send_leave / invite) take the same signed
+// X-Matrix requests. Without this the request bodies were trusted verbatim,
+// so anyone could inject joins, leaves or invites into a room.
+app.use('/_matrix/federation/v2/*', requireFederationAuth());
+
 // Matrix publishes Ed25519 verify keys as standard (non-URL-safe) unpadded
 // base64. Keys generated here are stored URL-safe, so normalize on publish --
 // strict decoders like Synapse's treat '_'/'-' as invalid alphabet and fail
@@ -1663,7 +1668,8 @@ function buildWireJoinState(
 async function persistInboundJoin(
   env: Env,
   roomId: string,
-  joinEvent: Record<string, unknown>
+  joinEvent: Record<string, unknown>,
+  origin?: string
 ): Promise<string | null> {
   if (
     joinEvent['room_id'] !== roomId ||
@@ -1673,6 +1679,21 @@ async function persistInboundJoin(
     joinEvent['state_key'] !== joinEvent['sender']
   ) {
     return null;
+  }
+
+  // A joining user's event travels through that user's own server, so the
+  // authenticated origin of the request must match the sender's domain.
+  // Without this check a server that signs its own requests could submit
+  // joins on behalf of users of other servers.
+  if (origin) {
+    const sender = typeof joinEvent['sender'] === 'string' ? joinEvent['sender'] : '';
+    const senderServer = sender.includes(':') ? sender.slice(sender.indexOf(':') + 1) : '';
+    if (senderServer !== origin) {
+      console.warn(
+        `[federation] Rejecting inbound join: sender ${sender} is not from origin ${origin}`
+      );
+      return null;
+    }
   }
 
   const signingKey = await getServerSigningKey(env.DB);
@@ -1824,7 +1845,12 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   // IDs, so locally stored events must be translated before they leave.
   const v1Derived = isMsc4291RoomVersion(room.room_version);
   if (v1Derived) {
-    const storedJoinId = await persistInboundJoin(c.env, roomId, body as Record<string, unknown>);
+    const storedJoinId = await persistInboundJoin(
+      c.env,
+      roomId,
+      body as Record<string, unknown>,
+      c.get('federationOrigin' as any) as string | undefined
+    );
     if (storedJoinId) {
       console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
     }
@@ -1945,7 +1971,12 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
   // IDs, so locally stored events must be translated before they leave.
   const v2Derived = isMsc4291RoomVersion(room.room_version);
   if (v2Derived) {
-    const storedJoinId = await persistInboundJoin(c.env, roomId, body as Record<string, unknown>);
+    const storedJoinId = await persistInboundJoin(
+      c.env,
+      roomId,
+      body as Record<string, unknown>,
+      c.get('federationOrigin' as any) as string | undefined
+    );
     if (storedJoinId) {
       console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
     }
@@ -2231,7 +2262,8 @@ async function storeInboundInvite(
   env: Env,
   inviteEvent: any,
   inviteRoomState: any[] | undefined,
-  inviteEventIdFromUrl: string
+  inviteEventIdFromUrl: string,
+  origin?: string
 ): Promise<void> {
   try {
     const roomId: string = inviteEvent?.room_id;
@@ -2244,6 +2276,18 @@ async function storeInboundInvite(
         ? inviteEvent.event_id
         : inviteEventIdFromUrl;
     if (!roomId || !invitee || !sender || !inviteEventId) return;
+
+    // The inviter's event travels through the inviter's own server, so the
+    // authenticated origin must match the sender's domain.
+    if (origin) {
+      const senderServer = sender.includes(':') ? sender.slice(sender.indexOf(':') + 1) : '';
+      if (senderServer !== origin) {
+        console.warn(
+          `[federation] Rejecting inbound invite: sender ${sender} is not from origin ${origin}`
+        );
+        return;
+      }
+    }
 
     // Room version: prefer the create event's, else default to v10.
     const createEv = (inviteRoomState ?? []).find((ev: any) => ev?.type === 'm.room.create');
@@ -2383,7 +2427,13 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
   }
 
   // Persist the invite locally so the invited user sees it in /sync.
-  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state, eventId);
+  await storeInboundInvite(
+    c.env,
+    inviteEvent,
+    body.invite_room_state,
+    eventId,
+    c.get('federationOrigin' as any) as string | undefined
+  );
 
   // Sign the invite event and return it
   // Get our signing key
@@ -2503,7 +2553,13 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
   }
 
   // Persist the invite locally so the invited user sees it in /sync.
-  await storeInboundInvite(c.env, inviteEvent, body.invite_room_state, eventId);
+  await storeInboundInvite(
+    c.env,
+    inviteEvent,
+    body.invite_room_state,
+    eventId,
+    c.get('federationOrigin' as any) as string | undefined
+  );
 
   // Sign the invite event and return it
   const key = await c.env.DB.prepare(

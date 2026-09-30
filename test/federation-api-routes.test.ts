@@ -3172,6 +3172,67 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
       restore();
     }
   });
+
+  it('send_join v2 v12: rejects a join whose sender is outside the authenticated origin', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({
+        keyId: kp.keyId,
+        privateKeyJwk: kp.privateKeyJwk,
+      });
+
+      const db = v12Room();
+      const env = makeEnv(db);
+      // Authenticated caller is attacker.example.com, but the join event
+      // claims to be from @bob:remote.example.com.
+      const prevOrigin = federationOrigin;
+      federationOrigin = 'attacker.example.com';
+
+      const joinEvent = {
+        room_id: ROOM,
+        sender: REMOTE_USER,
+        type: 'm.room.member',
+        state_key: REMOTE_USER,
+        content: { membership: 'join' },
+        origin_server_ts: 1_700_000_002_000,
+        depth: 6,
+        auth_events: [],
+        prev_events: [],
+        hashes: { sha256: 'abc' },
+        signatures: { 'remote.example.com': { 'ed25519:r1': 'sigr' } },
+      };
+
+      const { status } = await req(
+        'PUT',
+        `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/%24jv12-evil`,
+        env,
+        joinEvent
+      );
+      expect(status).toBe(200);
+
+      // Nothing was persisted: no membership update and no event row for the
+      // forged sender.
+      expect(
+        db.inserts.some(
+          (i) =>
+            i.sql.includes('room_memberships') &&
+            i.args[0] === ROOM &&
+            i.args[1] === REMOTE_USER
+        )
+      ).toBe(false);
+      expect(
+        db.inserts.some(
+          (i) =>
+            i.sql.includes('INSERT INTO events') && JSON.stringify(i.args).includes(REMOTE_USER)
+        )
+      ).toBe(false);
+
+      federationOrigin = prevOrigin;
+    } finally {
+      restore();
+    }
+  });
 });
 
 afterEach(() => {

@@ -2,7 +2,9 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   requireFederationAuth,
   optionalFederationAuth,
+  buildSignedRequest,
 } from '../src/middleware/federation-auth';
+import { canonicalJson, generateSigningKeyPair } from '../src/utils/crypto';
 
 const SERVER = 'matrix.example.com';
 const NOW = 1_700_000_000_000;
@@ -537,5 +539,134 @@ describe('optionalFederationAuth TOKENMAXX leftovers after #81 (fed auth middlew
     await optionalFederationAuth()(makeFedCtx({ auth }), vi.fn(async () => 'ok'));
     expect(verifyMock.mock.calls[0][1]).toBe('bridge.example.com');
     expect(verifyMock.mock.calls[0][2]).toBe('ed25519:bridge');
+  });
+});
+
+// Node's WebCrypto rejects the Cloudflare-specific 'NODE-ED25519' algorithm
+// name; remap it to 'Ed25519' for the duration of a test.
+function installNodeEd25519Shim() {
+  const subtle = crypto.subtle;
+  const origGenerateKey = subtle.generateKey.bind(subtle);
+  const origImportKey = subtle.importKey.bind(subtle);
+  const origSign = subtle.sign.bind(subtle);
+  const origVerify = subtle.verify.bind(subtle);
+
+  const mapAlg = (alg: unknown): AlgorithmIdentifier => {
+    if (typeof alg === 'string') return alg === 'NODE-ED25519' ? 'Ed25519' : alg;
+    if (alg && typeof alg === 'object' && (alg as { name?: string }).name === 'NODE-ED25519') {
+      return 'Ed25519';
+    }
+    return alg as AlgorithmIdentifier;
+  };
+
+  subtle.generateKey = ((alg: AlgorithmIdentifier, extractable: boolean, usages: KeyUsage[]) =>
+    origGenerateKey(mapAlg(alg), extractable, usages)) as typeof subtle.generateKey;
+  subtle.importKey = ((
+    format: KeyFormat,
+    keyData: BufferSource | JsonWebKey,
+    alg: AlgorithmIdentifier,
+    extractable: boolean,
+    usages: KeyUsage[]
+  ) => origImportKey(format, keyData, mapAlg(alg), extractable, usages)) as typeof subtle.importKey;
+  subtle.sign = ((alg: AlgorithmIdentifier, key: CryptoKey, data: BufferSource) =>
+    origSign(mapAlg(alg), key, data)) as typeof subtle.sign;
+  subtle.verify = ((
+    alg: AlgorithmIdentifier,
+    key: CryptoKey,
+    signature: BufferSource,
+    data: BufferSource
+  ) => origVerify(mapAlg(alg), key, signature, data)) as typeof subtle.verify;
+
+  return () => {
+    subtle.generateKey = origGenerateKey;
+    subtle.importKey = origImportKey;
+    subtle.sign = origSign;
+    subtle.verify = origVerify;
+  };
+}
+
+async function signSelfRequest(
+  kp: { privateKeyJwk: JsonWebKey },
+  uri: string
+): Promise<string> {
+  const signed = buildSignedRequest('GET', uri, SERVER, SERVER, undefined);
+  const key = await crypto.subtle.importKey('jwk', kp.privateKeyJwk, { name: 'Ed25519' }, false, [
+    'sign',
+  ]);
+  return Buffer.from(
+    await crypto.subtle.sign(
+      { name: 'Ed25519' },
+      key,
+      new TextEncoder().encode(canonicalJson(signed))
+    )
+  )
+    .toString('base64')
+    .replace(/=+$/, '');
+}
+
+function selfKeyDb(publicKey: string) {
+  return {
+    prepare: () => ({
+      bind: () => ({
+        first: async () => ({ public_key: publicKey }),
+      }),
+    }),
+  } as unknown as D1Database;
+}
+
+describe('requireFederationAuth self-origin verification', () => {
+  beforeEach(() => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('verifies a self-origin request against the local key store without a remote fetch', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      const uri = '/_matrix/federation/v1/make_join/room/u';
+      const sig = await signSelfRequest(kp, uri);
+      const auth = `X-Matrix origin="${SERVER}",destination="${SERVER}",key="${kp.keyId}",sig="${sig}"`;
+
+      const ctx = makeFedCtx({ auth, method: 'GET', url: `https://${SERVER}${uri}` });
+      (ctx.env as { DB: D1Database }).DB = selfKeyDb(kp.publicKey);
+
+      const next = vi.fn();
+      const result = await requireFederationAuth()(ctx, next);
+      expect(result).toBeUndefined();
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(verifyMock).not.toHaveBeenCalled();
+      expect(ctx._store.get('federationOrigin')).toBe(SERVER);
+    } finally {
+      restore();
+    }
+  });
+
+  it('rejects a self-origin request whose signature does not verify', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      const other = await generateSigningKeyPair();
+      const uri = '/_matrix/federation/v1/make_join/room/u';
+      const sig = await signSelfRequest(other, uri);
+      const auth = `X-Matrix origin="${SERVER}",destination="${SERVER}",key="${kp.keyId}",sig="${sig}"`;
+
+      const ctx = makeFedCtx({ auth, method: 'GET', url: `https://${SERVER}${uri}` });
+      (ctx.env as { DB: D1Database }).DB = selfKeyDb(kp.publicKey);
+
+      const next = vi.fn();
+      const result = await requireFederationAuth()(ctx, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        status: 401,
+        body: { errcode: 'M_UNAUTHORIZED', error: 'Invalid request signature' },
+      });
+      expect(verifyMock).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
   });
 });

@@ -7,6 +7,7 @@
 import type { Context, Next } from 'hono';
 import type { AppEnv } from '../types';
 import { verifyRemoteSignature } from '../services/federation-keys';
+import { verifySignature } from '../utils/crypto';
 
 interface MatrixAuthParams {
   origin: string;
@@ -164,14 +165,21 @@ export function requireFederationAuth() {
     };
 
     try {
-      // Verify the signature
-      const isValid = await verifyRemoteSignature(
-        requestWithSig,
-        authParams.origin,
-        authParams.key,
-        c.env.DB,
-        c.env.CACHE
-      );
+      // Verify the signature. A request that claims origin == this server is
+      // verified against the local key store directly: a worker fetching its
+      // own public-key URL can have the subrequest cancelled by the runtime
+      // ("Stream was cancelled"), which made self-origin federation requests
+      // (probes, self-checks) impossible to authenticate.
+      const isValid =
+        authParams.origin === serverName
+          ? await verifySelfOriginSignature(c.env.DB, requestWithSig, serverName, authParams.key)
+          : await verifyRemoteSignature(
+              requestWithSig,
+              authParams.origin,
+              authParams.key,
+              c.env.DB,
+              c.env.CACHE
+            );
 
       if (!isValid) {
         console.warn(`Federation auth failed for ${authParams.origin}: invalid signature`);
@@ -199,6 +207,30 @@ export function requireFederationAuth() {
       );
     }
   };
+}
+
+/**
+ * Verify a request signed by this server itself against the local key store.
+ * Used when the claimed origin is our own server name; avoids the self-fetch
+ * round trip that the Workers runtime cancels. The stored key may use the
+ * URL-safe alphabet while signatures arrive in standard base64; the decoder
+ * used by verifySignature accepts both.
+ */
+async function verifySelfOriginSignature(
+  db: D1Database,
+  requestWithSig: Record<string, unknown>,
+  serverName: string,
+  keyId: string
+): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT public_key FROM server_keys WHERE key_id = ?`)
+    .bind(keyId)
+    .first<{ public_key: string }>();
+  if (!row?.public_key) {
+    console.warn(`[federation-auth] No local key ${keyId} for self-origin verification`);
+    return false;
+  }
+  return verifySignature(requestWithSig, serverName, keyId, row.public_key);
 }
 
 /**
