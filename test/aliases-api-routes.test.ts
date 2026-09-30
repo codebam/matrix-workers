@@ -62,6 +62,8 @@ function createAliasesDb(opts: {
   powerLevelsContent?: string | null;
   /** Force power_levels first() to throw JSON path via invalid content. */
   powerLevelsRaw?: string | null;
+  /** m.room.create row for MSC4289 creator-power checks. */
+  createEvent?: { sender: string; content: string } | null;
 } = {}) {
   const aliasRows = opts.aliases ?? [];
   const roomRows = opts.rooms ?? [];
@@ -149,6 +151,13 @@ function createAliasesDb(opts: {
               ) {
                 if (powerLevelsContent == null) return null as T;
                 return { content: powerLevelsContent } as T;
+              }
+
+              if (
+                sql.includes('FROM room_state') &&
+                sql.includes("event_type = 'm.room.create'")
+              ) {
+                return (opts.createEvent ?? null) as T;
               }
 
               throw new Error(`Unhandled first() SQL: ${sql.slice(0, 160)}`);
@@ -1518,6 +1527,22 @@ describe('aliases leftover residual deepen after #241 — PL coerce / servers / 
     );
     expect(res.status).toBe(404);
     expect(db.inserts).toHaveLength(0);
+  });
+
+  it('v12 creator with empty users map still passes (MSC4289 implicit power)', async () => {
+    const db = createAliasesDb({
+      rooms: [{ room_id: ROOM, is_public: 0 }],
+      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+      powerLevelsContent: JSON.stringify({ users: {}, state_default: 50 }),
+      createEvent: { sender: USER, content: JSON.stringify({ room_version: '12' }) },
+    });
+    const res = await request(
+      db,
+      `/_matrix/client/v3/directory/list/room/${ROOM_ENC}`,
+      jsonInit('PUT', { visibility: 'public' })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rooms[0].is_public).toBe(1);
   });
 
   it('string power allows visibility PUT', async () => {

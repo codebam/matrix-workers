@@ -273,6 +273,13 @@ function createAliasesDb(
                 return { content: powerLevelsContent } as T;
               }
 
+              if (
+                sql.includes('FROM room_state') &&
+                sql.includes("event_type = 'm.room.create'")
+              ) {
+                return null as T;
+              }
+
               throw new Error(`Unhandled first() SQL: ${sql.slice(0, 160)}`);
             },
 

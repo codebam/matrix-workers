@@ -10,6 +10,7 @@ import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-
 import { calculateContentHash, signJson } from '../utils/crypto';
 import { computeEventReferenceHash, computeWireEventId, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
 import { getServerSigningKey } from '../services/federation-keys';
+import { getEffectiveUserPowerLevel } from '../services/event-auth';
 import {
   createRoom,
   getRoom,
@@ -206,7 +207,9 @@ async function createInitialRoomEvents(
     notifications: { room: 50 },
     redact: 50,
     state_default: 50,
-    users: { [creatorId]: 100 },
+    // MSC4289: in v12 rooms the creator has implicit power and must not
+    // appear in the users map (Synapse rejects remote joins otherwise).
+    users: isMsc4291RoomVersion(roomVersion) ? {} : { [creatorId]: 100 },
     users_default: 0,
   };
   await plan('m.room.power_levels', powerLevelsContent, '');
@@ -957,7 +960,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
 
   // Power-level permission check. We re-read this just before writing.
   const powerLevels = (powerLevelsEventCheck?.content as any) || {};
-  const userPower = powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
+  const userPower = getEffectiveUserPowerLevel(powerLevels, userId, createEvent);
   const requiredPower = powerLevels.events?.[eventType]
     ?? (eventType === 'm.room.member' ? (powerLevels.state_default ?? 50) : (powerLevels.state_default ?? 50));
   if (userPower < requiredPower) {
@@ -1233,8 +1236,9 @@ export async function buildMsc4291CreateEvent(
   creatorId: string,
   predecessor?: { room_id: string; event_id: string }
 ): Promise<{ roomId: string; eventId: string; pduBase: Record<string, unknown>; hashes: Record<string, string> }> {
+  // MSC4289: in v12 rooms the creator is implicit (the create event's
+  // sender); matrix.org's own v12 creates carry no `creator` field.
   const content: Record<string, unknown> = {
-    creator: creatorId,
     room_version: roomVersion,
   };
   if (predecessor) {
@@ -1509,9 +1513,10 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
 
   // Check power levels (captured at check-time; re-validated just before write
   // for optimistic concurrency — see issue 009 sub-finding 3).
+  const createEventForPower = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
   const powerLevels = powerLevelsEvent?.content as any || {};
-  const userPower = powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
+  const userPower = getEffectiveUserPowerLevel(powerLevels, userId, createEventForPower);
   const invitePower = powerLevels.invite ?? 50;
 
   if (userPower < invitePower) {
@@ -1618,10 +1623,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
   }
 
   // Check power levels
+  const createEventForPower = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
   const powerLevels = powerLevelsEvent?.content as any || {};
-  const userPower = powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
-  const targetPower = powerLevels.users?.[targetId] ?? powerLevels.users_default ?? 0;
+  const userPower = getEffectiveUserPowerLevel(powerLevels, userId, createEventForPower);
+  const targetPower = getEffectiveUserPowerLevel(powerLevels, targetId, createEventForPower);
   const kickPower = powerLevels.kick ?? 50;
 
   if (userPower < kickPower || userPower <= targetPower) {
@@ -1693,10 +1699,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
   }
 
   // Check power levels
+  const createEventForPower = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
   const powerLevels = powerLevelsEvent?.content as any || {};
-  const userPower = powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
-  const targetPower = powerLevels.users?.[targetId] ?? powerLevels.users_default ?? 0;
+  const userPower = getEffectiveUserPowerLevel(powerLevels, userId, createEventForPower);
+  const targetPower = getEffectiveUserPowerLevel(powerLevels, targetId, createEventForPower);
   const banPower = powerLevels.ban ?? 50;
 
   if (userPower < banPower || userPower <= targetPower) {
@@ -2477,7 +2484,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   const powerLevelsEvent = await getStateEvent(db, oldRoomId, 'm.room.power_levels', '');
   const powerLevels = powerLevelsEvent ? JSON.parse(typeof powerLevelsEvent.content === 'string' ? powerLevelsEvent.content : JSON.stringify(powerLevelsEvent.content)) : null;
 
-  const userPowerLevel = powerLevels?.users?.[userId] ?? powerLevels?.users_default ?? 0;
+  const oldCreateEvent = await getStateEvent(db, oldRoomId, 'm.room.create');
+  const userPowerLevel = getEffectiveUserPowerLevel(powerLevels ?? {}, userId, oldCreateEvent);
   const tombstonePowerLevel = powerLevels?.events?.['m.room.tombstone'] ?? powerLevels?.state_default ?? 50;
 
   if (userPowerLevel < tombstonePowerLevel) {
@@ -2567,11 +2575,18 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
 
   // 3. Copy power levels (with adjustments)
   if (powerLevels) {
-    await createNewRoomEvent('m.room.power_levels', powerLevels, '');
+    // MSC4289: creators must not appear in the users map of v12 rooms.
+    let plContent = powerLevels;
+    if (isMsc4291RoomVersion(body.new_version) && plContent.users) {
+      const users = { ...plContent.users };
+      delete users[userId];
+      plContent = { ...plContent, users };
+    }
+    await createNewRoomEvent('m.room.power_levels', plContent, '');
   } else {
     // Default power levels
     await createNewRoomEvent('m.room.power_levels', {
-      users: { [userId]: 100 },
+      users: isMsc4291RoomVersion(body.new_version) ? {} : { [userId]: 100 },
       users_default: 0,
       events_default: 0,
       state_default: 50,

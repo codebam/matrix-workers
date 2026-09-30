@@ -3,6 +3,7 @@
 
 import type { PDU, RoomPowerLevelsContent, RoomJoinRulesContent, RoomMemberContent } from '../types';
 import { getRoomVersion, type RoomVersionBehavior } from './room-versions';
+import { isMsc4291RoomVersion } from '../utils/event-signing';
 
 export interface AuthResult {
   allowed: boolean;
@@ -53,9 +54,47 @@ function getPowerLevels(state: RoomStateMap): RoomPowerLevelsContent {
   };
 }
 
+/** MSC4289 (room v12): room creators have implicit power level 2^53,
+ *  matching Synapse's CREATOR_POWER_LEVEL constant. */
+export const CREATOR_POWER_LEVEL = 2 ** 53;
+
+/** Whether the user is a room creator per MSC4289: the create event's sender
+ *  or a user listed in the create's additional_creators. Applies to room
+ *  versions with creator power enabled (v12 and later). */
+export function isRoomCreator(
+  createEvent: { sender?: string; content?: unknown } | null | undefined,
+  userId: string
+): boolean {
+  if (!createEvent) return false;
+  let content = createEvent.content;
+  if (typeof content === 'string') {
+    try {
+      content = JSON.parse(content);
+    } catch {
+      return false;
+    }
+  }
+  const cc = (content ?? {}) as Record<string, unknown>;
+  if (!isMsc4291RoomVersion(String(cc.room_version ?? ''))) return false;
+  if (createEvent.sender === userId) return true;
+  const additional = cc.additional_creators;
+  return Array.isArray(additional) && additional.includes(userId);
+}
+
 /** Get user's power level from power levels content */
 function getUserPowerLevel(powerLevels: RoomPowerLevelsContent, userId: string): number {
   return powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
+}
+
+/** Effective power level: MSC4289 grants the room creator(s) implicit power
+ *  in v12 rooms even though they are not in the users map. */
+export function getEffectiveUserPowerLevel(
+  powerLevels: RoomPowerLevelsContent,
+  userId: string,
+  createEvent: { sender?: string; content?: unknown } | null | undefined
+): number {
+  if (isRoomCreator(createEvent, userId)) return CREATOR_POWER_LEVEL;
+  return getUserPowerLevel(powerLevels, userId);
 }
 
 /** Get the required power level for an event */
@@ -158,8 +197,8 @@ function checkMemberEvent(
   }
 
   const powerLevels = getPowerLevels(state);
-  const senderPower = getUserPowerLevel(powerLevels, event.sender);
-  const targetPower = getUserPowerLevel(powerLevels, targetUserId);
+  const senderPower = getEffectiveUserPowerLevel(powerLevels, event.sender, getState(state, 'm.room.create'));
+  const targetPower = getEffectiveUserPowerLevel(powerLevels, targetUserId, getState(state, 'm.room.create'));
 
   const senderMemberEvent = getState(state, 'm.room.member', event.sender);
   const senderMembership = (senderMemberEvent?.content as RoomMemberContent)?.membership;
@@ -201,7 +240,7 @@ function checkMemberEvent(
           const authUserMember = getState(state, 'm.room.member', content.join_authorised_via_users_server);
           const authUserMembership = (authUserMember?.content as RoomMemberContent)?.membership;
           if (authUserMembership === 'join') {
-            const authUserPower = getUserPowerLevel(powerLevels, content.join_authorised_via_users_server);
+            const authUserPower = getEffectiveUserPowerLevel(powerLevels, content.join_authorised_via_users_server, getState(state, 'm.room.create'));
             if (authUserPower >= (powerLevels.invite ?? 0)) {
               return { allowed: true };
             }
@@ -331,7 +370,7 @@ function checkMemberEvent(
 /** Rule 5: m.room.third_party_invite */
 function checkThirdPartyInvite(event: PDU, state: RoomStateMap): AuthResult {
   const powerLevels = getPowerLevels(state);
-  const senderPower = getUserPowerLevel(powerLevels, event.sender);
+  const senderPower = getEffectiveUserPowerLevel(powerLevels, event.sender, getState(state, 'm.room.create'));
 
   const senderMemberEvent = getState(state, 'm.room.member', event.sender);
   const senderMembership = (senderMemberEvent?.content as RoomMemberContent)?.membership;
@@ -354,7 +393,7 @@ function checkStateEventPower(
   versionBehavior: RoomVersionBehavior
 ): AuthResult {
   const powerLevels = getPowerLevels(state);
-  const senderPower = getUserPowerLevel(powerLevels, event.sender);
+  const senderPower = getEffectiveUserPowerLevel(powerLevels, event.sender, getState(state, 'm.room.create'));
   const requiredPower = getEventPowerLevel(powerLevels, event.type, true);
 
   if (senderPower < requiredPower) {
@@ -396,6 +435,23 @@ function checkPowerLevelChange(
     for (const val of allValues) {
       if (!Number.isInteger(val)) {
         return { allowed: false, error: 'Power levels must be integers in this room version' };
+      }
+    }
+  }
+
+  // MSC4289: in v12 rooms the room creator(s) must not appear in the users
+  // map -- they have implicit power, and Synapse rejects events where they
+  // are listed (400 "Creator user ... must not appear in content.users").
+  const createEvent = getState(state, 'm.room.create');
+  if (createEvent && isMsc4291RoomVersion(String(((createEvent.content ?? {}) as Record<string, unknown>).room_version ?? ''))) {
+    const creators = new Set<string>([createEvent.sender]);
+    const additional = ((createEvent.content ?? {}) as Record<string, unknown>).additional_creators;
+    if (Array.isArray(additional)) {
+      for (const u of additional) if (typeof u === 'string') creators.add(u);
+    }
+    for (const creator of creators) {
+      if (newPl.users && creator in newPl.users) {
+        return { allowed: false, error: `Creator user ${creator} must not appear in content.users` };
       }
     }
   }
@@ -452,7 +508,7 @@ function checkPowerLevelChange(
 /** Rule 7: Non-state event power level check */
 function checkNonStateEventPower(event: PDU, state: RoomStateMap): AuthResult {
   const powerLevels = getPowerLevels(state);
-  const senderPower = getUserPowerLevel(powerLevels, event.sender);
+  const senderPower = getEffectiveUserPowerLevel(powerLevels, event.sender, getState(state, 'm.room.create'));
   const requiredPower = getEventPowerLevel(powerLevels, event.type, false);
 
   if (senderPower < requiredPower) {

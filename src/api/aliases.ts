@@ -7,6 +7,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { isRoomCreator, CREATOR_POWER_LEVEL } from '../services/event-auth';
 
 const app = new Hono<AppEnv>();
 
@@ -146,7 +147,8 @@ app.delete('/_matrix/client/v3/directory/room/:roomAlias', requireAuth(), async 
     if (powerLevels) {
       try {
         const levels = JSON.parse(powerLevels.content);
-        const userPower = levels.users?.[userId] || levels.users_default || 0;
+        const createEv = await db.prepare(`SELECT e.sender, e.content FROM room_state rs JOIN events e ON rs.event_id = e.event_id WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`).bind(alias.room_id).first<{ sender: string; content: string }>();
+        const userPower = isRoomCreator(createEv, userId) ? CREATOR_POWER_LEVEL : (levels.users?.[userId] || levels.users_default || 0);
         const aliasLevel = levels.state_default || 50;
 
         if (userPower < aliasLevel) {
@@ -222,7 +224,8 @@ app.put('/_matrix/client/v3/directory/list/room/:roomId', requireAuth(), async (
   if (powerLevels) {
     try {
       const levels = JSON.parse(powerLevels.content);
-      const userPower = levels.users?.[userId] || levels.users_default || 0;
+      const createEv = await db.prepare(`SELECT e.sender, e.content FROM room_state rs JOIN events e ON rs.event_id = e.event_id WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`).bind(roomId).first<{ sender: string; content: string }>();
+      const userPower = isRoomCreator(createEv, userId) ? CREATOR_POWER_LEVEL : (levels.users?.[userId] || levels.users_default || 0);
       const requiredPower = levels.state_default || 50;
 
       if (userPower < requiredPower) {
