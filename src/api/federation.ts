@@ -1533,12 +1533,18 @@ async function deriveRoomWireEvents(
   const all = await env.DB.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
      origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-     FROM events WHERE room_id = ?`
+     FROM events WHERE room_id = ?
+     ORDER BY depth ASC, stream_ordering ASC`
   ).bind(roomId).all();
 
   const refTargets = new Map<string, { type: string; stateKey: string }>();
-  const preparedList: Array<{ localId: string; wire: Record<string, unknown> }> = [];
 
+  // Single pass in dependency order: auth/prev references always point at
+  // earlier events, so each event's final wire form (and derived ID) is
+  // settled before any event that references it. References are translated
+  // to derived IDs, auth_events are reduced to the receiving server's
+  // expected selection, and the hash/signature computation happens last so
+  // the served bytes hash back to the served ID.
   for (const row of all.results as any[]) {
     const event: PDU = {
       event_id: row.event_id,
@@ -1558,6 +1564,44 @@ async function deriveRoomWireEvents(
     if (createEventId) {
       event.auth_events = event.auth_events.filter((id) => id !== createEventId);
     }
+
+    // Translate intra-room references to the derived wire IDs of the
+    // events already processed.
+    for (const key of ['auth_events', 'prev_events'] as const) {
+      event[key] = event[key].map((id) => (idMap.has(id) ? idMap.get(id)! : id));
+    }
+
+    // Reduce auth_events to the receiving server's expected selection: the
+    // receiver's receipt checks reject unexpected entries. References that
+    // cannot be classified (e.g. remote-side synthetic IDs) pass through
+    // untouched, and the create is never listed.
+    if (row.event_type !== 'm.room.create') {
+      const expected = expectedAuthTypes(
+        row.event_type,
+        row.sender,
+        row.state_key ?? undefined,
+        event.content as Record<string, unknown>
+      );
+      const kept: string[] = [];
+      const seen = new Set<string>();
+      const push = (id: unknown): void => {
+        if (typeof id === 'string' && !seen.has(id)) {
+          seen.add(id);
+          kept.push(id);
+        }
+      };
+      for (const ref of event.auth_events) {
+        const target = refTargets.get(ref);
+        if (!target) {
+          push(ref);
+          continue;
+        }
+        if (target.type === 'm.room.create') continue;
+        if (expected.has(`${target.type}\u0000${target.stateKey}`)) push(ref);
+      }
+      event.auth_events = kept;
+    }
+
     // Derivation recomputes the content hash and adds our signature; any
     // signatures already on the event (e.g. the joining server's own
     // signature on its join) are preserved by the merge inside signing.
@@ -1566,40 +1610,9 @@ async function deriveRoomWireEvents(
     idMap.set(row.event_id, prepared.wireId);
     wireById.set(row.event_id, prepared.wire);
     wireById.set(prepared.wireId, prepared.wire);
-    preparedList.push({ localId: row.event_id, wire: prepared.wire });
     const info = { type: row.event_type as string, stateKey: (row.state_key ?? '') as string };
     refTargets.set(row.event_id, info);
     refTargets.set(prepared.wireId, info);
-  }
-
-  // Translate intra-room references to derived wire IDs.
-  for (const { wire } of preparedList) {
-    for (const key of ['auth_events', 'prev_events']) {
-      const refs = wire[key];
-      if (Array.isArray(refs)) {
-        wire[key] = refs.map((id) =>
-          typeof id === 'string' && idMap.has(id) ? idMap.get(id) : id
-        );
-      }
-    }
-  }
-
-  // Reduce auth_events to the receiving server's expected selection.
-  for (const { wire } of preparedList) {
-    const type = wire['type'] as string;
-    if (type === 'm.room.create') continue;
-    const expected = expectedAuthTypes(
-      type,
-      wire['sender'] as string,
-      wire['state_key'] as string | undefined,
-      (wire['content'] as Record<string, unknown>) ?? {}
-    );
-    wire['auth_events'] = ((wire['auth_events'] as string[] | undefined) ?? []).filter((ref) => {
-      const target = refTargets.get(ref);
-      if (!target) return false;
-      if (target.type === 'm.room.create') return false;
-      return expected.has(`${target.type}\u0000${target.stateKey}`);
-    });
   }
 
   return { idMap, wireById };
