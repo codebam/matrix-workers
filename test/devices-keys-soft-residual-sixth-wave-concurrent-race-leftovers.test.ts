@@ -191,6 +191,9 @@ function createDevicesDb(opts: {
                 );
                 return (row ? { device_id: row.device_id } : null) as T;
               }
+              if (sql.includes('SELECT position FROM stream_positions')) {
+                return { position: 41 } as T;
+              }
               throw new Error(`Unhandled first() SQL: ${sql.slice(0, 140)}`);
             },
             async all<T>() {
@@ -210,6 +213,9 @@ function createDevicesDb(opts: {
                   }));
                 return { results: results as T[] };
               }
+              if (sql.includes('FROM room_memberships rm1')) {
+                return { results: [] as T[] };
+              }
               throw new Error(`Unhandled all() SQL: ${sql.slice(0, 140)}`);
             },
             async run() {
@@ -228,6 +234,12 @@ function createDevicesDb(opts: {
                 if (idx >= 0 && sql.includes('DELETE FROM devices')) {
                   deviceRows.splice(idx, 1);
                 }
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+              if (sql.includes('UPDATE stream_positions SET position = position + 1')) {
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+              if (sql.includes('INSERT INTO device_key_changes')) {
                 return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
               throw new Error(`Unhandled run() SQL: ${sql.slice(0, 140)}`);

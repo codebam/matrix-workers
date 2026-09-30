@@ -21,7 +21,7 @@ import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateOpaqueId } from '../utils/ids';
 import { createDevice, deleteDevice } from '../services/database';
-import { putDeviceKeysToDO, deleteDeviceKeysFromDO, recordKeyChange } from './keys';
+import { putDeviceKeysToDO, deleteDeviceKeysFromDO, queueDeviceListUpdateEdus, recordKeyChange } from './keys';
 
 const app = new Hono<AppEnv>();
 
@@ -62,6 +62,7 @@ async function purgeDehydratedDevice(env: Env, userId: string, deviceId: string)
   await db.prepare(`DELETE FROM one_time_keys WHERE user_id = ? AND device_id = ?`).bind(userId, deviceId).run();
   await deleteDevice(db, userId, deviceId);
   await recordKeyChange(db, userId, deviceId, 'delete');
+  await queueDeviceListUpdateEdus(env, userId, deviceId, { deleted: true });
 }
 
 /** Store uploaded one-time keys the same way POST /keys/upload does. */

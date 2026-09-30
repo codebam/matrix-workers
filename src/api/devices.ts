@@ -8,7 +8,7 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
-import { deleteDeviceKeysFromDO } from './keys';
+import { deleteDeviceKeysFromDO, queueDeviceListUpdateEdus, recordKeyChange } from './keys';
 
 const app = new Hono<AppEnv>();
 
@@ -168,6 +168,12 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     DELETE FROM devices WHERE user_id = ? AND device_id = ?
   `).bind(userId, deviceId).run();
 
+  // A deleted device is a device-list change: record it locally (drives
+  // /keys/changes and wakes this user's sync sessions) and tell federated
+  // servers so their device caches drop it.
+  await recordKeyChange(db, userId, deviceId, 'delete', c.env);
+  await queueDeviceListUpdateEdus(c.env, userId, deviceId, { deleted: true });
+
   return c.json({});
 });
 
@@ -225,6 +231,11 @@ app.post('/_matrix/client/v3/delete_devices', requireAuth(), async (c) => {
     await db.prepare(`
       DELETE FROM devices WHERE user_id = ? AND device_id = ?
     `).bind(userId, deviceId).run();
+
+    // Same convergence as single-device deletion: local key-change record
+    // plus m.device_list_update (deleted) to federated servers.
+    await recordKeyChange(db, userId, deviceId, 'delete', c.env);
+    await queueDeviceListUpdateEdus(c.env, userId, deviceId, { deleted: true });
   }
 
   return c.json({});

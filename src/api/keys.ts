@@ -133,6 +133,45 @@ export async function recordKeyChange(db: D1Database, userId: string, deviceId: 
   }
 }
 
+// Queue outbound m.device_list_update EDUs to every remote server that shares
+// a room with this user, so peers' device caches track additions (with keys)
+// and deletions (deleted: true, no keys). Best-effort: federation failures
+// must never fail the caller.
+export async function queueDeviceListUpdateEdus(
+  env: Env,
+  userId: string,
+  deviceId: string,
+  opts: { deleted: boolean; keys?: unknown; displayName?: string | null }
+): Promise<void> {
+  try {
+    const { getServersInRoomsWithUser } = await import('../services/database');
+    const remoteServers = await getServersInRoomsWithUser(env.DB, userId);
+    const uniqueServers = [...new Set(remoteServers)].filter((s) => s !== env.SERVER_NAME);
+
+    for (const server of uniqueServers) {
+      const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(server));
+      await fedDO.fetch(new Request('http://internal/send-edu', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          destination: server,
+          edu_type: 'm.device_list_update',
+          content: {
+            user_id: userId,
+            device_id: deviceId,
+            device_display_name: opts.displayName,
+            stream_id: Date.now(),
+            keys: opts.keys,
+            deleted: opts.deleted,
+          },
+        }),
+      }));
+    }
+  } catch (fedErr) {
+    console.warn('[keys] Failed to queue device list EDUs:', fedErr);
+  }
+}
+
 // Remove a device's keys from the Durable Object. Used when a device is
 // replaced or deleted so /keys/query stops returning it.
 export async function deleteDeviceKeysFromDO(env: Env, userId: string, deviceId: string): Promise<void> {
@@ -206,34 +245,11 @@ app.post('/_matrix/client/v3/keys/upload', requireAuth(), async (c) => {
     await recordKeyChange(db, userId, deviceId, 'update', c.env);
 
     // Queue outbound m.device_list_update EDUs to federated servers
-    try {
-      const { getServersInRoomsWithUser } = await import('../services/database');
-      const remoteServers = await getServersInRoomsWithUser(db, userId);
-      const localServer = c.env.SERVER_NAME;
-      const uniqueServers = [...new Set(remoteServers)].filter(s => s !== localServer);
-
-      for (const server of uniqueServers) {
-        const fedDO = c.env.FEDERATION.get(c.env.FEDERATION.idFromName(server));
-        await fedDO.fetch(new Request('http://internal/send-edu', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            destination: server,
-            edu_type: 'm.device_list_update',
-            content: {
-              user_id: userId,
-              device_id: deviceId,
-              device_display_name: device_keys.unsigned?.device_display_name,
-              stream_id: Date.now(),
-              keys: device_keys,
-              deleted: false,
-            },
-          }),
-        }));
-      }
-    } catch (fedErr) {
-      console.warn('[keys] Failed to queue device list EDUs:', fedErr);
-    }
+    await queueDeviceListUpdateEdus(c.env, userId, deviceId!, {
+      deleted: false,
+      keys: device_keys,
+      displayName: device_keys.unsigned?.device_display_name,
+    });
   }
 
   // Store one-time keys in KV for fast access

@@ -51,6 +51,8 @@ function createDevicesDb(opts: {
   passwordHash?: string | null;
   /** Force password_hash SELECT to return null user row. */
   missingUser?: boolean;
+  /** Server names returned by getServersInRoomsWithUser(). */
+  remoteServers?: string[];
 } = {}) {
   const deviceRows = opts.devices ?? [];
   const passwordHash =
@@ -61,6 +63,8 @@ function createDevicesDb(opts: {
   const updates: SqlCall[] = [];
   const deletes: SqlCall[] = [];
   const selects: SqlCall[] = [];
+  const keyChanges: SqlCall[] = [];
+  let streamPosition = 40;
 
   const db = {
     devices: deviceRows,
@@ -68,6 +72,7 @@ function createDevicesDb(opts: {
     updates,
     deletes,
     selects,
+    keyChanges,
     prepare(sql: string) {
       return {
         bind(...args: unknown[]) {
@@ -109,6 +114,10 @@ function createDevicesDb(opts: {
                 return (row ? { device_id: row.device_id } : null) as T;
               }
 
+              if (sql.includes('SELECT position FROM stream_positions')) {
+                return { position: streamPosition } as T;
+              }
+
               throw new Error(`Unhandled first() SQL: ${sql.slice(0, 140)}`);
             },
 
@@ -129,6 +138,13 @@ function createDevicesDb(opts: {
                     last_seen_ts: d.last_seen_ts,
                     last_seen_ip: d.last_seen_ip,
                   }));
+                return { results: results as T[] };
+              }
+
+              if (sql.includes('FROM room_memberships rm1')) {
+                const results = (opts.remoteServers ?? []).map((s) => ({
+                  server_name: s,
+                }));
                 return { results: results as T[] };
               }
 
@@ -178,6 +194,16 @@ function createDevicesDb(opts: {
                 };
               }
 
+              if (sql.includes('UPDATE stream_positions SET position = position + 1')) {
+                streamPosition += 1;
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+
+              if (sql.includes('INSERT INTO device_key_changes')) {
+                keyChanges.push({ sql, args });
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+
               throw new Error(`Unhandled run() SQL: ${sql.slice(0, 140)}`);
             },
           };
@@ -191,19 +217,47 @@ function createDevicesDb(opts: {
 
 type DevicesDb = ReturnType<typeof createDevicesDb>;
 
-function envFor(db: DevicesDb): Env {
+function envFor(db: DevicesDb, extras: Partial<Env> = {}): Env {
   return {
     DB: db as unknown as D1Database,
     SERVER_NAME: 'example.com',
+    ...extras,
   } as unknown as Env;
+}
+
+type FedStub = {
+  fetches: Array<{ url: string; body: any }>;
+  fetch: (req: Request) => Promise<Response>;
+};
+
+function createFederationStub(): FedStub {
+  const fetches: Array<{ url: string; body: any }> = [];
+  return {
+    fetches,
+    fetch: async (req: Request) => {
+      const body = await req.json().catch(() => null);
+      fetches.push({ url: req.url, body });
+      return new Response('Queued');
+    },
+  };
+}
+
+function fedEnv(db: DevicesDb, fed: FedStub): Env {
+  return envFor(db, {
+    FEDERATION: {
+      idFromName: (name: string) => name,
+      get: () => fed,
+    } as unknown as Env['FEDERATION'],
+  });
 }
 
 async function request(
   db: DevicesDb,
   path: string,
-  init: RequestInit = {}
+  init: RequestInit = {},
+  envOverride?: Env
 ): Promise<{ status: number; body: unknown }> {
-  const res = await devices.request(`http://localhost${path}`, init, envFor(db));
+  const res = await devices.request(`http://localhost${path}`, init, envOverride ?? envFor(db));
   let body: unknown = null;
   const text = await res.text();
   if (text) {
@@ -2031,5 +2085,101 @@ describe('devices UIA session uniqueness pinning', () => {
     expect((a.body as { session: string }).session).not.toBe(
       (b.body as { session: string }).session
     );
+  });
+});
+
+describe('device deletion — federation + key-change convergence', () => {
+  it('single deletion queues a deleted m.device_list_update EDU and records the key change', async () => {
+    const db = createDevicesDb({
+      devices: [seedDevice({ device_id: 'PHONE' })],
+      remoteServers: ['remote.example.org', 'example.com'],
+    });
+    const fed = createFederationStub();
+
+    const res = await request(
+      db,
+      '/_matrix/client/v3/devices/PHONE',
+      jsonInit('DELETE', { auth: { type: 'm.login.password', password: 's3cret' } }),
+      fedEnv(db, fed)
+    );
+    expect(res.status).toBe(200);
+
+    // Local convergence: a device_key_changes row for /keys/changes.
+    expect(db.keyChanges).toEqual([
+      expect.objectContaining({
+        args: expect.arrayContaining([USER, 'PHONE', 'delete']),
+      }),
+    ]);
+
+    // Remote convergence: one EDU per remote server, local server filtered.
+    expect(fed.fetches).toHaveLength(1);
+    expect(fed.fetches[0].body).toMatchObject({
+      destination: 'remote.example.org',
+      edu_type: 'm.device_list_update',
+      content: {
+        user_id: USER,
+        device_id: 'PHONE',
+        deleted: true,
+        stream_id: expect.any(Number),
+      },
+    });
+    expect('keys' in fed.fetches[0].body.content).toBe(false);
+    expect('device_display_name' in fed.fetches[0].body.content).toBe(false);
+  });
+
+  it('bulk deletion queues one deleted EDU and one key change per device', async () => {
+    const db = createDevicesDb({
+      devices: [seedDevice({ device_id: 'A' }), seedDevice({ device_id: 'B' })],
+      remoteServers: ['remote.example.org'],
+    });
+    const fed = createFederationStub();
+
+    const res = await request(
+      db,
+      '/_matrix/client/v3/delete_devices',
+      jsonInit('POST', {
+        devices: ['A', 'B'],
+        auth: { type: 'm.login.password', password: 's3cret' },
+      }),
+      fedEnv(db, fed)
+    );
+    expect(res.status).toBe(200);
+    expect(db.keyChanges).toHaveLength(2);
+    expect(fed.fetches.map((f) => f.body.content.device_id)).toEqual(['A', 'B']);
+    expect(
+      fed.fetches.every(
+        (f) =>
+          f.body.destination === 'remote.example.org' &&
+          f.body.content.deleted === true &&
+          !('keys' in f.body.content)
+      )
+    ).toBe(true);
+  });
+
+  it('deletion still succeeds when the federation EDU queue fails', async () => {
+    const db = createDevicesDb({
+      devices: [seedDevice({ device_id: 'PHONE' })],
+      remoteServers: ['remote.example.org'],
+    });
+    const env = envFor(db, {
+      FEDERATION: {
+        idFromName: (name: string) => name,
+        get: () => ({
+          fetch: async () => {
+            throw new Error('fed down');
+          },
+        }),
+      } as unknown as Env['FEDERATION'],
+    });
+
+    const res = await request(
+      db,
+      '/_matrix/client/v3/devices/PHONE',
+      jsonInit('DELETE', { auth: { type: 'm.login.password', password: 's3cret' } }),
+      env
+    );
+    expect(res.status).toBe(200);
+    expect(db.devices).toHaveLength(0);
+    expect(db.keyChanges).toHaveLength(1);
   });
 });

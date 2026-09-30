@@ -347,6 +347,9 @@ function createDevicesDb(
                 const row = deviceRows.find((d) => d.user_id === userId && d.device_id === deviceId);
                 return (row ? { device_id: row.device_id } : null) as T;
               }
+              if (sql.includes('SELECT position FROM stream_positions')) {
+                return { position: 41 } as T;
+              }
               throw new Error(`Unhandled first() SQL: ${sql.slice(0, 140)}`);
             },
             async all<T>() {
@@ -369,6 +372,9 @@ function createDevicesDb(
                     last_seen_ip: d.last_seen_ip,
                   }));
                 return { results: results as T[] };
+              }
+              if (sql.includes('FROM room_memberships rm1')) {
+                return { results: [] as T[] };
               }
               throw new Error(`Unhandled all() SQL: ${sql.slice(0, 140)}`);
             },
@@ -425,6 +431,12 @@ function createDevicesDb(
                   }
                 }
                 return { success: true, meta: { changes: before - deviceRows.length, last_row_id: 0 } };
+              }
+              if (sql.includes('UPDATE stream_positions SET position = position + 1')) {
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+              if (sql.includes('INSERT INTO device_key_changes')) {
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
               throw new Error(`Unhandled run() SQL: ${sql.slice(0, 140)}`);
             },
@@ -749,6 +761,12 @@ function createKeyBackupDb(
                 }
                 return { success: true, meta: { changes: before - keys.length, last_row_id: 0 } };
               }
+              if (sql.includes('UPDATE stream_positions SET position = position + 1')) {
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+              if (sql.includes('INSERT INTO device_key_changes')) {
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
               throw new Error(`Unhandled run() SQL: ${sql.slice(0, 140)}`);
             },
           };
@@ -905,6 +923,9 @@ function createReportDb(
                   event_type: ev?.event_type ?? null,
                   content: ev?.content ?? null,
                 } as T;
+              }
+              if (sql.includes('SELECT position FROM stream_positions')) {
+                return { position: 41 } as T;
               }
               throw new Error(`Unhandled first() SQL: ${sql.slice(0, 180)}`);
             },
@@ -1107,6 +1128,12 @@ function createReportDb(
                   reported_user_id: reportedUser,
                 });
                 return { success: true, meta: { changes: 1, last_row_id: id } };
+              }
+              if (sql.includes('UPDATE stream_positions SET position = position + 1')) {
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+              if (sql.includes('INSERT INTO device_key_changes')) {
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
               throw new Error(`Unhandled run() SQL: ${sql.slice(0, 180)}`);
             },
