@@ -159,7 +159,13 @@ export function msc4291CreateEventId(refHash: string): string {
   return `$${refHash}`;
 }
 
-/** MSC4291: the room ID is "!" + the create event's reference hash + server. */
-export function msc4291RoomId(refHash: string, serverName: string): string {
-  return `!${refHash}:${serverName}`;
+/**
+ * MSC4291: the room ID is "!" + the create event's reference hash.
+ * The room ID carries NO server suffix: Synapse derives the implicit create
+ * reference as "$" + room_id[1:], which must equal the create's event ID
+ * ("$" + refhash) for its auth checks to resolve it. A domain suffix breaks
+ * that identity and every join into the room 500s on the receiver.
+ */
+export function msc4291RoomId(refHash: string): string {
+  return `!${refHash}`;
 }

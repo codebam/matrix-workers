@@ -402,7 +402,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
   // both derived from the create event's reference hash, so the create must
   // be built before the room row exists.
   const prebuiltCreate = isMsc4291RoomVersion(version)
-    ? await buildMsc4291CreateEvent(c.env.SERVER_NAME, version, userId)
+    ? await buildMsc4291CreateEvent(version, userId)
     : null;
 
   // Generate room ID
@@ -1222,13 +1222,13 @@ export async function prepareOutboundPdu(
 /**
  * Build the initial m.room.create event for an MSC4291 room (version 12):
  * the create carries no room_id, its ID is "$" + reference hash of the create
- * itself, and the room ID is "!" + that reference hash + ":" + server. The
- * reference hash is computed over the exact bytes federation will see (no
- * room_id, no event_id, no signatures/unsigned), so remote servers derive
- * the same IDs.
+ * itself, and the room ID is "!" + that same reference hash with no server
+ * suffix (Synapse resolves its implicit create reference as "$" + room_id[1:]
+ * and requires it to equal the create's event ID). The reference hash is
+ * computed over the exact bytes federation will see (no room_id, no event_id,
+ * no signatures/unsigned), so remote servers derive the same IDs.
  */
 export async function buildMsc4291CreateEvent(
-  serverName: string,
   roomVersion: string,
   creatorId: string,
   predecessor?: { room_id: string; event_id: string }
@@ -1253,7 +1253,7 @@ export async function buildMsc4291CreateEvent(
   const hashes = { sha256: await calculateContentHash(pduBase) };
   const refHash = await computeEventReferenceHash({ ...pduBase, hashes });
   return {
-    roomId: msc4291RoomId(refHash, serverName),
+    roomId: msc4291RoomId(refHash),
     eventId: msc4291CreateEventId(refHash),
     pduBase,
     hashes,
@@ -2501,7 +2501,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   // MSC4291 (room version 12): derive the new room ID and create event ID
   // from the create event's reference hash.
   const prebuiltCreate = isMsc4291RoomVersion(body.new_version)
-    ? await buildMsc4291CreateEvent(serverName, body.new_version, userId, predecessor)
+    ? await buildMsc4291CreateEvent(body.new_version, userId, predecessor)
     : null;
 
   // Generate new room ID

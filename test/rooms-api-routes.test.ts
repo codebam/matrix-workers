@@ -794,9 +794,11 @@ describe('POST /createRoom', () => {
       );
       expect(status).toBe(200);
       // MSC4291 (room version 12): the room ID is derived from the create
-      // event's reference hash, not generated randomly.
+      // event's reference hash, not generated randomly -- and carries no
+      // server suffix (Synapse's implicit create reference "$"+room_id[1:]
+      // must equal the create's event ID).
       const body2 = body as { room_id: string };
-      expect(body2.room_id).toMatch(/^![A-Za-z0-9_-]{43}:example\.com$/);
+      expect(body2.room_id).toMatch(/^![A-Za-z0-9_-]{43}$/);
       expect(fedFetch).toHaveBeenCalledTimes(1);
       const sent = fedFetch.mock.calls[0][0] as Request;
       expect(new URL(sent.url).pathname).toBe('/invite');
