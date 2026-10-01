@@ -143,6 +143,7 @@ type DbOpts = {
   lastEvent?: { event_id: string; depth: number } | null;
   remoteJoinedUserIds?: Array<string>;
   remoteTip?: { event_id: string; depth: number } | null;
+  stateRows?: Array<{ event_id: string; event_type: string; state_key: string | null }>;
 };
 
 function createSqlDb(opts: DbOpts = {}) {
@@ -161,6 +162,7 @@ function createSqlDb(opts: DbOpts = {}) {
   const lastEvent = opts.lastEvent ?? { event_id: '$last:example.com', depth: 5 };
   const remoteJoinedUserIds = opts.remoteJoinedUserIds ?? [];
   const remoteTip = opts.remoteTip ?? null;
+  const stateRows = opts.stateRows ?? [];
   const inserts: SqlCall[] = [];
   const updates: SqlCall[] = [];
   const deletes: SqlCall[] = [];
@@ -320,6 +322,10 @@ function createSqlDb(opts: DbOpts = {}) {
                 return {
                   results: remoteJoinedUserIds.map((id) => ({ user_id: id })) as T[],
                 };
+              }
+
+              if (sql.includes('room_state rs JOIN events e')) {
+                return { results: stateRows as T[] };
               }
 
               return { results: [] as T[] };
@@ -967,6 +973,69 @@ describe('POST /createRoom', () => {
       expect(inviteCall).toBeTruthy();
       const payload = JSON.parse(await inviteCall!.text()) as { event: Record<string, unknown> };
       expect(payload.event.auth_events).toEqual([member.event_id, pl.event_id, jr.event_id]);
+    } finally {
+      restore();
+    }
+  });
+
+  it('v12: local member events are stored in the derived id space (leave)', async () => {
+    const USER_ = USER;
+    getRoom.mockResolvedValue({ room_id: '!v12room:example.com', room_version: '12', is_public: 0 });
+    getMembership.mockResolvedValue({ membership: 'join', eventId: '$alice-join' });
+    getStateEvent.mockImplementation(async (_db: unknown, _room: string, type: string) => {
+      if (type === 'm.room.create') {
+        return pdu({ type: 'm.room.create', event_id: '$create', state_key: '' });
+      }
+      if (type === 'm.room.power_levels') {
+        return pdu({ type: 'm.room.power_levels', event_id: '$pl', state_key: '', content: { users: { [USER_]: 100 } } });
+      }
+      if (type === 'm.room.join_rules') {
+        return pdu({ type: 'm.room.join_rules', event_id: '$jr', state_key: '', content: { join_rule: 'invite' } });
+      }
+      return null;
+    });
+    getRoomEvents.mockResolvedValue({ events: [pdu({ type: 'm.room.message', event_id: '$tip', depth: 5 })] });
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({ keyId: 'ed25519:test', privateKeyJwk: kp.privateKeyJwk });
+      const db = createSqlDb({
+        stateRows: [
+          { event_id: '$create', event_type: 'm.room.create', state_key: '' },
+          { event_id: '$pl', event_type: 'm.room.power_levels', state_key: '' },
+          { event_id: '$jr', event_type: 'm.room.join_rules', state_key: '' },
+          { event_id: '$alice-join', event_type: 'm.room.member', state_key: USER_ },
+        ],
+      });
+      const { status } = await request(
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
+        jsonInit('POST', {}),
+        db
+      );
+      expect(status).toBe(200);
+
+      const leaveCall = storeEvent.mock.calls
+        .map((c) => c[1] as PDU)
+        .find((e) => e.type === 'm.room.member' && (e.content as { membership?: string }).membership === 'leave');
+      expect(leaveCall).toBeTruthy();
+      // Derived ID: reference hash of the exact stored form, no server suffix.
+      expect(leaveCall!.event_id).not.toContain(':');
+      const form: Record<string, unknown> = {
+        room_id: leaveCall!.room_id,
+        sender: leaveCall!.sender,
+        type: leaveCall!.type,
+        state_key: leaveCall!.state_key,
+        content: leaveCall!.content,
+        origin_server_ts: leaveCall!.origin_server_ts,
+        depth: leaveCall!.depth,
+        auth_events: leaveCall!.auth_events,
+        prev_events: leaveCall!.prev_events,
+        hashes: leaveCall!.hashes,
+      };
+      await expect(computeWireEventId(form)).resolves.toBe(leaveCall!.event_id);
+      // Auth refs reduced to the receiving server's expected selection:
+      // power_levels + the sender's member event; the create never appears.
+      expect(leaveCall!.auth_events).toEqual(['$pl', '$alice-join']);
     } finally {
       restore();
     }

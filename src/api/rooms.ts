@@ -739,8 +739,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
   }
 
   // Create leave event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
 
@@ -757,7 +755,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
   };
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -769,7 +767,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(c.env.DB, roomId, userId, 'leave', eventId);
 
   // Notify room members about the leave
@@ -815,8 +813,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/knock', requireAuth(), async (c) => {
   }
 
   // Create knock event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(db, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(db, roomId, 'm.room.power_levels');
 
@@ -835,7 +831,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/knock', requireAuth(), async (c) => {
   };
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -847,7 +843,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/knock', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(db, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(db, roomId, userId, 'knock', eventId);
 
   // Store in room_knocks table for easy querying
@@ -907,8 +903,6 @@ app.post('/_matrix/client/v3/knock/:roomIdOrAlias', requireAuth(), async (c) => 
   }
 
   // Create knock event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(db, roomId, 'm.room.create');
   const powerLevelsEvent = await getStateEvent(db, roomId, 'm.room.power_levels');
 
@@ -927,7 +921,7 @@ app.post('/_matrix/client/v3/knock/:roomIdOrAlias', requireAuth(), async (c) => 
   };
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -939,7 +933,7 @@ app.post('/_matrix/client/v3/knock/:roomIdOrAlias', requireAuth(), async (c) => 
     prev_events: prevEvents,
   };
 
-  await storeEvent(db, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(db, roomId, userId, 'knock', eventId);
 
   await db.prepare(`
@@ -1039,8 +1033,6 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
     return Errors.forbidden('Insufficient power level for this state event').toResponse();
   }
 
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const authEvents: string[] = [];
   if (createEvent) authEvents.push(createEvent.event_id);
   if (powerLevelsEventCheck) authEvents.push(powerLevelsEventCheck.event_id);
@@ -1050,7 +1042,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   const prevEvents = latestEvents.map(e => e.event_id);
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: eventType,
@@ -1075,7 +1067,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
     return Errors.conflict(`State event ${eventType}/${stateKey} changed during request; retry`).toResponse();
   }
 
-  await storeEvent(c.env.DB, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
 
   // Invalidate room metadata cache if this is a metadata-affecting state event
   const CACHED_STATE_TYPES = ['m.room.name', 'm.room.avatar', 'm.room.topic', 'm.room.canonical_alias', 'm.room.member'];
@@ -1295,6 +1287,72 @@ export async function prepareOutboundPdu(
 }
 
 /**
+ * Prepare a locally-created event for storage and federation in MSC4291 room
+ * versions (v12): auth refs reduced to the receiving server's expected
+ * selection, reference-hash ID derived from the exact stored bytes, content
+ * hash and server signature attached, then stored. The stored event is then
+ * byte-identical to the served/delivered form, so remote servers can resolve
+ * references into it (storing under a generated ID instead puts the room in
+ * two ID spaces and makes every outbound reference unresolvable to peers).
+ * Older room versions keep the legacy path (generated ID, no derivation).
+ * Mutates `event` in place and returns its stored ID.
+ */
+async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): Promise<string> {
+  const room = await getRoom(env.DB, roomId);
+  const roomVersion = String(room?.room_version ?? '10');
+  if (isMsc4291RoomVersion(roomVersion)) {
+    const stateRows = await env.DB.prepare(
+      `SELECT e.event_id, e.event_type, e.state_key
+       FROM room_state rs JOIN events e ON rs.event_id = e.event_id
+       WHERE rs.room_id = ?`
+    ).bind(roomId).all<{ event_id: string; event_type: string; state_key: string | null }>();
+    const targets = new Map<string, { type: string; stateKey: string }>();
+    let createId: string | undefined;
+    for (const r of stateRows.results) {
+      targets.set(r.event_id, { type: r.event_type, stateKey: r.state_key ?? '' });
+      if (r.event_type === 'm.room.create') createId = r.event_id;
+    }
+    const expected = expectedAuthTypes(
+      event.type,
+      event.sender,
+      event.state_key,
+      (event.content ?? {}) as Record<string, unknown>
+    );
+    const kept: string[] = [];
+    const seen = new Set<string>();
+    for (const ref of event.auth_events ?? []) {
+      if (ref === createId) continue;
+      const t = targets.get(ref);
+      if (!t) {
+        if (!seen.has(ref)) {
+          seen.add(ref);
+          kept.push(ref);
+        }
+        continue;
+      }
+      if (expected.has(`${t.type}\u0000${t.stateKey}`)) {
+        if (!seen.has(ref)) {
+          seen.add(ref);
+          kept.push(ref);
+        }
+      }
+    }
+    event.auth_events = kept;
+    const prepared = await prepareOutboundPdu(env, event, roomVersion);
+    if (!prepared) {
+      throw new Error('[rooms] cannot derive v12 event ID without a signing key');
+    }
+    event.event_id = prepared.wireId;
+    event.hashes = prepared.hashes as PDU['hashes'];
+    event.signatures = prepared.signatures as PDU['signatures'];
+  } else {
+    event.event_id = await generateEventId(env.SERVER_NAME, roomVersion);
+  }
+  await storeEvent(env.DB, event);
+  return event.event_id;
+}
+
+/**
  * Build the initial m.room.create event for an MSC4291 room (version 12):
  * the create carries no room_id, its ID is "$" + reference hash of the create
  * itself, and the room ID is "!" + that same reference hash with no server
@@ -1510,20 +1568,23 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     prev_events: prevEvents,
   };
 
-  // If remote servers have joined members in this room, deliver over
-  // federation: adapt to the v4+ wire format (reference-hash ID, no explicit
-  // event_id, signatures over the redacted event) and store under the same
-  // derived ID so our local view matches the resident servers' view.
+  // Adapt to the v4+ wire format (reference-hash ID, no explicit event_id,
+  // signatures over the redacted event) and store under the same derived ID
+  // so our local view always matches resident servers' view. For MSC4291
+  // room versions the derivation happens even with no remote members yet:
+  // the stored ID must equal the served ID the moment a remote joins.
   const remoteServers = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
   let wirePdu: Record<string, unknown> | null = null;
-  if (remoteServers.length > 0) {
+  if (remoteServers.length > 0 || isMsc4291RoomVersion(roomVersionStr)) {
     const prepared = await prepareOutboundPdu(c.env, event, roomVersionStr);
     if (prepared) {
       event.event_id = prepared.wireId;
       (event as unknown as Record<string, unknown>).hashes = prepared.hashes;
       (event as unknown as Record<string, unknown>).signatures = prepared.signatures;
-      wirePdu = prepared.wire;
-      console.log(`[rooms] Federation wire PDU prepared for ${prepared.wireId} -> ${remoteServers.join(', ')}`);
+      if (remoteServers.length > 0) {
+        wirePdu = prepared.wire;
+        console.log(`[rooms] Federation wire PDU prepared for ${prepared.wireId} -> ${remoteServers.join(', ')}`);
+      }
     }
   }
 
@@ -1610,8 +1671,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
   }
 
   // Create invite event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
   // MSC4291 (room version 12): the create event is implicit in the auth
@@ -1633,7 +1692,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
   };
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -1651,7 +1710,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     return Errors.conflict('Power levels changed during invite; retry').toResponse();
   }
 
-  await storeEvent(c.env.DB, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(c.env.DB, roomId, inviteeId, 'invite', eventId);
 
   // Notify room members and the invitee about the invite
@@ -1707,8 +1766,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
   }
 
   // Create leave event for target
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
   const authEvents: string[] = [];
@@ -1726,7 +1783,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
   };
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -1738,7 +1795,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(c.env.DB, roomId, targetId, 'leave', eventId);
 
   // Notify room members about the kick
@@ -1783,8 +1840,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
   }
 
   // Create ban event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
   const targetMembership = await getMembership(c.env.DB, roomId, targetId);
 
@@ -1803,7 +1858,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
   };
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -1815,7 +1870,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(c.env.DB, roomId, targetId, 'ban', eventId);
 
   // Notify room members about the ban
@@ -1864,8 +1919,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/unban', requireAuth(), async (c) => {
   }
 
   // Create leave event (unban sets membership to leave)
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
   const authEvents: string[] = [];
@@ -1883,7 +1936,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/unban', requireAuth(), async (c) => {
   };
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.member',
@@ -1895,7 +1948,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/unban', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(c.env.DB, roomId, targetId, 'leave', eventId);
 
   // Notify room members about the unban
@@ -1962,8 +2015,6 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
   }
 
   // Create redaction event
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
   const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
 
   const authEvents: string[] = [];
@@ -1982,7 +2033,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
   }
 
   const event: PDU = {
-    event_id: eventId,
+    event_id: '',
     room_id: roomId,
     sender: userId,
     type: 'm.room.redaction',
@@ -1995,7 +2046,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
     prev_events: prevEvents,
   };
 
-  await storeEvent(c.env.DB, event);
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
 
   // Mark the original event as redacted
   await c.env.DB.prepare(`
@@ -2596,9 +2647,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
 
   // Helper to create events in new room
   async function createNewRoomEvent(type: string, content: any, stateKey?: string): Promise<string> {
-    const eventId = await generateEventId(serverName);
     const event: PDU = {
-      event_id: eventId,
+      event_id: '',
       room_id: newRoomId,
       sender: userId,
       type,
@@ -2610,7 +2660,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
       prev_events: [...prevEvents],
     };
 
-    await storeEvent(db, event);
+    const eventId = await prepareAndStoreLocalEvent(c.env, newRoomId, event);
 
     if (stateKey !== undefined) {
       authEvents.push(eventId);
@@ -2747,9 +2797,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
     .filter(e => e.state_key === '' || e.state_key === userId)
     .map(e => e.event_id);
 
-  const tombstoneEventId = await generateEventId(serverName);
   const tombstoneEvent: PDU = {
-    event_id: tombstoneEventId,
+    event_id: '',
     room_id: oldRoomId,
     sender: userId,
     type: 'm.room.tombstone',
@@ -2764,7 +2813,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
     prev_events: oldPrevEvent ? [oldPrevEvent.event_id] : [],
   };
 
-  await storeEvent(db, tombstoneEvent);
+  const tombstoneEventId = await prepareAndStoreLocalEvent(c.env, oldRoomId, tombstoneEvent);
 
   // Update old room's power levels to restrict posting
   // Elevate events_default to prevent casual messaging
@@ -2781,9 +2830,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   newPowerLevels.events_default = 100;
   newPowerLevels.invite = 100;
 
-  const restrictEventId = await generateEventId(serverName);
   const restrictEvent: PDU = {
-    event_id: restrictEventId,
+    event_id: '',
     room_id: oldRoomId,
     sender: userId,
     type: 'm.room.power_levels',
@@ -2795,7 +2843,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
     prev_events: [tombstoneEventId],
   };
 
-  await storeEvent(db, restrictEvent);
+  await prepareAndStoreLocalEvent(c.env, oldRoomId, restrictEvent);
 
   // Migrate local room aliases to point to new room
   const aliases = await db.prepare(`
