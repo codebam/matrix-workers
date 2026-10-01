@@ -3048,6 +3048,104 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
     }
   });
 
+  it('make_join v12: derivation never adds state_key to non-state events (no phantom IDs)', async () => {
+    const restore = installNodeEd25519Shim();
+    try {
+      const kp = await generateSigningKeyPair();
+      getServerSigningKey.mockResolvedValue({
+        keyId: kp.keyId,
+        privateKeyJwk: kp.privateKeyJwk,
+      });
+
+      const db = v12Room();
+      // Newest event: a plain message, no state_key. A derivation that adds
+      // `state_key: undefined` to it produces `"state_key":null` in the
+      // canonical JSON (canonicalJson maps undefined to null) and therefore a
+      // reference hash different from the bytes we serve and store -- a
+      // phantom ID that then cascades into every event referencing it.
+      const msg = makeEvent({
+        event_id: '$msg:example.com',
+        event_type: 'm.room.message',
+        sender: LOCAL_USER,
+        state_key: null,
+        content: JSON.stringify({ msgtype: 'm.text', body: 'hi' }),
+        depth: 6,
+        origin_server_ts: 1_700_000_000_001,
+        auth_events: JSON.stringify(['$pl:example.com', '$member:example.com']),
+        prev_events: JSON.stringify(['$member:example.com']),
+      });
+      db.events.set(msg.event_id, msg);
+      const env = makeEnv(db);
+      const { status, body } = await req(
+        'GET',
+        `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+        env
+      );
+      expect(status).toBe(200);
+      const b = body as { event: { prev_events: string[] } };
+      expect(b.event.prev_events).toHaveLength(1);
+
+      // Reconstruct the message's derived form exactly as the serve-time
+      // derivation does (translate refs to derived IDs, attach the content
+      // hash) and compute both candidate reference hashes.
+      const preparedPl = await prepareOutboundPdu(env, {
+        event_id: '$pl:example.com',
+        room_id: ROOM,
+        sender: LOCAL_USER,
+        type: 'm.room.power_levels',
+        state_key: '',
+        content: { users: { [LOCAL_USER]: 100 } },
+        origin_server_ts: 1_700_000_000_000,
+        depth: 3,
+        auth_events: [],
+        prev_events: [],
+      });
+      const preparedJr = await prepareOutboundPdu(env, {
+        event_id: '$jr:example.com',
+        room_id: ROOM,
+        sender: LOCAL_USER,
+        type: 'm.room.join_rules',
+        state_key: '',
+        content: { join_rule: 'public' },
+        origin_server_ts: 1_700_000_000_000,
+        depth: 2,
+        auth_events: [],
+        prev_events: [],
+      });
+      const preparedMember = await prepareOutboundPdu(env, {
+        event_id: '$member:example.com',
+        room_id: ROOM,
+        sender: LOCAL_USER,
+        type: 'm.room.member',
+        state_key: LOCAL_USER,
+        content: { membership: 'join' },
+        origin_server_ts: 1_700_000_000_000,
+        depth: 5,
+        auth_events: [preparedJr!.wireId, preparedPl!.wireId],
+        prev_events: [],
+      });
+      expect(preparedPl && preparedJr && preparedMember).toBeTruthy();
+
+      const baseForm: Record<string, unknown> = {
+        room_id: ROOM,
+        sender: LOCAL_USER,
+        type: 'm.room.message',
+        content: { msgtype: 'm.text', body: 'hi' },
+        origin_server_ts: 1_700_000_000_001,
+        depth: 6,
+        auth_events: [preparedPl!.wireId, preparedMember!.wireId],
+        prev_events: [preparedMember!.wireId],
+      };
+      const hashes = { sha256: await calculateContentHash(baseForm) };
+      const correct = await computeWireEventId({ ...baseForm, hashes });
+      const phantom = await computeWireEventId({ ...baseForm, state_key: undefined, hashes });
+      expect(correct).not.toBe(phantom);
+      expect(b.event.prev_events[0]).toBe(correct);
+    } finally {
+      restore();
+    }
+  });
+
   it('make_join v12: template auth_events include the invitee membership when invited', async () => {
     const restore = installNodeEd25519Shim();
     try {

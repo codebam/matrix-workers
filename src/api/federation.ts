@@ -1528,7 +1528,6 @@ async function deriveRoomWireEvents(
       room_id: row.room_id,
       sender: row.sender,
       type: row.event_type,
-      state_key: row.state_key ?? undefined,
       content: JSON.parse(row.content),
       origin_server_ts: row.origin_server_ts,
       depth: row.depth,
@@ -1537,6 +1536,14 @@ async function deriveRoomWireEvents(
       hashes: row.hashes ? JSON.parse(row.hashes) : undefined,
       signatures: row.signatures ? JSON.parse(row.signatures) : undefined,
     };
+    // `state_key` exists only on state events. Adding the key with an
+    // undefined value for other events would survive into the canonical JSON
+    // as `"state_key":null` (canonicalJson maps undefined to null), giving
+    // the event a different reference hash than the bytes we serve and store
+    // -- a phantom ID that cascades into every event referencing it.
+    if (row.state_key !== null && row.state_key !== undefined) {
+      event.state_key = row.state_key;
+    }
     // MSC4291: the create event is implicit, never listed.
     if (createEventId) {
       event.auth_events = event.auth_events.filter((id) => id !== createEventId);
