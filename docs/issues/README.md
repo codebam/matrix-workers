@@ -4,18 +4,17 @@
 
 Comprehensive issue documentation from that audit. Each issue document contains a detailed problem narrative, per-finding breakdowns with file/line references, step-by-step remediation plans, and ideal resolution criteria.
 
-**Last updated:** 2026-08-16 (status table aligned to landed PRs on `main`)
+**Last updated:** 2026-11-16 (re-audit of the 005/007/010 remainders against the current tree; all ten issues now closed)
 
 ---
 
 ## Resolution Status
 
-Of the 64 original findings, **most have landed on `main`**. Counts below reflect code that shipped (not the over-claims in some PR bodies). Line-level verification of every sub-finding is out of scope for this docs pass.
+All **64 original findings** have landed on `main`. The 2026-11-16 re-audit read the current tree for every finding previously listed as residual (005.6, 005.10, 007.3, 007.6, 010.6) and found each already fixed — see the re-audit section below for file-level evidence. Earlier items remain as recorded by the landed-PR pass.
 
-| Status | Count (approx.) |
-|--------|-----------------|
-| Done (issue closed by landed PRs) | 7 issues (001–004, 006, 008–009) |
-| Mostly done (key sub-findings on `main`) | 3 issues (005, 007, 010) |
+| Status | Count |
+|--------|-------|
+| Done (issue closed by landed work) | 10 issues (001–010) |
 
 ---
 
@@ -27,12 +26,12 @@ Of the 64 original findings, **most have landed on `main`**. Counts below reflec
 | [002](./002-authentication-session-security.md) | Authentication & Session Security | **Critical/High** | 8 | 8 | **Done** |
 | [003](./003-media-upload-download-security.md) | Media Upload & Download Security | **High** | 5 | 5 | **Done** |
 | [004](./004-database-integrity-and-transaction-safety.md) | Database Integrity & Transaction Safety | **Critical/High** | 6 | 6 | **Done** (PR #8) |
-| [005](./005-durable-object-lifecycle-memory-management.md) | Durable Object Lifecycle & Memory | **High** | 10 | 8+ | Mostly done — **005.1** & **005.7** on `main` (PR #11); earlier commits covered more |
+| [005](./005-durable-object-lifecycle-memory-management.md) | Durable Object Lifecycle & Memory | **High** | 10 | 10 | **Done** — re-audit 2026-11-16: 005.6 send failures already isolated, 005.10 outbound workflow fetches all timed |
 | [006](./006-federation-event-validation-state-resolution.md) | Federation Event Validation | **High** | 8 | 8 | **Done** (PR #9) |
-| [007](./007-rate-limiting-dos-protection.md) | Rate Limiting & DoS Protection | **High** | 7 | 6 | Mostly done — **007.1** on `main` (PR #11); earlier commits covered more |
+| [007](./007-rate-limiting-dos-protection.md) | Rate Limiting & DoS Protection | **High** | 7 | 7 | **Done** — re-audit 2026-11-16: 007.3 D1-backed reset limit, 007.6 5-minute TTL + SSRF/delegation validation |
 | [008](./008-rtc-webrtc-authentication-gap.md) | RTC/WebRTC Auth Gap | **Critical** | 3 | 3 | **Done** |
 | [009](./009-room-operations-race-conditions.md) | Room Operations Race Conditions | **High** | 5 | 5 | **Done** — PR #10 + `migrations/018_room_memberships_unique.sql` |
-| [010](./010-error-handling-information-leakage.md) | Error Handling & Information Leakage | **Medium** | 6 | 5 | Mostly done — **010.5** admin audit trail on `main` (PR #11) |
+| [010](./010-error-handling-information-leakage.md) | Error Handling & Information Leakage | **Medium** | 6 | 6 | **Done** — re-audit 2026-11-16: 010.6 no-store + hashed KV + single-use + audit trail |
 
 ---
 
@@ -92,6 +91,20 @@ Of the 64 original findings, **most have landed on `main`**. Counts below reflec
 
 ---
 
-## Remaining Work
+## Re-audit (2026-11-16)
 
-Issue **009 is done** on `main` (PR #10 + migration 018). Residual open work is mostly medium/low leftovers under **005**, **007**, and **010** (for example identity-reset rate limits, well-known cache TTL hardening, and admin QR login token handling) — re-audit against current line numbers before picking them up. Do not treat PR body “N/N Done” claims as a substitute for reading the tree.
+The findings previously listed as residual were read against the current tree (post federation-v12 work). All are already fixed; the August status table under-claimed what had landed.
+
+- **005.6** (broadcast failures) — `src/durable-objects/call-room.ts`: `send()` wraps `ws.send()` in try/catch, so one dead socket cannot abort the `broadcast()` loop. The reported failure mode is impossible in the current code.
+- **005.10** (workflow fetch timeouts) — every outbound workflow fetch carries `AbortSignal.timeout()`: `FederationCatchupWorkflow.ts` (10 s version probe, 30 s catchup), `PushNotificationWorkflow.ts` (10 s push). `RoomJoinWorkflow.ts`'s only fetch is an internal Durable Object stub, which has no remote-hang exposure.
+- **007.3** (identity reset limiting) — `src/api/oidc-auth.ts`: D1-backed per-user cap of 3 cross-signing resets per hour (`IDENTITY_RESET_LIMIT`), reading the `device_key_changes` audit rows the handler writes; the shared RateLimit DO cannot hold hourly windows, hence D1.
+- **007.6** (well-known amplification) — `src/services/server-discovery.ts`: edge `cacheTtl` reduced to 300 s, SSRF validation on both the well-known URL and the delegated target. The 5-minute cache also bounds lookup frequency per domain.
+- **010.6** (QR login token exposure) — `src/api/admin.ts`: `Cache-Control: no-store`, token stored hashed in KV with TTL, issuance recorded in the admin audit log; `src/api/login.ts` deletes the token on first use (single-use). Returning the raw token at issuance is inherent to rendering the QR in the admin UI.
+
+## Optional hardening (not open audit findings)
+
+Ideas from the issue docs that go beyond the reported findings, for future consideration:
+
+- **007.6**: extend the well-known TTL only after a delegation proves stable across lookups; probe that the delegated target answers as a Matrix server before trusting it.
+- **005.6**: evict participants whose sends keep failing (failures are already isolated and logged).
+- **010.6**: replace the raw-token issuance response with a short-lived reference ID exchanged server-side (larger admin-UI change; current mitigations already cover proxy/CDN caching and replay).
