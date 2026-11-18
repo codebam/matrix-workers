@@ -1,13 +1,14 @@
 // Matrix room endpoints
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppEnv, Env, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias } from '../utils/ids';
+import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias, generateOpaqueId } from '../utils/ids';
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
-import { calculateContentHash, signJson } from '../utils/crypto';
+import { calculateContentHash, signJson, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, computeWireEventId, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
 import { getServerSigningKey } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
@@ -28,6 +29,7 @@ import {
   getRoomByAlias,
   deleteRoomAlias,
   getEvent,
+  getUserById,
   notifyUsersOfEvent,
   validateEventSize,
 } from '../services/database';
@@ -1622,6 +1624,118 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
 });
 
 // POST /_matrix/client/v3/rooms/:roomId/invite - Invite a user
+// Resolve a 3PID (email/msisdn) to an MXID: local account bindings first,
+// then the built-in identity associations, then — when the client supplied
+// id_server/id_access_token — a v2 identity-server lookup. Returns null when
+// the 3PID is not bound anywhere, in which case the invite is stored as an
+// m.room.third_party_invite state event for later redemption.
+async function resolve3Pid(
+  env: Env,
+  medium: string,
+  address: string,
+  idServer?: string,
+  idAccessToken?: string
+): Promise<string | null> {
+  const bound = await env.DB.prepare(
+    `SELECT user_id FROM user_threepids WHERE medium = ? AND address = ?`
+  ).bind(medium, address).first<{ user_id: string }>();
+  if (bound) return bound.user_id;
+
+  const assoc = await env.DB.prepare(
+    `SELECT mxid FROM identity_associations WHERE medium = ? AND address = ?`
+  ).bind(medium, address).first<{ mxid: string }>();
+  if (assoc) return assoc.mxid;
+
+  if (idServer && idAccessToken && idServer !== env.SERVER_NAME) {
+    try {
+      const base = `https://${idServer}/_matrix/identity/v2`;
+      const headers = {
+        Authorization: `Bearer ${idAccessToken}`,
+        'Content-Type': 'application/json',
+      };
+      const detailsRes = await fetch(`${base}/hash_details`, {
+        headers,
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (detailsRes.ok) {
+        const details = await detailsRes.json() as { lookup_pepper: string; algorithms: string[] };
+        if (details.algorithms?.includes('sha256')) {
+          const hash = await sha256(`${address} ${medium} ${details.lookup_pepper}`);
+          const lookupRes = await fetch(`${base}/lookup`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ algorithm: 'sha256', pepper: details.lookup_pepper, addresses: [hash] }),
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (lookupRes.ok) {
+            const { mappings } = await lookupRes.json() as { mappings: Record<string, string> };
+            if (mappings?.[hash]) return mappings[hash];
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[rooms] Identity server 3PID lookup failed:', err);
+    }
+  }
+
+  return null;
+}
+
+// Store an m.room.third_party_invite state event (token as state_key) when
+// the invited 3PID has no known MXID. Federates like any other state event;
+// redemption happens via /exchange_third_party_invite once the invitee's
+// identity server signs the bind.
+async function storeThirdPartyInvite(
+  c: Context<AppEnv>,
+  roomId: string,
+  sender: string,
+  membershipEventId: string,
+  address: string
+): Promise<Response> {
+  const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
+  const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  const powerLevels = powerLevelsEvent?.content as any || {};
+  const userPower = getEffectiveUserPowerLevel(powerLevels, sender, createEvent);
+  const invitePower = powerLevels.invite ?? 50;
+  if (userPower < invitePower) {
+    return Errors.forbidden('Insufficient power level to invite').toResponse();
+  }
+
+  const room = await getRoom(c.env.DB, roomId);
+  const createIsImplicit = isMsc4291RoomVersion(String(room?.room_version ?? '10'));
+
+  const authEvents: string[] = [];
+  if (createEvent && !createIsImplicit) authEvents.push(createEvent.event_id);
+  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
+  authEvents.push(membershipEventId);
+
+  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
+
+  const token = await generateOpaqueId(32);
+  const event: PDU = {
+    event_id: '',
+    room_id: roomId,
+    sender,
+    type: 'm.room.third_party_invite',
+    state_key: token,
+    content: { display_name: address },
+    origin_server_ts: Date.now(),
+    depth: (latestEvents[0]?.depth ?? 0) + 1,
+    auth_events: authEvents,
+    prev_events: latestEvents.map(e => e.event_id),
+  };
+
+  // Optimistic concurrency, same as the MXID invite path.
+  const powerLevelsNow = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  if ((powerLevelsEvent?.event_id ?? null) !== (powerLevelsNow?.event_id ?? null)) {
+    return Errors.conflict('Power levels changed during invite; retry').toResponse();
+  }
+
+  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
+  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.third_party_invite');
+  return c.json({});
+}
+
 app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
@@ -1633,15 +1747,28 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     return Errors.badJson().toResponse();
   }
 
-  const { user_id: inviteeId } = body;
-  if (!inviteeId) {
-    return Errors.missingParam('user_id').toResponse();
-  }
-
   // Check inviter membership
   const inviterMembership = await getMembership(c.env.DB, roomId, userId);
   if (!inviterMembership || inviterMembership.membership !== 'join') {
     return Errors.forbidden('Not a member of this room').toResponse();
+  }
+
+  let inviteeId: string | undefined = body.user_id;
+
+  // inviteBy3PID: resolve medium/address to an MXID, or store a
+  // third_party_invite state event when it is not bound anywhere.
+  if (!inviteeId) {
+    if (!body.medium || !body.address) {
+      return Errors.missingParam('user_id (or medium and address)').toResponse();
+    }
+    if (body.medium !== 'email' && body.medium !== 'msisdn') {
+      return Errors.invalidParam('medium', 'medium must be "email" or "msisdn"').toResponse();
+    }
+    const resolved = await resolve3Pid(c.env, body.medium, body.address, body.id_server, body.id_access_token);
+    if (!resolved) {
+      return storeThirdPartyInvite(c, roomId, userId, inviterMembership.eventId, body.address);
+    }
+    inviteeId = resolved;
   }
 
   // Check power levels (captured at check-time; re-validated just before write
@@ -1722,6 +1849,28 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
   await federateInvite(c.env, roomId, event);
 
   return c.json({});
+});
+
+// GET /_matrix/client/unstable/uk.half-shot.msc2666/query_mutual_rooms/:userId
+// MSC2666 (advertised in /versions unstable_features): rooms that both the
+// requesting user and the target user have joined.
+app.get('/_matrix/client/unstable/uk.half-shot.msc2666/query_mutual_rooms/:userId', requireAuth(), async (c) => {
+  const requester = c.get('userId');
+  const target = c.req.param('userId');
+
+  const targetUser = await getUserById(c.env.DB, target);
+  if (!targetUser) {
+    return Errors.notFound('User not found').toResponse();
+  }
+
+  const rows = await c.env.DB.prepare(
+    `SELECT a.room_id FROM room_memberships a
+     JOIN room_memberships b ON a.room_id = b.room_id
+     WHERE a.user_id = ? AND a.membership = 'join'
+       AND b.user_id = ? AND b.membership = 'join'`
+  ).bind(requester, target).all<{ room_id: string }>();
+
+  return c.json({ joined: rows.results.map(r => r.room_id) });
 });
 
 // POST /_matrix/client/v3/rooms/:roomId/kick - Kick a user
