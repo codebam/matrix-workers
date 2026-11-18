@@ -15,7 +15,7 @@
  * tags (#196), workflows (#195), rooms-mutate (#194), aliases (#193).
  *
  * Focus: publicRooms rooms ALL→per-room FIRST TOCTOU; is_public/name/topic/
- * member-count mid-flight mutate; POST publicRooms stub flood; user_directory
+ * member-count mid-flight mutate; POST publicRooms query/filter flood; user_directory
  * FTS ALL barrier + deactivate/guest/exclude-self mid-flight; limit/limited;
  * bad JSON / empty term / method soft; thirdparty protocols + dehydrated
  * device stubs; SQL bind contracts; cross-endpoint isolation.
@@ -1306,15 +1306,24 @@ describe('race publicRooms N-way flood + failure soft after #208', () => {
   });
 });
 
-describe('publicRooms POST stub + method soft flood after #208', () => {
-  it('POST returns empty chunk stub', async () => {
+// POST /publicRooms is implemented (filter/search/pagination), so these
+// assertions check the real listing: Beta (3 members) sorts before Alpha
+// (2 members); the private Gamma room never appears.
+function expectPublicListing(body: unknown, expectedIds: string[], estimate = 2) {
+  const b = body as { chunk: Array<{ room_id: string }>; total_room_count_estimate: number };
+  expect(b.chunk.map((r) => r.room_id)).toEqual(expectedIds);
+  expect(b.total_room_count_estimate).toBe(estimate);
+}
+
+describe('publicRooms POST query/filter/pagination after #208', () => {
+  it('POST with empty filter returns the public listing sorted by member count', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const res = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { filter: {} }));
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
 
-  it('parallel POST stubs isolate from GET public listing', async () => {
+  it('parallel POST and GET return coherent public listings', async () => {
     const fx = defaultPublicFixture();
     const db = createDirectoryDb({ ...fx });
     const env = createEnv(db);
@@ -1325,9 +1334,63 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
     expect(getRes.status).toBe(200);
     expect((getRes.body as { chunk: unknown[] }).chunk).toHaveLength(2);
     expect(postRes.status).toBe(200);
-    expect(postRes.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(postRes.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-0', async () => {
+
+  it('POST generic_search_term matches name/topic case-insensitively', async () => {
+    const env = createEnv(createDirectoryDb(defaultPublicFixture()));
+    const res = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { filter: { generic_search_term: 'alph' } }));
+    expect(res.status).toBe(200);
+    expectPublicListing(res.body, [ROOM_A], 1);
+  });
+
+  it('POST room_types filter: null matches untyped rooms, m.space matches none', async () => {
+    const env = createEnv(createDirectoryDb(defaultPublicFixture()));
+    const untyped = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { filter: { room_types: [null] } }));
+    expect(untyped.status).toBe(200);
+    expectPublicListing(untyped.body, [ROOM_B, ROOM_A]);
+    const spaces = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { filter: { room_types: ['m.space'] } }));
+    expect(spaces.status).toBe(200);
+    expect(spaces.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+  });
+
+  it('POST limit paginates with next_batch/prev_batch tokens', async () => {
+    const env = createEnv(createDirectoryDb(defaultPublicFixture()));
+    const page1 = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { limit: 1 }));
+    expect(page1.status).toBe(200);
+    const b1 = page1.body as { chunk: Array<{ room_id: string }>; next_batch?: string; total_room_count_estimate: number };
+    expect(b1.chunk.map((r) => r.room_id)).toEqual([ROOM_B]);
+    expect(b1.total_room_count_estimate).toBe(2);
+    expect(typeof b1.next_batch).toBe('string');
+    const page2 = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { limit: 1, since: b1.next_batch }));
+    expect(page2.status).toBe(200);
+    const b2 = page2.body as { chunk: Array<{ room_id: string }>; next_batch?: string; prev_batch?: string };
+    expect(b2.chunk.map((r) => r.room_id)).toEqual([ROOM_A]);
+    expect(b2.next_batch).toBeUndefined();
+    expect(typeof b2.prev_batch).toBe('string');
+  });
+
+  it('POST third_party_instance_id without networks returns empty; combined with include_all_networks is 400', async () => {
+    const env = createEnv(createDirectoryDb(defaultPublicFixture()));
+    const scoped = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { third_party_instance_id: 'irc-libera' }));
+    expect(scoped.status).toBe(200);
+    expect(scoped.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    const both = await request(env, '/_matrix/client/v3/publicRooms', jsonInit('POST', { third_party_instance_id: 'irc-libera', include_all_networks: true }));
+    expect(both.status).toBe(400);
+    expect((both.body as { errcode: string }).errcode).toBe('M_INVALID_PARAM');
+  });
+
+  it('POST invalid JSON is 400 M_BAD_JSON', async () => {
+    const env = createEnv(createDirectoryDb(defaultPublicFixture()));
+    const res = await request(env, '/_matrix/client/v3/publicRooms', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...AUTH },
+      body: '{not json',
+    });
+    expect(res.status).toBe(400);
+    expect((res.body as { errcode: string }).errcode).toBe('M_BAD_JSON');
+  });
+  it('POST query soft-0', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1342,9 +1405,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[0 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-1', async () => {
+  it('POST query soft-1', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1359,9 +1422,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[1 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-2', async () => {
+  it('POST query soft-2', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1376,9 +1439,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[2 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [], 0);
   });
-  it('POST stub soft-3', async () => {
+  it('POST query soft-3', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1393,9 +1456,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[3 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-4', async () => {
+  it('POST query soft-4', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1410,9 +1473,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[4 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-5', async () => {
+  it('POST query soft-5', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1427,9 +1490,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[5 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-6', async () => {
+  it('POST query soft-6', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1444,9 +1507,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[6 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-7', async () => {
+  it('POST query soft-7', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1461,9 +1524,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[7 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [], 0);
   });
-  it('POST stub soft-8', async () => {
+  it('POST query soft-8', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1478,9 +1541,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[8 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-9', async () => {
+  it('POST query soft-9', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1495,9 +1558,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[9 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-10', async () => {
+  it('POST query soft-10', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1512,9 +1575,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[10 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-11', async () => {
+  it('POST query soft-11', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1529,9 +1592,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[11 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-12', async () => {
+  it('POST query soft-12', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1546,9 +1609,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[12 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [], 0);
   });
-  it('POST stub soft-13', async () => {
+  it('POST query soft-13', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1563,9 +1626,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[13 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-14', async () => {
+  it('POST query soft-14', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1580,9 +1643,9 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[14 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
-  it('POST stub soft-15', async () => {
+  it('POST query soft-15', async () => {
     const env = createEnv(createDirectoryDb(defaultPublicFixture()));
     const bodies = [
       {},
@@ -1597,7 +1660,7 @@ describe('publicRooms POST stub + method soft flood after #208', () => {
       jsonInit('POST', bodies[15 % 5])
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ chunk: [], total_room_count_estimate: 0 });
+    expectPublicListing(res.body, [ROOM_B, ROOM_A]);
   });
 });
 

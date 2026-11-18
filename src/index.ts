@@ -11,6 +11,7 @@ import versions from './api/versions';
 import login from './api/login';
 import rooms from './api/rooms';
 import sync from './api/sync';
+import legacySync from './api/legacy-sync';
 import slidingSync from './api/sliding-sync';
 import profile from './api/profile';
 import media from './api/media';
@@ -37,6 +38,7 @@ import report from './api/report';
 import calls from './api/calls';
 import rtc from './api/rtc';
 import appservice from './api/appservice';
+import thirdparty from './api/thirdparty';
 import identity from './api/identity';
 import dehydratedDevice from './api/dehydrated-device';
 // import qrLogin from './api/qr-login'; // QR feature commented out - requires MSC4108/OIDC for Element X
@@ -46,6 +48,7 @@ import { adminDashboardHtml } from './admin/dashboard';
 import { rateLimitMiddleware } from './middleware/rate-limit';
 import { requireAuth } from './middleware/auth';
 import { analyticsMiddleware } from './middleware/analytics';
+import { federationGet, federationPost } from './services/federation-keys';
 
 // Import Durable Objects
 export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject } from './durable-objects';
@@ -121,6 +124,7 @@ app.route('/', versions);
 app.route('/', login);
 app.route('/', rooms);
 app.route('/', sync);
+app.route('/', legacySync);
 app.route('/', slidingSync);
 app.route('/', profile);
 app.route('/', media);
@@ -189,6 +193,14 @@ app.get('/_matrix/client/v3/capabilities', (c) => {
         enabled: true,
       },
       'm.3pid_changes': {
+        enabled: true,
+      },
+      'm.get_login_token': {
+        enabled: true,
+      },
+      // Custom profile fields (Matrix v1.16+): arbitrary keys are accepted
+      // by the profile endpoints, so no allowed/disallowed restriction.
+      'm.profile_fields': {
         enabled: true,
       },
     },
@@ -262,10 +274,42 @@ app.route('/', search);
 
 // Device management now handled by devices.ts
 
-// Public rooms directory
-app.get('/_matrix/client/v3/publicRooms', async (c) => {
-  const db = c.env.DB;
+// Public rooms directory (Matrix v1.17): GET with query params, POST with
+// filter body. Both paginate via opaque offset tokens and sort by joined
+// member count (largest first), per spec.
+interface PublicRoomChunk {
+  room_id: string;
+  name?: string;
+  topic?: string;
+  num_joined_members: number;
+  world_readable: boolean;
+  guest_can_join: boolean;
+  avatar_url?: string;
+  join_rule?: string;
+  room_type?: string | null;
+  canonical_alias?: string;
+}
 
+function encodePublicRoomsToken(offset: number): string {
+  return btoa(JSON.stringify({ o: offset }))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function decodePublicRoomsToken(token: string | undefined): number {
+  if (!token) return 0;
+  try {
+    const json = atob(token.replace(/-/g, '+').replace(/_/g, '/'));
+    const offset = (JSON.parse(json) as { o?: number }).o;
+    return typeof offset === 'number' && offset > 0 ? Math.floor(offset) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function listPublicRooms(
+  db: D1Database,
+  opts: { searchTerm?: string; roomTypes?: (string | null)[] } = {}
+): Promise<PublicRoomChunk[]> {
   const rooms = await db.prepare(
     `SELECT r.room_id, r.room_version
      FROM rooms r
@@ -273,7 +317,7 @@ app.get('/_matrix/client/v3/publicRooms', async (c) => {
      LIMIT 100`
   ).all<{ room_id: string; room_version: string }>();
 
-  const publicRooms: any[] = [];
+  const publicRooms: PublicRoomChunk[] = [];
 
   for (const room of rooms.results) {
     // Get room name and topic from state
@@ -294,28 +338,205 @@ app.get('/_matrix/client/v3/publicRooms', async (c) => {
       `SELECT COUNT(*) as count FROM room_memberships WHERE room_id = ? AND membership = 'join'`
     ).bind(room.room_id).first<{ count: number }>();
 
-    publicRooms.push({
+    const name = nameEvent ? JSON.parse(nameEvent.content).name : undefined;
+    const topic = topicEvent ? JSON.parse(topicEvent.content).topic : undefined;
+
+    // Remaining directory metadata (alias, type, avatar, access rules).
+    const extraState = await db.prepare(
+      `SELECT rs.event_type, e.content FROM room_state rs
+       JOIN events e ON rs.event_id = e.event_id
+       WHERE rs.room_id = ? AND rs.event_type IN
+         ('m.room.canonical_alias', 'm.room.create', 'm.room.avatar',
+          'm.room.join_rules', 'm.room.guest_access', 'm.room.history_visibility')`
+    ).bind(room.room_id).all<{ event_type: string; content: string }>();
+
+    let canonicalAlias: string | undefined;
+    let roomType: string | null | undefined;
+    let avatarUrl: string | undefined;
+    let joinRule: string | undefined;
+    let guestCanJoin = false;
+    let worldReadable = false;
+    for (const row of extraState.results) {
+      const content = JSON.parse(row.content) as Record<string, unknown>;
+      switch (row.event_type) {
+        case 'm.room.canonical_alias':
+          canonicalAlias = typeof content.alias === 'string' ? content.alias : undefined;
+          break;
+        case 'm.room.create':
+          roomType = typeof content.type === 'string' ? content.type : null;
+          break;
+        case 'm.room.avatar':
+          avatarUrl = typeof content.url === 'string' ? content.url : undefined;
+          break;
+        case 'm.room.join_rules':
+          joinRule = typeof content.join_rule === 'string' ? content.join_rule : undefined;
+          break;
+        case 'm.room.guest_access':
+          guestCanJoin = content.guest_access === 'can_join';
+          break;
+        case 'm.room.history_visibility':
+          worldReadable = content.history_visibility === 'world_readable';
+          break;
+      }
+    }
+
+    const chunk: PublicRoomChunk = {
       room_id: room.room_id,
-      name: nameEvent ? JSON.parse(nameEvent.content).name : undefined,
-      topic: topicEvent ? JSON.parse(topicEvent.content).topic : undefined,
+      name,
+      topic,
       num_joined_members: memberCount?.count || 0,
-      world_readable: false,
-      guest_can_join: false,
-    });
+      world_readable: worldReadable,
+      guest_can_join: guestCanJoin,
+    };
+    if (avatarUrl !== undefined) chunk.avatar_url = avatarUrl;
+    if (joinRule !== undefined) chunk.join_rule = joinRule;
+    if (roomType !== undefined) chunk.room_type = roomType;
+    if (canonicalAlias !== undefined) chunk.canonical_alias = canonicalAlias;
+    publicRooms.push(chunk);
   }
 
-  return c.json({
-    chunk: publicRooms,
-    total_room_count_estimate: publicRooms.length,
-  });
+  let filtered = publicRooms;
+
+  if (opts.roomTypes) {
+    const types = opts.roomTypes;
+    filtered = filtered.filter(r =>
+      types.some(t => t === null ? r.room_type == null : r.room_type === t)
+    );
+  }
+
+  if (opts.searchTerm) {
+    const term = opts.searchTerm.toLowerCase();
+    filtered = filtered.filter(r =>
+      (r.name?.toLowerCase().includes(term)) ||
+      (r.topic?.toLowerCase().includes(term)) ||
+      (r.canonical_alias?.toLowerCase().includes(term)) ||
+      r.room_id.toLowerCase().includes(term)
+    );
+  }
+
+  // Spec: ordered by joined member count, largest first (stable for ties).
+  filtered.sort((a, b) => b.num_joined_members - a.num_joined_members);
+  return filtered;
+}
+
+function publicRoomsPage(
+  rooms: PublicRoomChunk[],
+  limit: number,
+  since: string | undefined
+): { chunk: PublicRoomChunk[]; next_batch?: string; prev_batch?: string; total_room_count_estimate: number } {
+  const offset = decodePublicRoomsToken(since);
+  const chunk = rooms.slice(offset, offset + limit);
+  const response: {
+    chunk: PublicRoomChunk[];
+    next_batch?: string;
+    prev_batch?: string;
+    total_room_count_estimate: number;
+  } = {
+    chunk,
+    total_room_count_estimate: rooms.length,
+  };
+  if (offset + limit < rooms.length) {
+    response.next_batch = encodePublicRoomsToken(offset + limit);
+  }
+  if (offset > 0) {
+    response.prev_batch = encodePublicRoomsToken(Math.max(0, offset - limit));
+  }
+  return response;
+}
+
+function parsePublicRoomsLimit(raw: string | number | undefined): number {
+  const n = typeof raw === 'number' ? raw : parseInt(raw || '100', 10);
+  if (!Number.isFinite(n) || n <= 0) return 100;
+  return Math.min(Math.floor(n), 100);
+}
+
+app.get('/_matrix/client/v3/publicRooms', async (c) => {
+  const server = c.req.query('server');
+  const limit = parsePublicRoomsLimit(c.req.query('limit'));
+  const since = c.req.query('since');
+
+  // Remote directory: proxy the query over federation.
+  if (server && server !== c.env.SERVER_NAME) {
+    try {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (since) params.set('since', since);
+      const res = await federationGet(
+        server,
+        `/_matrix/federation/v1/publicRooms?${params.toString()}`,
+        c.env.SERVER_NAME,
+        c.env.DB,
+        c.env.CACHE
+      );
+      return new Response(await res.text(), {
+        status: res.status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (err) {
+      console.error('[publicRooms] Remote directory query failed:', err);
+      return c.json({ errcode: 'M_UNKNOWN', error: 'Failed to query remote public rooms' }, 502);
+    }
+  }
+
+  const rooms = await listPublicRooms(c.env.DB);
+  return c.json(publicRoomsPage(rooms, limit, since));
 });
 
 app.post('/_matrix/client/v3/publicRooms', async (c) => {
-  // Same as GET but with search/filter support
-  return c.json({
-    chunk: [],
-    total_room_count_estimate: 0,
+  let body: {
+    limit?: number;
+    since?: string;
+    filter?: { generic_search_term?: string; room_types?: (string | null)[] };
+    include_all_networks?: boolean;
+    third_party_instance_id?: string;
+  } = {};
+  try {
+    const parsed = await c.req.json();
+    if (parsed && typeof parsed === 'object') body = parsed;
+  } catch {
+    return c.json({ errcode: 'M_BAD_JSON', error: 'Invalid JSON' }, 400);
+  }
+
+  if (body.include_all_networks && body.third_party_instance_id) {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'include_all_networks and third_party_instance_id are mutually exclusive',
+    }, 400);
+  }
+
+  const server = c.req.query('server');
+  const limit = parsePublicRoomsLimit(body.limit);
+
+  if (server && server !== c.env.SERVER_NAME) {
+    try {
+      const res = await federationPost(
+        server,
+        '/_matrix/federation/v1/publicRooms',
+        body,
+        c.env.SERVER_NAME,
+        c.env.DB,
+        c.env.CACHE
+      );
+      return new Response(await res.text(), {
+        status: res.status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (err) {
+      console.error('[publicRooms] Remote directory query failed:', err);
+      return c.json({ errcode: 'M_UNKNOWN', error: 'Failed to query remote public rooms' }, 502);
+    }
+  }
+
+  // No application-service networks are configured, so a request scoped to
+  // a specific third-party instance has no rooms to return.
+  if (body.third_party_instance_id && !body.include_all_networks) {
+    return c.json({ chunk: [], total_room_count_estimate: 0 });
+  }
+
+  const rooms = await listPublicRooms(c.env.DB, {
+    searchTerm: body.filter?.generic_search_term,
+    roomTypes: body.filter?.room_types,
   });
+  return c.json(publicRoomsPage(rooms, limit, body.since));
 });
 
 // User directory search (requires authentication per Matrix spec)
@@ -384,6 +605,9 @@ app.post('/_matrix/client/v3/user_directory/search', requireAuth(), async (c) =>
 app.get('/_matrix/client/v3/thirdparty/protocols', async (c) => {
   return c.json({});
 });
+
+// Third-party protocol/user/location lookups (404 while no bridges exist)
+app.route('/', thirdparty);
 
 // Dehydrated device (MSC3814) routes live in ./api/dehydrated-device
 

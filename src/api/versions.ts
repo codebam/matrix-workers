@@ -150,8 +150,16 @@ app.get('/_matrix/client/versions', (c) => {
       'v1.10',
       'v1.11',
       'v1.12',
+      'v1.13',
+      'v1.14',
+      'v1.15',
+      'v1.16',
+      'v1.17',
     ],
     unstable_features: {
+      // Authenticated media (MSC3916) is stable since v1.17; clients probe
+      // this flag to choose the /_matrix/client/v1/media/* endpoints.
+      'org.matrix.msc3916.stable': true,
       'org.matrix.label_based_filtering': true,
       'org.matrix.e2e_cross_signing': true,
       'org.matrix.msc2432': true,

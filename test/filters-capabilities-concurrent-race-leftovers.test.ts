@@ -1598,6 +1598,8 @@ describe('race capabilities exhaustive key bind after #214', () => {
     'm.set_displayname',
     'm.set_avatar_url',
     'm.3pid_changes',
+    'm.get_login_token',
+    'm.profile_fields',
   ] as const;
 
   for (let i = 0; i < 12; i++) {
@@ -2293,6 +2295,8 @@ describe('race capabilities HEAD + key-set bind after #241', () => {
     'm.set_displayname',
     'm.set_avatar_url',
     'm.3pid_changes',
+    'm.get_login_token',
+    'm.profile_fields',
   ].sort();
 
   for (let i = 0; i < 12; i++) {

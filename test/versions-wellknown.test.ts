@@ -223,7 +223,7 @@ describe('versions module /.well-known/matrix/support', () => {
 });
 
 describe('versions module /_matrix/client/versions', () => {
-  it('returns the full CS API versions list ending in v1.12', async () => {
+  it('returns the full CS API versions list ending in v1.17', async () => {
     const { status, body } = await getJson('/_matrix/client/versions');
     expect(status).toBe(200);
     expect(body.versions).toEqual([
@@ -247,7 +247,18 @@ describe('versions module /_matrix/client/versions', () => {
       'v1.10',
       'v1.11',
       'v1.12',
+      'v1.13',
+      'v1.14',
+      'v1.15',
+      'v1.16',
+      'v1.17',
     ]);
+  });
+
+  it('advertises authenticated media (MSC3916) support', async () => {
+    const { body } = await getJson('/_matrix/client/versions');
+    const f = body.unstable_features as Record<string, boolean>;
+    expect(f['org.matrix.msc3916.stable']).toBe(true);
   });
 
   it('pins sliding-sync / MatrixRTC / E2EE unstable_features flags', async () => {
@@ -392,6 +403,7 @@ describe('versions TOKENMAXX HEAVY after #83 — discovery leftovers', () => {
         'org.matrix.msc3827.stable',
         'org.matrix.msc3881',
         'org.matrix.msc3882',
+        'org.matrix.msc3916.stable',
         'org.matrix.msc4143',
         'org.matrix.simplified_msc3575',
         'uk.half-shot.msc2666.query_mutual_rooms',
