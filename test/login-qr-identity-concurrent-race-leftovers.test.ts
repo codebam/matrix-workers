@@ -522,8 +522,10 @@ function createIdentityDb(opts: {
               events.push(`db:run:${sql.slice(0, 60)}`);
               if (sql.includes('INSERT INTO email_verification_sessions')) {
                 inserts.push({ sql, args });
-                const [sessionId, email, clientSecret, token, sendAttempt, createdAt, expiresAt] =
-                  args as [string, string, string, string, number, number, number];
+                // createVerificationSession column order:
+                // (session_id, email, user_id, client_secret, token, send_attempt, validated, created_at, expires_at)
+                const [sessionId, email, _userId, clientSecret, token, sendAttempt, createdAt, expiresAt] =
+                  args as [string, string, string | null, string, string, number, number, number];
                 emailSessions.set(sessionId, {
                   session_id: sessionId,
                   email,
@@ -535,6 +537,9 @@ function createIdentityDb(opts: {
                   expires_at: expiresAt,
                   validated_at: null,
                 });
+              }
+              if (sql.includes('DELETE FROM email_verification_sessions')) {
+                emailSessions.delete(args[0] as string);
               }
               if (sql.includes('UPDATE email_verification_sessions SET validated = 1')) {
                 updates.push({ sql, args });
@@ -565,6 +570,9 @@ function idEnv(opts: {
     SERVER_NAME: SERVER,
     CACHE: cache,
     DB: db as unknown as D1Database,
+    EMAIL: {
+      send: async () => ({ messageId: 'msg-1' }),
+    },
     _cache: cache,
     _db: db,
   } as unknown as Env & { _cache: ReturnType<typeof mockKv>; _db: ReturnType<typeof createIdentityDb> };

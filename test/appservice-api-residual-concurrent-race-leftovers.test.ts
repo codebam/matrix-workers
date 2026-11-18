@@ -20,10 +20,12 @@ import type { Env } from '../src/types';
 import type { AppServiceRegistration } from '../src/services/appservice';
 
 const getAppServiceByToken = vi.fn();
+const getAppServiceByHsToken = vi.fn();
 const getUserById = vi.fn();
 
 vi.mock('../src/services/appservice', () => ({
   getAppServiceByToken: (...args: unknown[]) => getAppServiceByToken(...args),
+  getAppServiceByHsToken: (...args: unknown[]) => getAppServiceByHsToken(...args),
 }));
 
 vi.mock('../src/services/database', () => ({
@@ -148,6 +150,8 @@ function statusesOf(results: Array<{ status: number }>): number[] {
 
 beforeEach(() => {
   getAppServiceByToken.mockReset();
+  getAppServiceByHsToken.mockReset();
+  getAppServiceByHsToken.mockResolvedValue(null);
   getUserById.mockReset();
   vi.spyOn(console, 'log').mockImplementation(() => {});
   vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -294,9 +298,9 @@ describe('race residual appservice room-id-as-alias path after #236', () => {
 // Residual: missing ping endpoint + thirdparty control
 // ---------------------------------------------------------------------------
 
-describe('race residual appservice missing ping after #236', () => {
+describe('race residual appservice ping hs_token auth after #236', () => {
   for (let i = 0; i < 10; i++) {
-    it(`ping GET/POST 404∥thirdparty 200 flood-${i}`, async () => {
+    it(`ping GET 404 / POST as_token 403∥thirdparty 200 flood-${i}`, async () => {
       authOk();
       const results = await Promise.all([
         request(`/_matrix/app/v1/ping`, bearer(AS_TOKEN)),
@@ -312,7 +316,9 @@ describe('race residual appservice missing ping after #236', () => {
         request(`/_matrix/app/v1/thirdparty/protocol`, bearer(AS_TOKEN)),
       ]);
       expect([404, 405]).toContain(results[0].status);
-      expect([404, 405]).toContain(results[1].status);
+      // POST ping exists and authenticates with the hs_token; the as_token
+      // is not the hs_token, so it answers 403.
+      expect(results[1].status).toBe(403);
       expect(results[2].status).toBe(200);
       expect(results[2].body).toEqual({
         user_fields: [],

@@ -12,6 +12,7 @@ import { calculateContentHash, signJson, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, computeWireEventId, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
 import { getServerSigningKey } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
+import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import {
   createRoom,
   getRoom,
@@ -1351,6 +1352,7 @@ async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): 
     event.event_id = await generateEventId(env.SERVER_NAME, roomVersion);
   }
   await storeEvent(env.DB, event);
+  await fanoutEventToAppServices(env, event);
   return event.event_id;
 }
 
@@ -1591,6 +1593,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   }
 
   await storeEvent(c.env.DB, event);
+  await fanoutEventToAppServices(c.env, event);
 
   // Notify all room members that a new message was sent (wakes up long-polling syncs)
   await notifyUsersOfEvent(c.env, roomId, event.event_id, eventType);

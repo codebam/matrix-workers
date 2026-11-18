@@ -15,6 +15,7 @@ import {
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth, expectedAuthTypes } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync } from '../services/database';
+import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { prepareOutboundPdu } from './rooms';
 import { resolveState } from '../services/state-resolution';
@@ -842,6 +843,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             for (const member of localMembers.results ?? []) {
               await notifyUserSync(c.env, member.user_id, 'events');
             }
+            await fanoutEventToAppServices(c.env, { ...pdu, event_id: eventId } as PDU);
           }
         } catch (e) {
           console.error(`Failed to store event ${eventId}:`, e);
@@ -1696,6 +1698,7 @@ async function persistInboundJoin(
   const event = joinEvent as unknown as PDU;
   await storeEvent(env.DB, event);
   await updateMembership(env.DB, roomId, event.state_key as string, 'join', wireId);
+  await fanoutEventToAppServices(env, event);
 
   // Wake local members' sync loops so the new member shows up promptly.
   const localMembers = await env.DB.prepare(
@@ -2304,7 +2307,7 @@ async function storeInboundInvite(
 
     // Store the invite event itself and the invitee's membership row --
     // this is what makes the room appear in the user's /sync as an invite.
-    await storeEventIdempotent(env.DB, {
+    const invitePdu: PDU = {
       event_id: inviteEventId,
       room_id: roomId,
       sender,
@@ -2318,9 +2321,13 @@ async function storeInboundInvite(
       prev_events: Array.isArray(inviteEvent.prev_events) ? inviteEvent.prev_events : [],
       hashes: inviteEvent.hashes,
       signatures: inviteEvent.signatures,
-    });
+    };
+    const { inserted } = await storeEventIdempotent(env.DB, invitePdu);
 
     await updateMembership(env.DB, roomId, invitee, 'invite', inviteEventId);
+    if (inserted) {
+      await fanoutEventToAppServices(env, invitePdu);
+    }
 
     // Wake the invitee's long-polling sync so the invite appears immediately.
     await notifyUserSync(env, invitee, 'events');

@@ -113,15 +113,18 @@ function createIdentityDb(opts: {
             async run() {
               if (sql.includes('INSERT INTO email_verification_sessions')) {
                 inserts.push({ sql, args });
+                // createVerificationSession column order:
+                // (session_id, email, user_id, client_secret, token, send_attempt, validated, created_at, expires_at)
                 const [
                   sessionId,
                   email,
+                  _userId,
                   clientSecret,
                   token,
                   sendAttempt,
                   createdAt,
                   expiresAt,
-                ] = args as [string, string, string, string, number, number, number];
+                ] = args as [string, string, string | null, string, string, number, number, number];
                 emailSessions.set(sessionId, {
                   session_id: sessionId,
                   email,
@@ -133,6 +136,9 @@ function createIdentityDb(opts: {
                   expires_at: expiresAt,
                   validated_at: null,
                 });
+              }
+              if (sql.includes('DELETE FROM email_verification_sessions')) {
+                emailSessions.delete(args[0] as string);
               }
               if (sql.includes('UPDATE email_verification_sessions SET validated = 1')) {
                 updates.push({ sql, args });
@@ -169,7 +175,10 @@ function makeEnv(opts: {
     SERVER_NAME: opts.serverName ?? SERVER_NAME,
     CACHE: opts.cache ?? mockKv(),
     DB: opts.db ?? createIdentityDb(),
-  } as Env;
+    EMAIL: {
+      send: async () => ({ messageId: 'msg-1' }),
+    },
+  } as unknown as Env;
 }
 
 async function jsonRequest(
@@ -817,16 +826,16 @@ describe('identity leftovers POST /validate/email/requestToken — param failure
     });
   });
 
-  it('send_attempt omitted still inserts (undefined bound)', async () => {
+  it('send_attempt omitted is rejected (required by spec)', async () => {
     const db = createIdentityDb();
     const { status, body } = await jsonRequest(
       `${BASE}/validate/email/requestToken`,
       postJson({ email: 'a@example.com', client_secret: 'sec' }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
-    expect(db.inserts[0].args[4]).toBeUndefined();
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.inserts).toHaveLength(0);
   });
 
   it('next_link is ignored (not stored)', async () => {
@@ -841,7 +850,7 @@ describe('identity leftovers POST /validate/email/requestToken — param failure
       }),
       makeEnv({ db })
     );
-    expect(db.inserts[0].args).toHaveLength(7);
+    expect(db.inserts[0].args).toHaveLength(8);
     expect(db.inserts[0].args).not.toContain('https://example.com/next');
   });
 });
@@ -861,18 +870,25 @@ describe('identity leftovers POST /validate/email/requestToken — token math fl
   ];
 
   for (let i = 0; i < randoms.length; i++) {
-    it(`token from Math.random=${randoms[i]} → six-digit string (flood-${i})`, async () => {
-      vi.spyOn(Math, 'random').mockReturnValue(randoms[i]);
+    it(`token from crypto counter=${randoms[i]} → six-digit string (flood-${i})`, async () => {
+      const counter = Math.floor(randoms[i] * 900000);
+      vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: ArrayBufferView) => {
+        if (arr instanceof Uint32Array) {
+          arr[0] = counter;
+          return arr;
+        }
+        new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(i + 1);
+        return arr;
+      });
       const db = createIdentityDb();
       await jsonRequest(
         `${BASE}/validate/email/requestToken`,
         postJson({ email: `u${i}@example.com`, client_secret: `sec-${i}`, send_attempt: i }),
         makeEnv({ db })
       );
-      const token = String(db.inserts[0].args[3]);
+      const token = String(db.inserts[0].args[4]);
       expect(token).toMatch(/^\d{6}$/);
-      const expected = Math.floor(100000 + randoms[i] * 900000).toString();
-      expect(token).toBe(expected);
+      expect(token).toBe(((counter % 900000) + 100000).toString());
     });
   }
 
@@ -883,17 +899,24 @@ describe('identity leftovers POST /validate/email/requestToken — token math fl
       postJson({ email: 'exp@example.com', client_secret: 'sec', send_attempt: 1 }),
       makeEnv({ db })
     );
-    expect(db.inserts[0].args[5]).toBe(FIXED_NOW);
-    expect(db.inserts[0].args[6]).toBe(FIXED_NOW + DAY_MS);
+    expect(db.inserts[0].args[6]).toBe(FIXED_NOW);
+    expect(db.inserts[0].args[7]).toBe(FIXED_NOW + DAY_MS);
   });
 
-  it('sid uses crypto.randomUUID mock', async () => {
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue('sid-uuid-0000-1111-2222-333344445555');
+  it('sid is 32 hex chars from crypto randomness', async () => {
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: ArrayBufferView) => {
+      if (arr instanceof Uint32Array) {
+        arr[0] = 0;
+        return arr;
+      }
+      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(0xcd);
+      return arr;
+    });
     const { body } = await jsonRequest(
       `${BASE}/validate/email/requestToken`,
       postJson({ email: 's@example.com', client_secret: 'sec', send_attempt: 0 })
     );
-    expect(body.sid).toBe('sid-uuid-0000-1111-2222-333344445555');
+    expect(body.sid).toBe('cd'.repeat(16));
   });
 });
 
@@ -1096,11 +1119,17 @@ describe('identity leftovers hash_details ↔ lookup pepper passthrough flood', 
 describe('identity leftovers requestToken → submitToken reliability flood', () => {
   for (let i = 0; i < 20; i++) {
     it(`email validate lifecycle flood-${i}`, async () => {
-      const sid = `sid-flood-${i.toString().padStart(4, '0')}-0000-0000-000000000000`;
+      const sid = (i + 1).toString(16).padStart(2, '0').repeat(16);
       const secret = `secret-flood-${i}`;
       const email = `flood${i}@example.com`;
-      vi.spyOn(crypto, 'randomUUID').mockReturnValue(sid);
-      vi.spyOn(Math, 'random').mockReturnValue((i % 1000) / 1000);
+      vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: ArrayBufferView) => {
+        if (arr instanceof Uint32Array) {
+          arr[0] = (i % 1000) * 900;
+          return arr;
+        }
+        new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(i + 1);
+        return arr;
+      });
 
       const db = createIdentityDb();
       const env = makeEnv({ db });
@@ -1122,11 +1151,9 @@ describe('identity leftovers requestToken → submitToken reliability flood', ()
         postJson({ sid, client_secret: secret, token: '000000' }),
         env
       );
-      // may accidentally match if generated token is 000000 — only assert no success when mismatch
-      if (session.token !== '000000') {
-        expect(fail.body.errcode).toBe('M_INVALID_PARAM');
-        expect(db.emailSessions.get(sid)?.validated).toBe(0);
-      }
+      // generated tokens are always >= 100000, so '000000' never matches
+      expect(fail.body.errcode).toBe('M_INVALID_PARAM');
+      expect(db.emailSessions.get(sid)?.validated).toBe(0);
 
       const ok = await jsonRequest(
         `${BASE}/validate/email/submitToken`,

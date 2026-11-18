@@ -4,7 +4,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
-import { getAppServiceByToken } from '../services/appservice';
+import { getAppServiceByToken, getAppServiceByHsToken } from '../services/appservice';
 import { getUserById } from '../services/database';
 
 const app = new Hono<AppEnv>();
@@ -72,6 +72,89 @@ app.get('/_matrix/app/v1/thirdparty/user/:protocol', requireAppServiceAuth, asyn
 // GET /_matrix/app/v1/thirdparty/location/:protocol - Lookup third party locations
 app.get('/_matrix/app/v1/thirdparty/location/:protocol', requireAppServiceAuth, async (c) => {
   return c.json([]);
+});
+
+// POST /_matrix/app/v1/ping - HS → AS liveness probe (Matrix v1.7+).
+// Authenticated with the registration's hs_token; answers 200 {} so the
+// homeserver can measure the round trip.
+app.post('/_matrix/app/v1/ping', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : c.req.query('access_token');
+  if (!token) {
+    return Errors.missingToken('Missing hs_token').toResponse();
+  }
+  const as = await getAppServiceByHsToken(c.env.DB, token);
+  if (!as) {
+    return Errors.forbidden('Invalid hs_token').toResponse();
+  }
+  return c.json({});
+});
+
+// POST /_matrix/client/v1/appservice/:appserviceId/ping - AS → HS request to
+// ping its own registration (Matrix v1.7+). The HS probes the AS's
+// /_matrix/app/v1/ping with the hs_token and reports the round-trip duration.
+app.post('/_matrix/client/v1/appservice/:appserviceId/ping', async (c) => {
+  const authHeader = c.req.header('Authorization');
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : c.req.query('access_token');
+  const as = token ? await getAppServiceByToken(c.env.DB, token) : null;
+  if (!as || as.id !== c.req.param('appserviceId')) {
+    return c.json({
+      errcode: 'M_FORBIDDEN',
+      error: "Provided access token is not the appservice's as_token",
+    }, 403);
+  }
+  if (!as.url) {
+    return c.json({
+      errcode: 'M_URL_NOT_SET',
+      error: "Application service doesn't have a URL configured",
+    }, 400);
+  }
+
+  let body: { transaction_id?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const started = Date.now();
+  try {
+    const res = await fetch(`${as.url}/_matrix/app/v1/ping`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${as.hs_token}`,
+      },
+      body: JSON.stringify({ transaction_id: body.transaction_id ?? `ping_${started}` }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      return c.json({
+        errcode: 'M_BAD_STATUS',
+        error: `Ping returned status ${res.status}`,
+        status: res.status,
+        body: text,
+      }, 502);
+    }
+    return c.json({ duration_ms: Date.now() - started });
+  } catch (err) {
+    const name = (err as Error)?.name;
+    if (name === 'TimeoutError' || name === 'AbortError') {
+      return c.json({
+        errcode: 'M_CONNECTION_TIMEOUT',
+        error: 'Connection to application service timed out',
+      }, 504);
+    }
+    return c.json({
+      errcode: 'M_CONNECTION_FAILED',
+      error: 'Connection to application service failed',
+    }, 502);
+  }
 });
 
 export default app;

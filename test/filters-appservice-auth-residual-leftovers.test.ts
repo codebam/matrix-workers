@@ -411,6 +411,7 @@ describe('appservice residual sendAppServiceTransaction fetch contract after #23
           Authorization: 'Bearer hs-bridge',
         },
         body: JSON.stringify({ events }),
+        signal: expect.any(AbortSignal),
       }
     );
     // Body is wrapped object, not a bare array

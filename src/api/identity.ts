@@ -5,6 +5,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { sha256 } from '../utils/crypto';
+import { createVerificationSession, sendVerificationEmail } from '../services/email';
 
 const app = new Hono<AppEnv>();
 
@@ -142,27 +143,31 @@ app.post('/_matrix/identity/v2/validate/email/requestToken', async (c) => {
   if (!email || !client_secret) {
     return c.json({ errcode: 'M_MISSING_PARAM', error: 'Missing email or client_secret' }, 400);
   }
+  if (send_attempt === undefined) {
+    return c.json({ errcode: 'M_MISSING_PARAM', error: 'Missing send_attempt' }, 400);
+  }
 
-  // Generate a session ID and token
-  const sessionId = crypto.randomUUID();
-  const token = Math.floor(100000 + Math.random() * 900000).toString();
+  const result = await createVerificationSession(c.env.DB, email, client_secret, send_attempt);
+  if ('error' in result) {
+    return c.json({ errcode: 'M_THREEPID_DENIED', error: result.error }, 400);
+  }
 
-  await c.env.DB.prepare(`
-    INSERT INTO email_verification_sessions (session_id, email, client_secret, token, send_attempt, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    sessionId,
-    email,
-    client_secret,
-    token,
-    send_attempt,
-    Date.now(),
-    Date.now() + (24 * 60 * 60 * 1000)
-  ).run();
+  // A non-empty token means a fresh attempt that must be emailed; retries
+  // of the same send_attempt reuse the session without re-sending.
+  if (result.token) {
+    const emailResult = await sendVerificationEmail(c.env, email, result.token, c.env.SERVER_NAME);
+    if (!emailResult.success) {
+      await c.env.DB.prepare(`
+        DELETE FROM email_verification_sessions WHERE session_id = ?
+      `).bind(result.sessionId).run();
+      return c.json({
+        errcode: 'M_THREEPID_DENIED',
+        error: emailResult.error || 'Failed to send verification email',
+      }, 500);
+    }
+  }
 
-  // TODO: Send email via Cloudflare Email Service (requires EMAIL binding)
-
-  return c.json({ sid: sessionId });
+  return c.json({ sid: result.sessionId });
 });
 
 // POST /_matrix/identity/v2/validate/email/submitToken - Submit email validation token

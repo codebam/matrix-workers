@@ -107,8 +107,10 @@ function createIdentityDb(opts: {
             async run() {
               if (sql.includes('INSERT INTO email_verification_sessions')) {
                 inserts.push({ sql, args });
-                const [sessionId, email, clientSecret, token, sendAttempt, createdAt, expiresAt] =
-                  args as [string, string, string, string, number, number, number];
+                // createVerificationSession column order:
+                // (session_id, email, user_id, client_secret, token, send_attempt, validated, created_at, expires_at)
+                const [sessionId, email, _userId, clientSecret, token, sendAttempt, createdAt, expiresAt] =
+                  args as [string, string, string | null, string, string, number, number, number];
                 emailSessions.set(sessionId, {
                   session_id: sessionId,
                   email,
@@ -120,6 +122,9 @@ function createIdentityDb(opts: {
                   expires_at: expiresAt,
                   validated_at: null,
                 });
+              }
+              if (sql.includes('DELETE FROM email_verification_sessions')) {
+                emailSessions.delete(args[0] as string);
               }
               if (sql.includes('UPDATE email_verification_sessions SET validated = 1')) {
                 updates.push({ sql, args });
@@ -156,7 +161,10 @@ function makeEnv(opts: {
     SERVER_NAME: opts.serverName ?? SERVER_NAME,
     CACHE: opts.cache ?? mockKv(),
     DB: opts.db ?? createIdentityDb(),
-  } as Env;
+    EMAIL: {
+      send: async () => ({ messageId: 'msg-1' }),
+    },
+  } as unknown as Env;
 }
 
 async function jsonRequest(

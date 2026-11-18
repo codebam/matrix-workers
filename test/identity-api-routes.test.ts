@@ -114,15 +114,18 @@ function createIdentityDb(opts: {
             async run() {
               if (sql.includes('INSERT INTO email_verification_sessions')) {
                 inserts.push({ sql, args });
+                // createVerificationSession column order:
+                // (session_id, email, user_id, client_secret, token, send_attempt, validated, created_at, expires_at)
                 const [
                   sessionId,
                   email,
+                  _userId,
                   clientSecret,
                   token,
                   sendAttempt,
                   createdAt,
                   expiresAt,
-                ] = args as [string, string, string, string, number, number, number];
+                ] = args as [string, string, string | null, string, string, number, number, number];
                 emailSessions.set(sessionId, {
                   session_id: sessionId,
                   email,
@@ -143,6 +146,9 @@ function createIdentityDb(opts: {
                   session.validated = 1;
                   session.validated_at = validatedAt;
                 }
+              }
+              if (sql.includes('DELETE FROM email_verification_sessions')) {
+                emailSessions.delete(args[0] as string);
               }
               return { success: true, meta: { changes: 1 } };
             },
@@ -165,11 +171,19 @@ function makeEnv(opts: {
   cache?: ReturnType<typeof mockKv>;
   db?: ReturnType<typeof createIdentityDb>;
 } = {}): Env {
+  const emailSends: Array<Record<string, unknown>> = [];
   return {
     SERVER_NAME,
     CACHE: opts.cache ?? mockKv(),
     DB: opts.db ?? createIdentityDb(),
-  } as Env;
+    EMAIL: {
+      sends: emailSends,
+      send: async (msg: Record<string, unknown>) => {
+        emailSends.push(msg);
+        return { messageId: 'msg-1' };
+      },
+    },
+  } as unknown as Env;
 }
 
 async function jsonRequest(
@@ -611,7 +625,16 @@ describe('POST /_matrix/identity/v2/validate/email/requestToken', () => {
     });
   });
 
-  it('inserts email_verification_sessions row and returns sid without sending email', async () => {
+  it('creates a verification session, sends the email, and returns the sid', async () => {
+    // Deterministic randomness: session id bytes 0xab, token counter 0.
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: ArrayBufferView) => {
+      if (arr instanceof Uint32Array) {
+        arr[0] = 0;
+        return arr;
+      }
+      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(0xab);
+      return arr;
+    });
     const db = createIdentityDb();
     const env = makeEnv({ db });
 
@@ -625,48 +648,90 @@ describe('POST /_matrix/identity/v2/validate/email/requestToken', () => {
       env
     );
 
+    const sid = 'ab'.repeat(16);
     expect(status).toBe(200);
-    expect(body).toEqual({ sid: '11111111-2222-3333-4444-555555555555' });
+    expect(body).toEqual({ sid });
 
     expect(db.inserts).toHaveLength(1);
     expect(db.inserts[0].sql).toContain('INSERT INTO email_verification_sessions');
     expect(db.inserts[0].args).toEqual([
-      '11111111-2222-3333-4444-555555555555',
+      sid,
       'newuser@example.com',
+      null,
       'client-secret-abc',
-      '478000',
+      '100000',
       2,
       FIXED_NOW,
       FIXED_NOW + 24 * 60 * 60 * 1000,
     ]);
 
-    const session = db.emailSessions.get('11111111-2222-3333-4444-555555555555');
+    const session = db.emailSessions.get(sid);
     expect(session).toMatchObject({
       email: 'newuser@example.com',
       client_secret: 'client-secret-abc',
-      token: '478000',
+      token: '100000',
       send_attempt: 2,
       validated: 0,
       expires_at: FIXED_NOW + 86_400_000,
     });
+
+    const sends = (env as unknown as { EMAIL: { sends: Array<Record<string, unknown>> } }).EMAIL.sends;
+    expect(sends).toHaveLength(1);
+    expect(sends[0].to).toBe('newuser@example.com');
+    expect(String(sends[0].text)).toContain('100000');
   });
 
-  it('generates six-digit token from Math.random floor range', async () => {
-    vi.spyOn(Math, 'random').mockReturnValue(0);
+  it('generates a six-digit token from crypto randomness', async () => {
     const db = createIdentityDb();
     const env = makeEnv({ db });
+    const spy = vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: ArrayBufferView) => {
+      if (arr instanceof Uint32Array) {
+        arr[0] = 0;
+        return arr;
+      }
+      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(1);
+      return arr;
+    });
 
     await jsonRequest(
       `${BASE}/validate/email/requestToken`,
-      postJson({
-        email: 'a@example.com',
-        client_secret: 'sec',
-        send_attempt: 0,
-      }),
+      postJson({ email: 'a@example.com', client_secret: 'sec', send_attempt: 0 }),
       env
     );
+    // token is the 5th bind arg in createVerificationSession's INSERT
+    expect(db.inserts[0].args[4]).toBe('100000');
 
-    expect(db.inserts[0].args[3]).toBe('100000');
+    spy.mockImplementation((arr: ArrayBufferView) => {
+      if (arr instanceof Uint32Array) {
+        arr[0] = 899_999;
+        return arr;
+      }
+      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(2);
+      return arr;
+    });
+    await jsonRequest(
+      `${BASE}/validate/email/requestToken`,
+      postJson({ email: 'b@example.com', client_secret: 'sec2', send_attempt: 0 }),
+      env
+    );
+    expect(db.inserts[1].args[4]).toBe('999999');
+  });
+
+  it('answers 500 M_THREEPID_DENIED and cleans up when email delivery fails', async () => {
+    const db = createIdentityDb();
+    const env = makeEnv({ db });
+    (env as unknown as { EMAIL: { send: () => Promise<unknown> } }).EMAIL.send = async () => {
+      throw new Error('EMAIL binding down');
+    };
+
+    const { status, body } = await jsonRequest(
+      `${BASE}/validate/email/requestToken`,
+      postJson({ email: 'fail@example.com', client_secret: 'sec', send_attempt: 1 }),
+      env
+    );
+    expect(status).toBe(500);
+    expect(body).toMatchObject({ errcode: 'M_THREEPID_DENIED' });
+    expect(db.emailSessions.size).toBe(0);
   });
 });
 
@@ -809,9 +874,6 @@ describe('POST /_matrix/identity/v2/validate/email/submitToken', () => {
 
 describe('identity routes — cross-endpoint integration', () => {
   it('full email validation flow: requestToken then submitToken', async () => {
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue('flow-session-uuid-0001');
-    vi.spyOn(Math, 'random').mockReturnValue(0.5);
-
     const db = createIdentityDb();
     const env = makeEnv({ db });
 

@@ -1460,11 +1460,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit0@example.com`, client_secret: `cs_0` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-1', async () => {
@@ -1475,11 +1473,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit1@example.com`, client_secret: `cs_1` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-2', async () => {
@@ -1490,11 +1486,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit2@example.com`, client_secret: `cs_2` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-3', async () => {
@@ -1505,11 +1499,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit3@example.com`, client_secret: `cs_3` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-4', async () => {
@@ -1520,11 +1512,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit4@example.com`, client_secret: `cs_4` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-5', async () => {
@@ -1535,11 +1525,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit5@example.com`, client_secret: `cs_5` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-6', async () => {
@@ -1550,11 +1538,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit6@example.com`, client_secret: `cs_6` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-7', async () => {
@@ -1565,11 +1551,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit7@example.com`, client_secret: `cs_7` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-8', async () => {
@@ -1580,11 +1564,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit8@example.com`, client_secret: `cs_8` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-9', async () => {
@@ -1595,11 +1577,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit9@example.com`, client_secret: `cs_9` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-10', async () => {
@@ -1610,11 +1590,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit10@example.com`, client_secret: `cs_10` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-11', async () => {
@@ -1625,11 +1603,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit11@example.com`, client_secret: `cs_11` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-12', async () => {
@@ -1640,11 +1616,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit12@example.com`, client_secret: `cs_12` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-13', async () => {
@@ -1655,11 +1629,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit13@example.com`, client_secret: `cs_13` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 
   it('requestToken omit send_attempt soft-14', async () => {
@@ -1670,11 +1642,9 @@ describe('identity contract leftovers requestToken send_attempt undefined soft f
       postJson({ email: `omit14@example.com`, client_secret: `cs_14` }),
       makeEnv({ db })
     );
-    expect(status).toBe(200);
-    expect(body.sid).toBeTruthy();
-    const stored = [...db.emailSessions.values()][0];
-    expect(stored.send_attempt).toBeUndefined();
-    expect(stored.expires_at - stored.created_at).toBe(DAY_MS);
+    expect(status).toBe(400);
+    expect(body.errcode).toBe('M_MISSING_PARAM');
+    expect(db.emailSessions.size).toBe(0);
   });
 });
 

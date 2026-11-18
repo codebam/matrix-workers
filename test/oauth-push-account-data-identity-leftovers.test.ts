@@ -565,9 +565,12 @@ function createIdentityDb(opts: {
               if (opts.throwOnRun) throw new Error('identity run boom');
               if (sql.includes('INSERT INTO email_verification_sessions')) {
                 inserts.push({ sql, args });
-                const [sessionId, email, clientSecret, token, sendAttempt, createdAt, expiresAt] = args as [
+                // createVerificationSession column order:
+                // (session_id, email, user_id, client_secret, token, send_attempt, validated, created_at, expires_at)
+                const [sessionId, email, _userId, clientSecret, token, sendAttempt, createdAt, expiresAt] = args as [
                   string,
                   string,
+                  string | null,
                   string,
                   string,
                   number,
@@ -585,6 +588,9 @@ function createIdentityDb(opts: {
                   expires_at: expiresAt,
                   validated_at: null,
                 });
+              }
+              if (sql.includes('DELETE FROM email_verification_sessions')) {
+                emailSessions.delete(args[0] as string);
               }
               if (sql.includes('UPDATE email_verification_sessions SET validated = 1')) {
                 updates.push({ sql, args });
@@ -621,7 +627,10 @@ function makeIdentityEnv(opts: {
     SERVER_NAME: opts.serverName ?? SERVER,
     CACHE: opts.cache ?? mockKv(),
     DB: opts.db ?? createIdentityDb(),
-  } as Env;
+    EMAIL: {
+      send: async () => ({ messageId: 'msg-1' }),
+    },
+  } as unknown as Env;
 }
 
 async function identityRequest(
@@ -2096,7 +2105,8 @@ describe('oauth identity leftovers identity validate email soft TTL after #146',
       makeIdentityEnv({ db })
     );
     expect(status).toBe(200);
-    expect(body.sid).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    // sid is 32 hex chars from crypto randomness (createVerificationSession)
+    expect(body.sid).toMatch(/^[0-9a-f]{32}$/);
     const sess = db.emailSessions.get(body.sid);
     expect(sess?.expires_at).toBe(NOW + DAY_MS);
     expect(sess?.send_attempt).toBe(0);
@@ -5801,8 +5811,14 @@ describe('oauth identity leftovers identity requestToken / submitToken soft afte
   });
 
   it('requestToken soft returns sid and inserts session', async () => {
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue('11111111-2222-3333-4444-555555555555');
-    vi.spyOn(Math, 'random').mockReturnValue(0);
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: ArrayBufferView) => {
+      if (arr instanceof Uint32Array) {
+        arr[0] = 0;
+        return arr;
+      }
+      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(0x11);
+      return arr;
+    });
     const db = createIdentityDb();
     const { status, body } = await identityRequest(
       `${ID_BASE}/validate/email/requestToken`,
@@ -5810,7 +5826,7 @@ describe('oauth identity leftovers identity requestToken / submitToken soft afte
       makeIdentityEnv({ db })
     );
     expect(status).toBe(200);
-    expect(body.sid).toBe('11111111-2222-3333-4444-555555555555');
+    expect(body.sid).toBe('11'.repeat(16));
     expect(db.inserts).toHaveLength(1);
     const sess = db.emailSessions.get(body.sid);
     expect(sess?.token).toBe('100000');
@@ -9247,8 +9263,14 @@ describe('oauth identity leftovers identity soft reliability round-3 after #151'
   });
 
   it('requestToken soft success inserts session', async () => {
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee99');
-    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    vi.spyOn(crypto, 'getRandomValues').mockImplementation((arr: ArrayBufferView) => {
+      if (arr instanceof Uint32Array) {
+        arr[0] = 450000;
+        return arr;
+      }
+      new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).fill(0x99);
+      return arr;
+    });
     const db = createIdentityDb();
     const { status, body } = await identityRequest(
       `${ID_BASE}/validate/email/requestToken`,
@@ -9256,7 +9278,7 @@ describe('oauth identity leftovers identity soft reliability round-3 after #151'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(200);
-    expect(body.sid).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeee99');
+    expect(body.sid).toBe('99'.repeat(16));
     expect(db.emailSessions.get(body.sid)?.email).toBe('r3@example.com');
     expect(db.emailSessions.get(body.sid)?.send_attempt).toBe(2);
   });

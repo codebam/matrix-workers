@@ -73,6 +73,36 @@ export async function getAppServiceByToken(db: D1Database, asToken: string): Pro
   };
 }
 
+/** Find app service by HS token (used to authenticate HS → AS probes) */
+export async function getAppServiceByHsToken(db: D1Database, hsToken: string): Promise<AppServiceRegistration | null> {
+  const result = await db.prepare(
+    `SELECT id, url, as_token, hs_token, sender_localpart, rate_limited, protocols, namespaces
+     FROM appservice_registrations WHERE hs_token = ?`
+  ).bind(hsToken).first<{
+    id: string;
+    url: string;
+    as_token: string;
+    hs_token: string;
+    sender_localpart: string;
+    rate_limited: number;
+    protocols: string | null;
+    namespaces: string;
+  }>();
+
+  if (!result) return null;
+
+  return {
+    id: result.id,
+    url: result.url,
+    as_token: result.as_token,
+    hs_token: result.hs_token,
+    sender_localpart: result.sender_localpart,
+    rate_limited: result.rate_limited === 1,
+    protocols: result.protocols ? JSON.parse(result.protocols) : [],
+    namespaces: JSON.parse(result.namespaces),
+  };
+}
+
 /** Check if a user ID matches any exclusive AS namespace */
 export function isExclusiveAppServiceUser(
   appservices: AppServiceRegistration[],
@@ -169,6 +199,8 @@ export async function sendAppServiceTransaction(
         'Authorization': `Bearer ${appservice.hs_token}`,
       },
       body: JSON.stringify({ events }),
+      // A hung bridge must not hold the originating request open forever.
+      signal: AbortSignal.timeout(10_000),
     });
 
     if (response.ok) {
