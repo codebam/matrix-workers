@@ -1236,7 +1236,7 @@ describe('race account soft floods UIA/method/body/lifecycle after #208', () => 
     expect(res.status).toBe(403);
   });
 
-  it('registration token validity always false', async () => {
+  it('registration token validity is true while the token gate is off', async () => {
     const env = createEnv(createAccountRaceDb());
     const res = await request(
       env,
@@ -1244,7 +1244,7 @@ describe('race account soft floods UIA/method/body/lifecycle after #208', () => 
       authGet()
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
   for (let i = 0; i < 8; i++) {

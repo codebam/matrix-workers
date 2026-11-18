@@ -1,8 +1,11 @@
 // Matrix login/registration endpoints
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
+import { initiateIdpLogin, type IdPProvider } from './oidc-auth';
+import { createVerificationSession, sendVerificationEmail } from '../services/email';
 import { hashPassword, verifyPassword, hashToken, validatePasswordStrength } from '../utils/crypto';
 import {
   formatUserId,
@@ -28,18 +31,84 @@ import { requireAuth, extractAccessToken } from '../middleware/auth';
 const app = new Hono<AppEnv>();
 
 // GET /_matrix/client/v3/login - Get supported login flows
-app.get('/_matrix/client/v3/login', (c) => {
-  return c.json({
-    flows: [
-      {
-        type: 'm.login.password',
-      },
-      {
-        type: 'm.login.token',
-      },
-    ],
-  });
+app.get('/_matrix/client/v3/login', async (c) => {
+  const flows: Record<string, unknown>[] = [
+    {
+      type: 'm.login.password',
+    },
+    {
+      type: 'm.login.token',
+    },
+  ];
+
+  // Advertise m.login.sso when identity providers are configured, so clients
+  // render the SSO button and can pick an IdP via /login/sso/redirect/{idpId}.
+  try {
+    const idps = await c.env.DB.prepare(`
+      SELECT id, name, icon_url FROM idp_providers
+      WHERE enabled = 1 ORDER BY display_order ASC, name ASC
+    `).all<{ id: string; name: string; icon_url: string | null }>();
+    if (idps.results.length > 0) {
+      flows.push({
+        type: 'm.login.sso',
+        identity_providers: idps.results.map(p => ({
+          id: p.id,
+          name: p.name,
+          ...(p.icon_url ? { icon: p.icon_url } : {}),
+        })),
+      });
+    }
+  } catch {
+    // idp_providers absent (minimal deployment) — password/token only.
+  }
+
+  return c.json({ flows });
 });
+
+// GET /_matrix/client/v3/login/sso/redirect[/:idpId] - Spec SSO login entry.
+// Validates the client's redirectUrl, then starts the IdP OAuth flow; the
+// callback returns to redirectUrl with a one-time loginToken.
+async function handleSsoRedirect(c: Context<AppEnv>, idpId?: string): Promise<Response> {
+  const redirectUrl = c.req.query('redirectUrl');
+  if (!redirectUrl) {
+    return Errors.missingParam('redirectUrl').toResponse();
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(redirectUrl);
+  } catch {
+    return Errors.invalidParam('redirectUrl', 'redirectUrl must be an absolute URL').toResponse();
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return Errors.invalidParam('redirectUrl', 'redirectUrl must use http or https').toResponse();
+  }
+
+  const db = c.env.DB;
+  let provider;
+  if (idpId) {
+    provider = await db.prepare(`
+      SELECT * FROM idp_providers WHERE id = ? AND enabled = 1
+    `).bind(idpId).first<IdPProvider>();
+    if (!provider) {
+      return Errors.notFound('Identity provider not found').toResponse();
+    }
+  } else {
+    // Without an explicit IdP, use the first enabled provider in display
+    // order; clients that support multiple IdPs use the /{idpId} variant.
+    provider = await db.prepare(`
+      SELECT * FROM idp_providers WHERE enabled = 1
+      ORDER BY display_order ASC, name ASC LIMIT 1
+    `).first<IdPProvider>();
+    if (!provider) {
+      return Errors.notFound('SSO is not configured on this server').toResponse();
+    }
+  }
+
+  return initiateIdpLogin(c, provider, { ssoRedirectUrl: redirectUrl });
+}
+
+app.get('/_matrix/client/v3/login/sso/redirect', (c) => handleSsoRedirect(c));
+app.get('/_matrix/client/v3/login/sso/redirect/:idpId', (c) => handleSsoRedirect(c, c.req.param('idpId')));
 
 // POST /_matrix/client/v3/login - Login
 app.post('/_matrix/client/v3/login', async (c) => {
@@ -460,6 +529,83 @@ app.post('/_matrix/client/v3/register', async (c) => {
     refresh_token: refreshToken,
     expires_in_ms: expiresInMs,
   });
+});
+
+// POST /_matrix/client/v3/register/email/requestToken - Email verification
+// during registration (spec v1.17). Mirrors account/3pid/email/requestToken:
+// the sid is later presented in the m.login.email.identity UIA stage.
+app.post('/_matrix/client/v3/register/email/requestToken', async (c) => {
+  const db = c.env.DB;
+
+  let body: {
+    client_secret: string;
+    email: string;
+    send_attempt: number;
+    next_link?: string;
+    id_server?: string;
+    id_access_token?: string;
+  };
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const { client_secret, email, send_attempt } = body;
+  if (!client_secret) {
+    return Errors.missingParam('client_secret').toResponse();
+  }
+  if (!email) {
+    return Errors.missingParam('email').toResponse();
+  }
+  if (send_attempt === undefined) {
+    return Errors.missingParam('send_attempt').toResponse();
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return c.json({ errcode: 'M_INVALID_EMAIL', error: 'Invalid email address format' }, 400);
+  }
+
+  const existingBinding = await db.prepare(`
+    SELECT user_id FROM user_threepids
+    WHERE medium = 'email' AND address = ?
+  `).bind(email).first<{ user_id: string }>();
+  if (existingBinding) {
+    return c.json({
+      errcode: 'M_THREEPID_IN_USE',
+      error: 'This email is already associated with an account',
+    }, 400);
+  }
+
+  const result = await createVerificationSession(db, email, client_secret, send_attempt);
+  if ('error' in result) {
+    return c.json({ errcode: 'M_THREEPID_DENIED', error: result.error }, 400);
+  }
+
+  if (result.token) {
+    const emailResult = await sendVerificationEmail(c.env, email, result.token, c.env.SERVER_NAME);
+    if (!emailResult.success) {
+      await db.prepare(`
+        DELETE FROM email_verification_sessions WHERE session_id = ?
+      `).bind(result.sessionId).run();
+      return c.json({
+        errcode: 'M_THREEPID_DENIED',
+        error: emailResult.error || 'Failed to send verification email',
+      }, 500);
+    }
+  }
+
+  return c.json({ sid: result.sessionId });
+});
+
+// POST /_matrix/client/v3/register/msisdn/requestToken - Phone verification
+// is not supported (no SMS gateway), same as the account 3PID variant.
+app.post('/_matrix/client/v3/register/msisdn/requestToken', async (c) => {
+  return c.json({
+    errcode: 'M_THREEPID_DENIED',
+    error: 'Phone verification is not supported',
+  }, 403);
 });
 
 // POST /_matrix/client/v1/login/get_token - Generate a login token for authenticated user

@@ -2,6 +2,7 @@
 // Handles OAuth flow for external Identity Providers
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppEnv } from '../types';
 import {
   fetchOIDCDiscovery,
@@ -21,7 +22,7 @@ import { generateOpaqueId } from '../utils/ids';
 
 const app = new Hono<AppEnv>();
 
-interface IdPProvider {
+export interface IdPProvider {
   id: string;
   name: string;
   issuer_url: string;
@@ -49,6 +50,9 @@ interface OAuthState {
   nonce: string;
   redirectUri: string;
   returnTo?: string;
+  // Set for spec SSO login (/login/sso/redirect): the callback finishes by
+  // redirecting here with a one-time loginToken instead of rendering a page.
+  ssoRedirectUrl?: string;
 }
 
 // Version byte for encrypted secrets
@@ -170,21 +174,15 @@ app.get('/auth/oidc/providers', async (c) => {
   });
 });
 
-// GET /auth/oidc/:providerId/login - Initiate OAuth flow
-app.get('/auth/oidc/:providerId/login', async (c) => {
-  const providerId = c.req.param('providerId');
-  const returnTo = c.req.query('return_to') || '/';
-  const db = c.env.DB;
-
-  // Get provider config
-  const provider = await db.prepare(`
-    SELECT * FROM idp_providers WHERE id = ? AND enabled = 1
-  `).bind(providerId).first<IdPProvider>();
-
-  if (!provider) {
-    return c.json({ errcode: 'M_NOT_FOUND', error: 'Identity provider not found' }, 404);
-  }
-
+// Start the OAuth flow against a configured IdP. Shared by the dashboard
+// login (/auth/oidc/:providerId/login) and the spec SSO login redirect
+// (/login/sso/redirect): the latter stores ssoRedirectUrl so the callback
+// completes with a one-time login token instead of an HTML page.
+export async function initiateIdpLogin(
+  c: Context<AppEnv>,
+  provider: IdPProvider,
+  opts: { returnTo?: string; ssoRedirectUrl?: string } = {}
+): Promise<Response> {
   try {
     // Fetch OIDC discovery
     const discovery = await fetchOIDCDiscovery(provider.issuer_url);
@@ -195,15 +193,15 @@ app.get('/auth/oidc/:providerId/login', async (c) => {
 
     // Build redirect URI
     const host = c.req.header('host') || c.env.SERVER_NAME;
-    const protocol = c.req.url.startsWith('https') ? 'https' : 'https';
-    const redirectUri = `${protocol}://${host}/auth/oidc/${providerId}/callback`;
+    const redirectUri = `https://${host}/auth/oidc/${provider.id}/callback`;
 
     // Store state in KV (expires in 10 minutes)
     const stateData: OAuthState = {
-      providerId,
+      providerId: provider.id,
       nonce,
       redirectUri,
-      returnTo,
+      returnTo: opts.returnTo,
+      ssoRedirectUrl: opts.ssoRedirectUrl,
     };
     await c.env.SESSIONS.put(`oidc_state:${state}`, JSON.stringify(stateData), {
       expirationTtl: 600,
@@ -224,6 +222,24 @@ app.get('/auth/oidc/:providerId/login', async (c) => {
     console.error('OIDC login error:', err);
     return c.json({ errcode: 'M_UNKNOWN', error: 'Failed to initiate login' }, 500);
   }
+}
+
+// GET /auth/oidc/:providerId/login - Initiate OAuth flow
+app.get('/auth/oidc/:providerId/login', async (c) => {
+  const providerId = c.req.param('providerId');
+  const returnTo = c.req.query('return_to') || '/';
+  const db = c.env.DB;
+
+  // Get provider config
+  const provider = await db.prepare(`
+    SELECT * FROM idp_providers WHERE id = ? AND enabled = 1
+  `).bind(providerId).first<IdPProvider>();
+
+  if (!provider) {
+    return c.json({ errcode: 'M_NOT_FOUND', error: 'Identity provider not found' }, 404);
+  }
+
+  return initiateIdpLogin(c, provider, { returnTo });
 });
 
 // GET /auth/oidc/:providerId/callback - Handle OAuth callback
@@ -348,6 +364,22 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
           VALUES (?, ?, ?, ?, ?, ?)
         `).bind(providerId, claims.sub, userId, claims.email || null, claims.name || null, Date.now()).run();
       }
+    }
+
+    // Spec SSO login: redirect back to the client with a one-time login
+    // token (exchanged at POST /login via m.login.token) rather than minting
+    // a session here — the client picks its own device_id that way.
+    if (stateData.ssoRedirectUrl) {
+      const loginToken = generateRandomString(32);
+      const loginTokenHash = await hashToken(loginToken);
+      await c.env.SESSIONS.put(
+        `login_token:${loginTokenHash}`,
+        JSON.stringify({ user_id: userId, expires_at: Date.now() + 2 * 60 * 1000 }),
+        { expirationTtl: 120 }
+      );
+      const redirect = new URL(stateData.ssoRedirectUrl);
+      redirect.searchParams.set('loginToken', loginToken);
+      return c.redirect(redirect.toString());
     }
 
     // Generate Matrix access token

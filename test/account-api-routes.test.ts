@@ -1967,17 +1967,17 @@ describe('GET /_matrix/client/v1/register/m.login.registration_token/validity', 
     });
   });
 
-  it('always returns valid:false for any token', async () => {
+  it('returns valid:true for any token when registration does not require one', async () => {
     const env = createEnv();
     const res = await request(
       env,
       '/_matrix/client/v1/register/m.login.registration_token/validity?token=abc123'
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('returns valid:false for empty-looking non-empty token strings', async () => {
+  it('returns valid:true for empty-looking non-empty token strings when the gate is off', async () => {
     const env = createEnv();
     const res = await request(
       env,
@@ -1985,7 +1985,7 @@ describe('GET /_matrix/client/v1/register/m.login.registration_token/validity', 
     );
     // "%20" decodes to space — still a present query value
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 });
 
@@ -2983,7 +2983,7 @@ describe('account email requestToken / submit_token leftovers', () => {
 });
 
 describe('account registration_token + openid leftovers', () => {
-  it('registration token validity always { valid: false } for any non-empty token', async () => {
+  it('registration token validity is { valid: true } for any non-empty token when the gate is off', async () => {
     const env = createEnv();
     for (const token of ['abc', '0', 'token with spaces', '🔐']) {
       const res = await request(
@@ -2991,7 +2991,7 @@ describe('account registration_token + openid leftovers', () => {
         `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent(token)}`
       );
       expect(res.status).toBe(200);
-      expect(res.body).toEqual({ valid: false });
+      expect(res.body).toEqual({ valid: true });
     }
   });
 

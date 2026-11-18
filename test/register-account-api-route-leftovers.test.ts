@@ -2146,104 +2146,104 @@ describe('account leftovers registration_token validity', () => {
   });
 
 
-  it('always returns valid:false for token case-0', async () => {
+  it('returns valid:true (gate off) for token case-0', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("abc")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-1', async () => {
+  it('returns valid:true (gate off) for token case-1', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-2', async () => {
+  it('returns valid:true (gate off) for token case-2', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("tok with space")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-3', async () => {
+  it('returns valid:true (gate off) for token case-3', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("\ud83c\udfab")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-4', async () => {
+  it('returns valid:true (gate off) for token case-4', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("null")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-5', async () => {
+  it('returns valid:true (gate off) for token case-5', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("0")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-6', async () => {
+  it('returns valid:true (gate off) for token case-6', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("true")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-7', async () => {
+  it('returns valid:true (gate off) for token case-7', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("../etc")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-8', async () => {
+  it('returns valid:true (gate off) for token case-8', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("%00")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('always returns valid:false for token case-9', async () => {
+  it('returns valid:true (gate off) for token case-9', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("a/b")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
 });
@@ -2775,13 +2775,13 @@ describe('register+account leftovers soft-cap lifecycles', () => {
     expect(who.body.user_id).toBe(USER);
   });
 
-  it('registration_token always false while register/available still works', async () => {
+  it('registration_token valid (gate off) while register/available still works', async () => {
     const aenv = accountEnv();
     const tok = await accountRequest(
       aenv,
       '/_matrix/client/v1/register/m.login.registration_token/validity?token=invite'
     );
-    expect(tok.body).toEqual({ valid: false });
+    expect(tok.body).toEqual({ valid: true });
     const lenv = loginEnv(createLoginDb());
     const avail = await loginRequest(lenv, '/_matrix/client/v3/register/available?username=stillok');
     expect(avail.body).toEqual({ available: true });
@@ -3449,234 +3449,234 @@ describe('register leftovers password strength boundary grid', () => {
 
 describe('account leftovers openid + registration_token matrix flood', () => {
 
-  it('registration_token flood case-0 always invalid', async () => {
+  it('registration_token flood case-0 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-0")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-1 always invalid', async () => {
+  it('registration_token flood case-1 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-1")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-2 always invalid', async () => {
+  it('registration_token flood case-2 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-2")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-3 always invalid', async () => {
+  it('registration_token flood case-3 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-3")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-4 always invalid', async () => {
+  it('registration_token flood case-4 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-4")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-5 always invalid', async () => {
+  it('registration_token flood case-5 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-5")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-6 always invalid', async () => {
+  it('registration_token flood case-6 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-6")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-7 always invalid', async () => {
+  it('registration_token flood case-7 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-7")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-8 always invalid', async () => {
+  it('registration_token flood case-8 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-8")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-9 always invalid', async () => {
+  it('registration_token flood case-9 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-9")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-10 always invalid', async () => {
+  it('registration_token flood case-10 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-10")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-11 always invalid', async () => {
+  it('registration_token flood case-11 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-11")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-12 always invalid', async () => {
+  it('registration_token flood case-12 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-12")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-13 always invalid', async () => {
+  it('registration_token flood case-13 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-13")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-14 always invalid', async () => {
+  it('registration_token flood case-14 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-14")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-15 always invalid', async () => {
+  it('registration_token flood case-15 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-15")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-16 always invalid', async () => {
+  it('registration_token flood case-16 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-16")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-17 always invalid', async () => {
+  it('registration_token flood case-17 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-17")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-18 always invalid', async () => {
+  it('registration_token flood case-18 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-18")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-19 always invalid', async () => {
+  it('registration_token flood case-19 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("token-19")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-20 always invalid', async () => {
+  it('registration_token flood case-20 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-21 always invalid', async () => {
+  it('registration_token flood case-21 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("inv\u00edte")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
-  it('registration_token flood case-22 always invalid', async () => {
+  it('registration_token flood case-22 valid while gate off', async () => {
     const env = accountEnv();
     const res = await accountRequest(
       env,
       `/_matrix/client/v1/register/m.login.registration_token/validity?token=${encodeURIComponent("tok\n")}`
     );
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ valid: false });
+    expect(res.body).toEqual({ valid: true });
   });
 
   it('openid forbids other user with encoded and raw forms', async () => {

@@ -7,7 +7,7 @@ import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { hashPassword, verifyPassword, validatePasswordStrength } from '../utils/crypto';
+import { hashPassword, verifyPassword, validatePasswordStrength, hashToken } from '../utils/crypto';
 import { generateOpaqueId } from '../utils/ids';
 import { getPasswordHash, deleteAllUserTokens } from '../services/database';
 import {
@@ -515,8 +515,28 @@ app.get('/_matrix/client/v1/register/m.login.registration_token/validity', async
     return Errors.missingParam('token').toResponse();
   }
 
-  // Registration tokens not supported - always invalid
-  return c.json({ valid: false });
+  // When registration does not require a token, any token passes — the
+  // gate is off, so clients should not block the register flow on it.
+  const tokenRequired =
+    c.env.REGISTRATION_REQUIRE_TOKEN === 'true' || c.env.REGISTRATION_REQUIRE_TOKEN === '1';
+  if (!tokenRequired) {
+    return c.json({ valid: true });
+  }
+
+  // Mirror consumeRegistrationToken's validity rules without spending a use.
+  const row = await c.env.DB.prepare(`
+    SELECT uses_remaining, expires_at, revoked FROM registration_tokens WHERE token_hash = ?
+  `).bind(await hashToken(token)).first<{
+    uses_remaining: number;
+    expires_at: number | null;
+    revoked: number;
+  }>();
+
+  const valid = Boolean(row)
+    && row!.revoked === 0
+    && row!.uses_remaining > 0
+    && (row!.expires_at === null || row!.expires_at > Date.now());
+  return c.json({ valid });
 });
 
 // ============================================
