@@ -78,7 +78,8 @@ app.get('/.well-known/openid-configuration', (c) => {
     claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'name', 'email'],
     // Matrix-specific extension
     'org.matrix.matrix-authentication-service': {
-      graphql_endpoint: null,
+      // No MAS GraphQL API; omit graphql_endpoint (a null here breaks clients
+      // that cast it to String, e.g. FluffyChat).
       account: {
         issuer: baseUrl,
       },
