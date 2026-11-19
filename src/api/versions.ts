@@ -70,7 +70,9 @@ app.get('/.well-known/openid-configuration', (c) => {
     ],
     response_types_supported: ['code'],
     response_modes_supported: ['query', 'fragment'],
-    grant_types_supported: ['authorization_code', 'refresh_token'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
+    // QR code login (MSC4108) device authorization endpoint.
+    device_authorization_endpoint: `${baseUrl}/oauth/device`,
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256', 'plain'],
     subject_types_supported: ['public'],
