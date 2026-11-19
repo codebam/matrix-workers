@@ -107,6 +107,8 @@ describe('versions module /.well-known/openid-configuration', () => {
       'email',
       'urn:matrix:org.matrix.msc2967.client:api:*',
       'urn:matrix:org.matrix.msc2967.client:device:*',
+      'urn:matrix:client:api:*',
+      'urn:matrix:client:device:*',
     ]);
   });
 

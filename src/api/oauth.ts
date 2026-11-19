@@ -195,6 +195,7 @@ app.get('/oauth/authorize', async (c) => {
   const nonce = c.req.query('nonce');
   const codeChallenge = c.req.query('code_challenge');
   const codeChallengeMethod = c.req.query('code_challenge_method') || 'plain';
+  const responseMode = c.req.query('response_mode') || 'query';
 
   // Validate required parameters
   if (!clientId) {
@@ -205,6 +206,9 @@ app.get('/oauth/authorize', async (c) => {
   }
   if (responseType !== 'code') {
     return c.json({ error: 'unsupported_response_type', error_description: 'Only code response type is supported' }, 400);
+  }
+  if (responseMode !== 'query' && responseMode !== 'fragment') {
+    return c.json({ error: 'invalid_request', error_description: 'Unsupported response_mode' }, 400);
   }
 
   // Validate client
@@ -230,6 +234,7 @@ app.get('/oauth/authorize', async (c) => {
     nonce,
     code_challenge: codeChallenge,
     code_challenge_method: codeChallengeMethod,
+    response_mode: responseMode,
   }), { expirationTtl: 600 }); // 10 minutes
 
   // Return login page
@@ -302,11 +307,20 @@ app.post('/oauth/authorize', async (c) => {
 
   await c.env.SESSIONS.put(`oauth_code:${code}`, JSON.stringify(authCode), { expirationTtl: 600 });
 
-  // Redirect back to client with authorization code
+  // Redirect back to client with the code in the mode it asked for. Element
+  // Web requests fragment so its hash router can read the callback.
   const redirectUrl = new URL(authRequest.redirect_uri);
-  redirectUrl.searchParams.set('code', code);
+  const responseParams = new URLSearchParams();
+  responseParams.set('code', code);
   if (authRequest.state) {
-    redirectUrl.searchParams.set('state', authRequest.state);
+    responseParams.set('state', authRequest.state);
+  }
+  if (authRequest.response_mode === 'fragment') {
+    redirectUrl.hash = responseParams.toString();
+  } else {
+    for (const [key, value] of responseParams) {
+      redirectUrl.searchParams.set(key, value);
+    }
   }
 
   return c.redirect(redirectUrl.toString());
@@ -422,13 +436,18 @@ app.post('/oauth/token', async (c) => {
     const newRefreshToken = generateRandomString(32);
     const tokenId = await generateOpaqueId(16);
     
-    // Extract device ID from scope per MSC2967
-    // Scope format: urn:matrix:org.matrix.msc2967.client:device:DEVICE_ID
+    // Extract device ID from scope per MSC2967, accepting both the current
+    // and the original URN spellings Element versions may ask for.
     let deviceId: string | undefined;
     const scopes = authCode.scope?.split(' ') || [];
+    const deviceScopePrefixes = [
+      'urn:matrix:client:device:',
+      'urn:matrix:org.matrix.msc2967.client:device:',
+    ];
     for (const scope of scopes) {
-      if (scope.startsWith('urn:matrix:org.matrix.msc2967.client:device:')) {
-        deviceId = scope.replace('urn:matrix:org.matrix.msc2967.client:device:', '');
+      const prefix = deviceScopePrefixes.find((candidate) => scope.startsWith(candidate));
+      if (prefix) {
+        deviceId = scope.slice(prefix.length);
         break;
       }
     }

@@ -1200,6 +1200,8 @@ describe('GET /_matrix/client/v1/auth_metadata', () => {
         'openid',
         'urn:matrix:org.matrix.msc2967.client:api:*',
         'urn:matrix:org.matrix.msc2967.client:device:*',
+        'urn:matrix:client:api:*',
+        'urn:matrix:client:device:*',
       ])
     );
     expect(meta.account_management_actions_supported).toEqual(

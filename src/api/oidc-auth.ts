@@ -513,6 +513,8 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
       'email',
       'urn:matrix:org.matrix.msc2967.client:api:*',
       'urn:matrix:org.matrix.msc2967.client:device:*',
+      'urn:matrix:client:api:*',
+      'urn:matrix:client:device:*',
     ],
     // Matrix authentication service extension (MSC3861/MSC4191)
     // account_management_uri is where users can manage their account

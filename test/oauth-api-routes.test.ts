@@ -355,6 +355,38 @@ describe('GET /oauth/authorize', () => {
     });
   });
 
+  it('rejects an unsupported response_mode', async () => {
+    const env = makeEnv();
+    const { body: client } = await registerClient(env);
+    const qs = new URLSearchParams({
+      client_id: String(client.client_id),
+      redirect_uri: REDIRECT,
+      response_type: 'code',
+      response_mode: 'form_post',
+    });
+    const res = await request(`/oauth/authorize?${qs}`, {}, env);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: 'invalid_request',
+      error_description: 'Unsupported response_mode',
+    });
+  });
+
+  it('stores a requested fragment response_mode on the auth request', async () => {
+    const sessions = mockKv();
+    const env = makeEnv({ sessions });
+    const { body: client } = await registerClient(env);
+    const qs = new URLSearchParams({
+      client_id: String(client.client_id),
+      redirect_uri: REDIRECT,
+      response_type: 'code',
+      response_mode: 'fragment',
+    });
+    await request(`/oauth/authorize?${qs}`, {}, env);
+    const key = Object.keys(sessions.data).find((k) => k.startsWith('oauth_auth_request:'))!;
+    expect(JSON.parse(sessions.data[key]).response_mode).toBe('fragment');
+  });
+
   it('rejects unknown client and redirect_uri not registered', async () => {
     const env = makeEnv();
     const { body: client } = await registerClient(env);
@@ -597,6 +629,49 @@ describe('POST /oauth/authorize', () => {
       created_at: NOW,
       expires_at: NOW + 10 * 60 * 1000,
     });
+  });
+
+  it('puts the code and state in the fragment when response_mode is fragment', async () => {
+    const sessions = mockKv();
+    const db = createOAuthDb({
+      users: new Map([
+        [
+          USER_ID,
+          userRow({
+            user_id: USER_ID,
+            localpart: 'alice',
+            password_hash: 'mockok:correct',
+          }),
+        ],
+      ]),
+    });
+    const env = makeEnv({ sessions, db });
+    const redirectUri = 'https://element.example.com/callback?no_universal_links=true';
+    const { body: client } = await registerClient(env, {
+      client_name: 'Element Web',
+      redirect_uris: [redirectUri],
+    });
+    const id = await seededAuth(env, {
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      scope: 'openid',
+      state: 'return-me',
+      response_mode: 'fragment',
+    });
+
+    const form = new FormData();
+    form.set('username', 'alice');
+    form.set('password', 'correct');
+    form.set('auth_request_id', id);
+    const res = await request('/oauth/authorize', { method: 'POST', body: form }, env);
+    expect(res.status).toBe(302);
+    const url = new URL(res.headers.get('Location')!);
+    expect(url.searchParams.get('no_universal_links')).toBe('true');
+    expect(url.searchParams.has('code')).toBe(false);
+    expect(url.searchParams.has('state')).toBe(false);
+    const fragment = new URLSearchParams(url.hash.replace(/^#/, ''));
+    expect(fragment.get('state')).toBe('return-me');
+    expect(fragment.get('code')).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('omits state query param when auth request had no state', async () => {
@@ -1029,6 +1104,34 @@ describe('POST /oauth/token', () => {
     const body = await res.json();
     expect(body.device_id).toBeTruthy();
     expect(body.device_id).not.toBe('*');
+  });
+
+  it('honours the current urn:matrix:client:device scope spelling', async () => {
+    const sessions = mockKv();
+    const db = createOAuthDb();
+    const env = makeEnv({ sessions, db });
+    const { body: client } = await setupConfidential(env);
+    await putAuthCode(env, 'c-current-scope', {
+      client_id: String(client.client_id),
+      scope: 'openid urn:matrix:client:api:* urn:matrix:client:device:HsumqtW7tE',
+    });
+    const res = await request(
+      '/oauth/token',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          grant_type: 'authorization_code',
+          client_id: client.client_id,
+          client_secret: client.client_secret,
+          code: 'c-current-scope',
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.device_id).toBe('HsumqtW7tE');
   });
 
   it('refresh_token grant rotates tokens and rejects wrong client', async () => {

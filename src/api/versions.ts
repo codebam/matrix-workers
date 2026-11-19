@@ -65,6 +65,8 @@ app.get('/.well-known/openid-configuration', (c) => {
       'email',
       'urn:matrix:org.matrix.msc2967.client:api:*',
       'urn:matrix:org.matrix.msc2967.client:device:*',
+      'urn:matrix:client:api:*',
+      'urn:matrix:client:device:*',
     ],
     response_types_supported: ['code'],
     response_modes_supported: ['query', 'fragment'],
