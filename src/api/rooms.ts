@@ -694,6 +694,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
         userId,
         isRemote: true,
         remoteServer: roomServer,
+        backfill: true,
       },
     });
 
@@ -2495,7 +2496,7 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
     if (!mem || mem.membership === 'invite' || mem.membership === 'leave') {
       if (!room) await ensureRemoteRoomRow(db, roomId, userId);
       const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
-        params: { roomId, userId, isRemote: true, remoteServer: residentServer, servers: aliasServers ?? undefined },
+        params: { roomId, userId, isRemote: true, remoteServer: residentServer, servers: aliasServers ?? undefined, backfill: true },
       });
       try {
         const status = await instance.status();

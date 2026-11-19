@@ -46,6 +46,8 @@ export interface JoinParams {
   // resident server is unreachable or rejects us (e.g. it fetches keys on a
   // port we don't serve).
   servers?: string[];
+  // When true, backfill full room state + members after join (large rooms).
+  backfill?: boolean;
 }
 
 // Result returned when workflow completes
@@ -73,7 +75,7 @@ interface SerializableEvent {
 
 export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   async run(event: WorkflowEvent<JoinParams>, step: WorkflowStep): Promise<JoinResult> {
-    const { roomId, userId, isRemote, remoteServer, displayName, avatarUrl, reason, servers } = event.payload;
+    const { roomId, userId, isRemote, remoteServer, displayName, avatarUrl, reason, servers, backfill } = event.payload;
 
     console.log('[RoomJoinWorkflow] Starting join', { roomId, userId, isRemote, remoteServer });
 
@@ -147,7 +149,7 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       // This runs after `persist` so the join event already exists locally;
       // when the response echoes the counter-signed join event, the
       // idempotent store simply skips the duplicate.
-      if (sendJoinResponse) {
+      if (isRemote && remoteServer) {
         await step.do('store-remote-state', async () => {
           const remoteEvents = [
             ...(Array.isArray(sendJoinResponse?.auth_chain) ? sendJoinResponse.auth_chain : []),
@@ -155,51 +157,65 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
             ...(sendJoinResponse?.event ? [sendJoinResponse.event] : []),
           ];
           for (const ev of remoteEvents) {
-            if (!ev || typeof ev !== 'object' || !ev.type) continue;
-            try {
-              const normalized: Record<string, unknown> = { ...ev };
-              if (typeof ev.event_id !== 'string' || !ev.event_id) {
-                // v4+ events omit event_id on the wire; derive the reference
-                // hash the same way the resident server did.
-                normalized.event_id = await computeWireEventId(ev as Record<string, unknown>);
-              }
-              if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
-                // v4+ create events also omit room_id; it is the event ID
-                // with the sigil swapped.
-                normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
-              }
-              await storeEventIdempotent(
-                this.env.DB,
-                normalized as unknown as Parameters<typeof storeEventIdempotent>[1]
-              );
+            await this.storeRemoteStateEvent(ev, roomId);
+          }
 
-              // Keep the memberships table in sync with the remote state --
-              // federation fan-out picks destinations from it.
-              const evStateKey = (ev as { state_key?: unknown }).state_key;
-              if (ev.type === 'm.room.member' && typeof evStateKey === 'string') {
-                const membership = (ev.content as { membership?: string } | undefined)?.membership;
-                if (
-                  membership === 'join' ||
-                  membership === 'invite' ||
-                  membership === 'leave' ||
-                  membership === 'ban' ||
-                  membership === 'knock'
-                ) {
-                  await updateMembership(
-                    this.env.DB,
-                    roomId,
-                    evStateKey,
-                    membership,
-                    String(normalized.event_id)
-                  );
+          // Some residents return a partial snapshot (missing create/name), so
+          // the room renders without a name. Backfill the full current state.
+          if (backfill) {
+          const haveCreate = await this.env.DB.prepare(
+            `SELECT 1 AS x FROM room_state WHERE room_id = ? AND event_type = 'm.room.create'`
+          ).bind(roomId).first();
+          if (!haveCreate) {
+            try {
+              const resp = await federationGet(
+                chosenServer ?? remoteServer!,
+                `/_matrix/federation/v1/state/${encodeURIComponent(roomId)}`,
+                this.env.SERVER_NAME,
+                this.env.DB,
+                this.env.CACHE
+              );
+              if (resp.ok) {
+                const data = (await resp.json()) as { pdus?: any[]; auth_chain?: any[] };
+                for (const ev of [...(data.auth_chain ?? []), ...(data.pdus ?? [])]) {
+                  await this.storeRemoteStateEvent(ev, roomId);
                 }
               }
-            } catch (storeErr) {
-              // Never let one malformed remote event abort the whole join.
-              console.warn('[RoomJoinWorkflow] Skipping remote state event', {
-                error: storeErr instanceof Error ? storeErr.message : 'Unknown error',
+            } catch (e) {
+              console.warn('[RoomJoinWorkflow] state backfill failed', {
+                roomId,
+                error: e instanceof Error ? e.message : String(e),
               });
             }
+          }
+
+          // Large rooms omit most members from the join snapshot. Paginate the
+          // federation /members endpoint to store the full member list so the
+          // client shows the correct name/heroes and member count.
+          try {
+            let at: string | undefined;
+            for (let page = 0; page < 100; page++) {
+              const q = `?limit=100${at ? `&at=${encodeURIComponent(at)}` : ''}`;
+              const resp = await federationGet(
+                chosenServer ?? remoteServer!,
+                `/_matrix/federation/v1/members/${encodeURIComponent(roomId)}${q}`,
+                this.env.SERVER_NAME,
+                this.env.DB,
+                this.env.CACHE
+              );
+              if (!resp.ok) break;
+              const data = (await resp.json()) as { chunk?: any[]; end?: string; start?: string };
+              const chunk = Array.isArray(data.chunk) ? data.chunk : [];
+              for (const ev of chunk) await this.storeRemoteStateEvent(ev, roomId);
+              if (chunk.length === 0 || !data.end || data.end === at) break;
+              at = data.end;
+            }
+          } catch (e) {
+            console.warn('[RoomJoinWorkflow] member backfill failed', {
+              roomId,
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
           }
         });
       }
@@ -461,6 +477,43 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     // v2 send_join returns { auth_chain, origin, state, event }: the join
     // counter-signed by the resident server plus the room's current state.
     return await response.json();
+  }
+
+  // Store one remote state/event PDU, deriving wire IDs where omitted and
+  // keeping the memberships table in sync. Never throws on a malformed event.
+  private async storeRemoteStateEvent(ev: any, roomId: string): Promise<void> {
+    if (!ev || typeof ev !== 'object' || !ev.type) return;
+    try {
+      const normalized: Record<string, unknown> = { ...ev };
+      if (typeof ev.event_id !== 'string' || !ev.event_id) {
+        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>);
+      }
+      if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
+        normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
+      }
+      await storeEventIdempotent(
+        this.env.DB,
+        normalized as unknown as Parameters<typeof storeEventIdempotent>[1]
+      );
+
+      const evStateKey = (ev as { state_key?: unknown }).state_key;
+      if (ev.type === 'm.room.member' && typeof evStateKey === 'string') {
+        const membership = (ev.content as { membership?: string } | undefined)?.membership;
+        if (
+          membership === 'join' ||
+          membership === 'invite' ||
+          membership === 'leave' ||
+          membership === 'ban' ||
+          membership === 'knock'
+        ) {
+          await updateMembership(this.env.DB, roomId, evStateKey, membership, String(normalized.event_id));
+        }
+      }
+    } catch (storeErr) {
+      console.warn('[RoomJoinWorkflow] Skipping remote state event', {
+        error: storeErr instanceof Error ? storeErr.message : 'Unknown error',
+      });
+    }
   }
 
   // Notify a batch of members about the join
