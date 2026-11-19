@@ -1508,18 +1508,23 @@ async function queueFederationPdu(
   eventId: string,
   roomId: string
 ): Promise<void> {
-  for (const destination of destinations) {
-    try {
-      const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(destination));
-      await fedDO.fetch(new Request('http://internal/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ destination, event_id: eventId, room_id: roomId, pdu }),
-      }));
-      console.log(`[rooms] Federation DO accepted delivery for ${destination}: ${eventId}`);
-    } catch (err) {
-      console.error(`[rooms] Federation queueing failed for ${destination}:`, err);
-    }
+  // Fan out in parallel batches; a large room can have hundreds of member
+  // servers and sequential awaits would exceed the request budget.
+  const BATCH = 25;
+  for (let i = 0; i < destinations.length; i += BATCH) {
+    const batch = destinations.slice(i, i + BATCH);
+    await Promise.allSettled(batch.map(async (destination) => {
+      try {
+        const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(destination));
+        await fedDO.fetch(new Request('http://internal/send', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ destination, event_id: eventId, room_id: roomId, pdu }),
+        }));
+      } catch (err) {
+        console.error(`[rooms] Federation queueing failed for ${destination}:`, err);
+      }
+    }));
   }
 }
 
@@ -1699,10 +1704,14 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   // Notify all room members that a new message was sent (wakes up long-polling syncs)
   await notifyUsersOfEvent(c.env, roomId, event.event_id, eventType);
 
-  // Hand the wire PDU to the federation delivery queue (signs the
-  // transaction, batches, retries; self-catching -- never blocks the send).
+  // Hand the wire PDU to the federation delivery queue in the background so a
+  // room with hundreds of member servers doesn't block the client's send.
   if (wirePdu) {
-    await queueFederationPdu(c.env, remoteServers, wirePdu, event.event_id, roomId);
+    c.executionCtx.waitUntil(
+      queueFederationPdu(c.env, remoteServers, wirePdu, event.event_id, roomId).catch(err => {
+        console.error('[rooms] Federation fanout error:', err);
+      })
+    );
   }
 
   // Send push notifications via durable workflow (fire and forget)

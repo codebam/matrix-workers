@@ -163,10 +163,12 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           // Some residents return a partial snapshot (missing create/name), so
           // the room renders without a name. Backfill the full current state.
           if (backfill) {
-          const haveCreate = await this.env.DB.prepare(
-            `SELECT 1 AS x FROM room_state WHERE room_id = ? AND event_type = 'm.room.create'`
-          ).bind(roomId).first();
-          if (!haveCreate) {
+          const haveEssential = await this.env.DB.prepare(
+            `SELECT
+               (SELECT 1 FROM room_state WHERE room_id = ? AND event_type = 'm.room.create') AS c,
+               (SELECT 1 FROM room_state WHERE room_id = ? AND event_type = 'm.room.name') AS n`
+          ).bind(roomId, roomId).first<{ c: number | null; n: number | null }>();
+          if (!haveEssential?.c || !haveEssential?.n) {
             try {
               const resp = await federationGet(
                 chosenServer ?? remoteServer!,

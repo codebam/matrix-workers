@@ -900,13 +900,14 @@ export async function notifyUsersOfEvent(
   eventType: string
 ): Promise<void> {
   try {
-    // Get all joined members of the room
+    // Only local members have a SyncDurableObject here; remote users receive
+    // events via federation /send, so waking their (nonexistent) local sync is
+    // wasted work that explodes for large rooms.
     const members = await env.DB.prepare(
-      `SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'`
-    ).bind(roomId).all<{ user_id: string }>();
+      `SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join' AND user_id LIKE ?`
+    ).bind(roomId, `%:${env.SERVER_NAME}`).all<{ user_id: string }>();
 
-    console.log('[database] Notifying', members.results.length, 'users of event', eventId,
-      'users:', members.results.map(m => m.user_id).join(', '));
+    console.log('[database] Notifying', members.results.length, 'local users of event', eventId);
 
     // Notify each user's SyncDurableObject in parallel
     const notifications = members.results.map(async (member) => {

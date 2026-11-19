@@ -5,9 +5,11 @@ import { createMiddleware } from 'hono/factory';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { getUserById, createRegistrationToken, listRegistrationTokens, revokeRegistrationToken } from '../services/database';
+import { getUserById, createRegistrationToken, listRegistrationTokens, revokeRegistrationToken, storeEventIdempotent, updateMembership } from '../services/database';
 import { generateLoginToken, generateOpaqueId, generateRegistrationToken } from '../utils/ids';
 import { base64UrlDecode, hashToken, verifySignature } from '../utils/crypto';
+import { computeWireEventId } from '../utils/event-signing';
+import { federationGet } from '../services/federation-keys';
 import { encryptSecret } from './oidc-auth';
 import { fetchOIDCDiscovery } from '../services/oidc';
 import { logAdminAction } from '../services/admin-audit';
@@ -2665,6 +2667,72 @@ app.get('/_matrix/client/v3/admin/analytics/federation', requireAuth(), requireA
     outbound_events: outboundEvents?.count || 0,
     known_servers: remoteServers?.count || 0,
   });
+});
+
+// Backfill a remote room's state (name/create) and full member list without
+// requiring a fresh join. Useful when the join snapshot was partial.
+app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async (c) => {
+  const roomId = decodeURIComponent(c.req.param('roomId'));
+  const db = c.env.DB;
+
+  let server = c.req.query('server');
+  if (!server) {
+    const m = roomId.match(/^!.+:(.+)$/);
+    server = m ? m[1] : undefined;
+  }
+  if (!server) {
+    const row = await db.prepare(
+      `SELECT substr(user_id, instr(user_id, ':') + 1) AS s FROM room_memberships
+       WHERE room_id = ? AND user_id NOT LIKE ? LIMIT 1`
+    ).bind(roomId, `%:${c.env.SERVER_NAME}`).first<{ s: string }>();
+    server = row?.s;
+  }
+  if (!server) return Errors.invalidParam('server', 'Could not determine a remote server for this room').toResponse();
+
+  const storeEv = async (ev: any): Promise<boolean> => {
+    if (!ev || typeof ev !== 'object' || !ev.type) return false;
+    try {
+      const normalized: Record<string, unknown> = { ...ev };
+      if (typeof ev.event_id !== 'string' || !ev.event_id) {
+        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>);
+      }
+      if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
+        normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
+      }
+      await storeEventIdempotent(db, normalized as any);
+      if (ev.type === 'm.room.member' && typeof ev.state_key === 'string') {
+        const mem = ev.content?.membership;
+        if (['join', 'invite', 'leave', 'ban', 'knock'].includes(mem)) {
+          await updateMembership(db, roomId, ev.state_key, mem, String(normalized.event_id));
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  let stored = 0;
+  const stateResp = await federationGet(server, `/_matrix/federation/v1/state/${encodeURIComponent(roomId)}`, c.env.SERVER_NAME, db, c.env.CACHE);
+  if (stateResp.ok) {
+    const data = await stateResp.json() as { pdus?: any[]; auth_chain?: any[] };
+    for (const ev of [...(data.auth_chain ?? []), ...(data.pdus ?? [])]) if (await storeEv(ev)) stored++;
+  }
+
+  let members = 0;
+  let at: string | undefined;
+  for (let page = 0; page < 100; page++) {
+    const q = `?limit=100${at ? `&at=${encodeURIComponent(at)}` : ''}`;
+    const resp = await federationGet(server, `/_matrix/federation/v1/members/${encodeURIComponent(roomId)}${q}`, c.env.SERVER_NAME, db, c.env.CACHE);
+    if (!resp.ok) break;
+    const data = await resp.json() as { chunk?: any[]; end?: string };
+    const chunk = Array.isArray(data.chunk) ? data.chunk : [];
+    for (const ev of chunk) if (await storeEv(ev)) members++;
+    if (chunk.length === 0 || !data.end || data.end === at) break;
+    at = data.end;
+  }
+
+  return c.json({ server, stored_state: stored, stored_members: members });
 });
 
 export default app;
