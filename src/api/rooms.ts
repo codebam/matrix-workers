@@ -10,7 +10,7 @@ import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-c
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
 import { calculateContentHash, signJson, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, computeWireEventId, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
-import { getServerSigningKey } from '../services/federation-keys';
+import { getServerSigningKey, federationGet } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import {
@@ -606,6 +606,58 @@ async function getRoomResidentServer(
   return null;
 }
 
+// A previously-unknown remote room needs a rooms row before the join workflow
+// stores state (room_state has a FK to rooms). Version is corrected from the
+// resident server's create event once the join completes.
+async function ensureRemoteRoomRow(db: D1Database, roomId: string, userId: string): Promise<void> {
+  await db.prepare(
+    `INSERT OR IGNORE INTO rooms (room_id, room_version, is_public, creator_id, created_at)
+     VALUES (?, '10', 0, ?, ?)`
+  ).bind(roomId, userId, Date.now()).run();
+}
+
+async function syncRoomVersionFromCreate(db: D1Database, roomId: string): Promise<void> {
+  const create = await getStateEvent(db, roomId, 'm.room.create');
+  const rv = (create?.content as { room_version?: string } | undefined)?.room_version;
+  const creator = (create as { sender?: string } | null)?.sender;
+  if (rv || creator) {
+    await db.prepare(
+      `UPDATE rooms SET room_version = COALESCE(?, room_version), creator_id = COALESCE(?, creator_id) WHERE room_id = ?`
+    ).bind(rv ? String(rv) : null, creator ?? null, roomId).run();
+  }
+}
+
+// Resolve a remote room alias via the alias server's federation directory
+// (GET /_matrix/federation/v1/query/directory). Local aliases are handled by
+// getRoomByAlias; this covers aliases hosted on other servers.
+async function resolveRemoteAlias(
+  env: Env,
+  alias: string
+): Promise<{ roomId: string; servers: string[] } | null> {
+  const colon = alias.indexOf(':');
+  if (colon <= 0) return null;
+  const server = alias.slice(colon + 1);
+  if (!server || server === env.SERVER_NAME) return null;
+  try {
+    const res = await federationGet(
+      server,
+      `/_matrix/federation/v1/query/directory?room_alias=${encodeURIComponent(alias)}`,
+      env.SERVER_NAME,
+      env.DB,
+      env.CACHE
+    );
+    if (!res.ok) return null;
+    const data = (await res.json()) as { room_id?: string; servers?: string[] };
+    if (typeof data.room_id !== 'string') return null;
+    return {
+      roomId: data.room_id,
+      servers: Array.isArray(data.servers) && data.servers.length ? data.servers : [server],
+    };
+  } catch {
+    return null;
+  }
+}
+
 // POST /_matrix/client/v3/rooms/:roomId/join - Join a room
 app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -633,6 +685,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   if (needsFederationJoin && roomServer) {
     console.log('[rooms] Remote room join via workflow', { roomId, roomServer, userId });
 
+    if (!room) await ensureRemoteRoomRow(c.env.DB, roomId, userId);
+
     // Trigger the RoomJoinWorkflow for durable federation handling
     const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
       params: {
@@ -659,6 +713,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
       // Check if workflow completed successfully
       const output = status.output as JoinResult | undefined;
       if (status.status === 'complete' && output?.success) {
+        await syncRoomVersionFromCreate(c.env.DB, roomId);
         return c.json({ room_id: roomId });
       }
 
@@ -2407,31 +2462,38 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   const db = c.env.DB;
 
   let roomId: string;
+  let aliasServers: string[] | null = null;
 
-  // Determine if it's an alias or room ID
+  // Determine if it's an alias or room ID. Aliases may be local or hosted on
+  // another server; remote aliases resolve via federation query/directory.
   if (roomIdOrAlias.startsWith('#')) {
-    // It's an alias, resolve it
     const resolved = await getRoomByAlias(db, roomIdOrAlias);
-    if (!resolved) {
-      return Errors.notFound('Room alias not found').toResponse();
+    if (resolved) {
+      roomId = resolved;
+    } else {
+      const remote = await resolveRemoteAlias(c.env, roomIdOrAlias);
+      if (!remote) {
+        return Errors.notFound('Room alias not found').toResponse();
+      }
+      roomId = remote.roomId;
+      aliasServers = remote.servers;
     }
-    roomId = resolved;
   } else {
     roomId = roomIdOrAlias;
   }
 
-  // Check if room exists
   const room = await getRoom(db, roomId);
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
 
-  // Remote rooms (incl. v12 suffix-less IDs) must complete the federation
-  // handshake with the resident server, not just join locally.
-  const residentServer = await getRoomResidentServer(db, roomId);
+  // Remote rooms (incl. v12 suffix-less IDs and rooms unknown locally) must
+  // complete the federation handshake with the resident server.
+  const residentServer =
+    getServerFromRoomId(roomId) ??
+    (room ? await getRoomResidentServer(db, roomId) : null) ??
+    (aliasServers ? aliasServers[0] : null);
   if (residentServer && residentServer !== c.env.SERVER_NAME) {
-    const mem = await getMembership(db, roomId, userId);
-    if (!mem || mem.membership === 'invite') {
+    const mem = room ? await getMembership(db, roomId, userId) : null;
+    if (!mem || mem.membership === 'invite' || mem.membership === 'leave') {
+      if (!room) await ensureRemoteRoomRow(db, roomId, userId);
       const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
         params: { roomId, userId, isRemote: true, remoteServer: residentServer },
       });
@@ -2442,6 +2504,7 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
         }
         const output = status.output as { success?: boolean } | undefined;
         if (status.status === 'complete' && output?.success) {
+          await syncRoomVersionFromCreate(db, roomId);
           return c.json({ room_id: roomId });
         }
         return Errors.unknown('Failed to join remote room').toResponse();
@@ -2450,6 +2513,11 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
         return Errors.unknown('Failed to join remote room').toResponse();
       }
     }
+  }
+
+  // Local rooms must exist; remote unknown rooms were handled above.
+  if (!room) {
+    return Errors.notFound('Room not found').toResponse();
   }
 
   // Check current membership
