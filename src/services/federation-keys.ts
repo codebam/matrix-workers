@@ -581,6 +581,7 @@ export async function makeFederationRequest(
   localServerName: string,
   signingKey: SigningKey,
   cache: KVNamespace,
+  db: D1Database,
   body?: unknown
 ): Promise<Response> {
   // Discover the remote server's endpoint
@@ -614,7 +615,21 @@ export async function makeFederationRequest(
     options.body = JSON.stringify(body);
   }
 
-  return federationFetch(`${serverUrl}${path}`, options);
+  const response = await federationFetch(`${serverUrl}${path}`, options);
+
+  // Record successful outbound federation so the admin panel lists the peer.
+  if (response.ok && serverName !== localServerName) {
+    try {
+      await db.prepare(
+        `INSERT INTO servers (server_name, last_successful_fetch) VALUES (?, ?)
+         ON CONFLICT(server_name) DO UPDATE SET last_successful_fetch = excluded.last_successful_fetch`
+      ).bind(serverName, Date.now()).run();
+    } catch (e) {
+      console.warn('[federation] failed to record server', serverName, e);
+    }
+  }
+
+  return response;
 }
 
 /**
@@ -632,7 +647,7 @@ export async function federationGet(
     throw new Error('Server signing key not configured');
   }
 
-  return makeFederationRequest('GET', serverName, path, localServerName, signingKey, cache);
+  return makeFederationRequest('GET', serverName, path, localServerName, signingKey, cache, db);
 }
 
 /**
@@ -651,7 +666,7 @@ export async function federationPost(
     throw new Error('Server signing key not configured');
   }
 
-  return makeFederationRequest('POST', serverName, path, localServerName, signingKey, cache, body);
+  return makeFederationRequest('POST', serverName, path, localServerName, signingKey, cache, db, body);
 }
 
 /**
@@ -670,5 +685,5 @@ export async function federationPut(
     throw new Error('Server signing key not configured');
   }
 
-  return makeFederationRequest('PUT', serverName, path, localServerName, signingKey, cache, body);
+  return makeFederationRequest('PUT', serverName, path, localServerName, signingKey, cache, db, body);
 }

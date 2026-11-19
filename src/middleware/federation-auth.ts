@@ -195,6 +195,18 @@ export function requireFederationAuth() {
       // Set origin in context for use by handlers
       c.set('federationOrigin' as any, authParams.origin);
 
+      // Record the peer so the admin federation panel reflects real traffic.
+      if (authParams.origin !== serverName) {
+        try {
+          await c.env.DB.prepare(
+            `INSERT INTO servers (server_name, last_successful_fetch) VALUES (?, ?)
+             ON CONFLICT(server_name) DO UPDATE SET last_successful_fetch = excluded.last_successful_fetch`
+          ).bind(authParams.origin, Date.now()).run();
+        } catch (e) {
+          console.warn('[federation-auth] failed to record server', authParams.origin, e);
+        }
+      }
+
       return next();
     } catch (error) {
       console.error(`Federation auth error for ${authParams.origin}:`, error);

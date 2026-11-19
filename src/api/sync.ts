@@ -456,6 +456,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     // Get events since last sync
     const events = await getEventsSince(c.env.DB, roomId, sincePosition);
+    const isInitial = !hasSinceToken || fullState;
 
     // Separate state and timeline events
     let stateEvents: any[] = [];
@@ -474,10 +475,14 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       };
 
       if (event.state_key !== undefined) {
-        // State event - include in both state and timeline
+        // State event - always in the state section. On initial sync keep it
+        // out of the timeline so clients don't render years of old state as
+        // messages; incremental syncs still surface state changes inline.
         stateEvents.push(clientEvent);
+        if (!isInitial) timelineEvents.push(clientEvent);
+      } else {
+        timelineEvents.push(clientEvent);
       }
-      timelineEvents.push(clientEvent);
     }
 
     // Include full state if requested or initial sync
@@ -503,6 +508,15 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     // Apply filters to state and timeline events
     stateEvents = applyEventFilter(stateEvents, filter?.room?.state);
     timelineEvents = applyEventFilter(timelineEvents, filter?.room?.timeline);
+
+    // On initial sync return only a recent timeline window so clients show the
+    // latest messages and backfill older history on demand, instead of walking
+    // the room's entire history.
+    const timelineLimit = filter?.room?.timeline?.limit ?? 20;
+    if (isInitial && timelineEvents.length > timelineLimit) {
+      timelineEvents = timelineEvents.slice(-timelineLimit);
+      joinedRoom.timeline!.limited = true;
+    }
 
     joinedRoom.state!.events = stateEvents;
     joinedRoom.timeline!.events = timelineEvents;
