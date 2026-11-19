@@ -242,16 +242,26 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     const versions = SUPPORTED_ROOM_VERSIONS.map((v) => `ver=${encodeURIComponent(v)}`).join('&');
     const path = `/_matrix/federation/v1/make_join/${encodeURIComponent(roomId)}/${encodeURIComponent(userId)}?${versions}`;
 
-    const response = await federationGet(
-      remoteServer,
-      path,
-      this.env.SERVER_NAME,
-      this.env.DB,
-      this.env.CACHE
-    );
+    let response: Response;
+    try {
+      response = await federationGet(
+        remoteServer,
+        path,
+        this.env.SERVER_NAME,
+        this.env.DB,
+        this.env.CACHE
+      );
+    } catch (e) {
+      console.warn('[RoomJoinWorkflow] make_join transport error', {
+        remoteServer,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
+    }
 
     if (!response.ok) {
       const error = await response.text();
+      console.warn('[RoomJoinWorkflow] make_join non-OK', { remoteServer, status: response.status, error: error.slice(0, 300) });
       throw new Error(`make_join failed: ${response.status} ${error}`);
     }
 

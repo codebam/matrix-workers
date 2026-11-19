@@ -2588,14 +2588,19 @@ app.get('/_matrix/client/v3/directory/room/:roomAlias', async (c) => {
   const alias = decodeURIComponent(c.req.param('roomAlias'));
 
   const roomId = await getRoomByAlias(c.env.DB, alias);
-  if (!roomId) {
-    return Errors.notFound('Room alias not found').toResponse();
+  if (roomId) {
+    return c.json({
+      room_id: roomId,
+      servers: [c.env.SERVER_NAME],
+    });
   }
 
-  return c.json({
-    room_id: roomId,
-    servers: [c.env.SERVER_NAME],
-  });
+  // Remote aliases resolve via the alias server's federation directory.
+  const remote = await resolveRemoteAlias(c.env, alias);
+  if (!remote) {
+    return Errors.notFound('Room alias not found').toResponse();
+  }
+  return c.json({ room_id: remote.roomId, servers: remote.servers });
 });
 
 // PUT /_matrix/client/v3/directory/room/:roomAlias
