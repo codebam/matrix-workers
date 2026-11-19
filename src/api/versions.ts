@@ -164,6 +164,8 @@ app.get('/_matrix/client/versions', (c) => {
       'org.matrix.msc3916.stable': true,
       'org.matrix.label_based_filtering': true,
       'org.matrix.e2e_cross_signing': true,
+      // QR code login (RFC 8628 device authorization grant)
+      'org.matrix.msc4108': true,
       'org.matrix.msc2432': true,
       'org.matrix.msc3440.stable': true,
       'uk.half-shot.msc2666.query_mutual_rooms': true,

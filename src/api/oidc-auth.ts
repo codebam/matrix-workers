@@ -503,7 +503,7 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
     // without this key Element logs "Issuer configuration not valid" and
     // disables OIDC/QR features.
     response_modes_supported: ['query', 'fragment'],
-    grant_types_supported: ['authorization_code', 'refresh_token'],
+    grant_types_supported: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
     code_challenge_methods_supported: ['S256', 'plain'],
     // Additional optional fields that Element Web may check
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],

@@ -7,7 +7,7 @@ import type { AppEnv } from '../types';
 import { requireAuth } from '../middleware/auth';
 import { hashToken, timingSafeEqual, verifyPassword } from '../utils/crypto';
 import { generateAccessToken, generateDeviceId, generateOpaqueId, formatUserId } from '../utils/ids';
-import { createDevice, createAccessToken, getUserById } from '../services/database';
+import { createDevice, createAccessToken, getUserById, getPasswordHash } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -546,8 +546,77 @@ app.post('/oauth/token', async (c) => {
       scope: tokenData.scope,
     });
 
+  } else if (grantType === 'urn:ietf:params:oauth:grant-type:device_code') {
+    // RFC 8628 device authorization grant (MSC4108 QR login).
+    const deviceCode = params.device_code;
+    if (!deviceCode) {
+      return c.json({ error: 'invalid_request', error_description: 'device_code is required' }, 400);
+    }
+    const sessJson = await c.env.SESSIONS.get(`oauth_device:${deviceCode}`);
+    if (!sessJson) {
+      return c.json({ error: 'expired_token', error_description: 'Device code expired or unknown' }, 400);
+    }
+    const sess: DeviceAuthorizationSession = JSON.parse(sessJson);
+    if (sess.client_id !== effectiveClientId) {
+      return c.json({ error: 'invalid_grant', error_description: 'Device code was not issued to this client' }, 400);
+    }
+    if (sess.expires_at < Date.now()) {
+      await c.env.SESSIONS.delete(`oauth_device:${deviceCode}`);
+      return c.json({ error: 'expired_token', error_description: 'Device code expired' }, 400);
+    }
+    if (sess.status === 'pending') {
+      return c.json({ error: 'authorization_pending', error_description: 'Awaiting user approval' }, 400);
+    }
+    if (sess.status === 'denied') {
+      await c.env.SESSIONS.delete(`oauth_device:${deviceCode}`);
+      return c.json({ error: 'access_denied', error_description: 'User denied the device' }, 400);
+    }
+    if (sess.status !== 'approved' || !sess.user_id) {
+      return c.json({ error: 'invalid_grant', error_description: 'Device not approved' }, 400);
+    }
+
+    // Approved: issue tokens for the new device.
+    let deviceId: string | undefined;
+    for (const scope of sess.scope?.split(' ') || []) {
+      for (const prefix of ['urn:matrix:client:device:', 'urn:matrix:org.matrix.msc2967.client:device:']) {
+        if (scope.startsWith(prefix)) { deviceId = scope.slice(prefix.length); break; }
+      }
+      if (deviceId) break;
+    }
+    if (!deviceId || deviceId === '*') deviceId = await generateDeviceId();
+
+    const accessToken = await generateAccessToken();
+    const newRefreshToken = generateRandomString(32);
+    const tokenId = await generateOpaqueId(16);
+    await createDevice(c.env.DB, sess.user_id, deviceId, `QR Client (${client.client_name})`);
+    const tokenHash = await hashToken(accessToken);
+    await createAccessToken(c.env.DB, tokenId, tokenHash, sess.user_id, deviceId);
+    const oauthToken: OAuthToken = {
+      token_id: tokenId,
+      access_token_hash: tokenHash,
+      refresh_token_hash: await hashClientSecret(newRefreshToken),
+      client_id: effectiveClientId,
+      user_id: sess.user_id,
+      device_id: deviceId,
+      scope: sess.scope,
+      created_at: Date.now(),
+      expires_at: Date.now() + 24 * 60 * 60 * 1000,
+    };
+    await c.env.SESSIONS.put(`oauth_refresh:${newRefreshToken}`, JSON.stringify(oauthToken), { expirationTtl: 30 * 24 * 60 * 60 });
+    await c.env.SESSIONS.delete(`oauth_device:${deviceCode}`);
+
+    return c.json({
+      access_token: accessToken,
+      token_type: 'Bearer',
+      expires_in: 86400,
+      refresh_token: newRefreshToken,
+      scope: sess.scope,
+      user_id: sess.user_id,
+      device_id: deviceId,
+    });
+
   } else {
-    return c.json({ error: 'unsupported_grant_type', error_description: 'Only authorization_code and refresh_token grants are supported' }, 400);
+    return c.json({ error: 'unsupported_grant_type', error_description: 'Only authorization_code, refresh_token and device_code grants are supported' }, 400);
   }
 });
 
@@ -1361,5 +1430,107 @@ export function generateUiaErrorPage(title: string, message: string, serverName:
 </body>
 </html>`;
 }
+
+// ============================================
+// RFC 8628 Device Authorization Grant (MSC4108 QR login)
+// ============================================
+
+interface DeviceAuthorizationSession {
+  device_code: string;
+  user_code: string;
+  client_id: string;
+  scope: string;
+  status: 'pending' | 'approved' | 'denied';
+  user_id?: string;
+  created_at: number;
+  expires_at: number;
+}
+
+// POST /oauth/device - Device authorization request (new device shows QR).
+app.post('/oauth/device', async (c) => {
+  const contentType = c.req.header('Content-Type') || '';
+  let params: Record<string, string> = {};
+  if (contentType.includes('application/x-www-form-urlencoded')) {
+    const form = await c.req.formData();
+    for (const [k, v] of form.entries()) params[k] = v as string;
+  } else {
+    params = await c.req.json().catch(() => ({}));
+  }
+  const clientId = params.client_id;
+  if (!clientId) return c.json({ error: 'invalid_request', error_description: 'client_id is required' }, 400);
+  const clientJson = await c.env.CACHE.get(`oauth_client:${clientId}`);
+  if (!clientJson) return c.json({ error: 'invalid_client', error_description: 'Unknown client' }, 401);
+
+  const baseUrl = `https://${c.env.SERVER_NAME}`;
+  const deviceCode = generateRandomString(32);
+  const userCode = (generateRandomString(4) + generateRandomString(4)).toUpperCase();
+  const session: DeviceAuthorizationSession = {
+    device_code: deviceCode,
+    user_code: userCode,
+    client_id: clientId,
+    scope: params.scope || 'openid urn:matrix:client:api:*',
+    status: 'pending',
+    created_at: Date.now(),
+    expires_at: Date.now() + 600_000,
+  };
+  await c.env.SESSIONS.put(`oauth_device:${deviceCode}`, JSON.stringify(session), { expirationTtl: 600 });
+  await c.env.SESSIONS.put(`oauth_device_uc:${userCode}`, deviceCode, { expirationTtl: 600 });
+
+  return c.json({
+    device_code: deviceCode,
+    user_code: userCode,
+    verification_uri: `${baseUrl}/oauth/device/verify`,
+    verification_uri_complete: `${baseUrl}/oauth/device/verify?user_code=${userCode}`,
+    expires_in: 600,
+    interval: 5,
+  });
+});
+
+// GET /oauth/device/verify - Approval page (opened by scanning the QR).
+app.get('/oauth/device/verify', async (c) => {
+  const userCode = (c.req.query('user_code') || '').toUpperCase();
+  return c.html(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Approve device</title></head>
+<body style="font-family:system-ui;max-width:24rem;margin:2rem auto;padding:0 1rem">
+<h1>Approve new device</h1>
+<p>Enter your account credentials to approve the device showing this code.</p>
+<form method="POST" action="/oauth/device/verify">
+<label>Code<br><input name="user_code" value="${userCode}" required style="width:100%;padding:.5rem;margin:.25rem 0"></label><br>
+<label>Username<br><input name="username" autocomplete="username" required style="width:100%;padding:.5rem;margin:.25rem 0"></label><br>
+<label>Password<br><input name="password" type="password" autocomplete="current-password" required style="width:100%;padding:.5rem;margin:.25rem 0"></label><br>
+<button name="action" value="approve" style="padding:.5rem 1rem;margin:.5rem .25rem 0">Approve</button>
+<button name="action" value="deny" style="padding:.5rem 1rem;margin:.5rem .25rem 0">Deny</button>
+</form></body></html>`);
+});
+
+// POST /oauth/device/verify - Approve or deny the pending device.
+app.post('/oauth/device/verify', async (c) => {
+  const form = await c.req.formData();
+  const userCode = String(form.get('user_code') || '').toUpperCase();
+  const username = String(form.get('username') || '');
+  const password = String(form.get('password') || '');
+  const action = String(form.get('action') || 'approve');
+
+  const deviceCode = await c.env.SESSIONS.get(`oauth_device_uc:${userCode}`);
+  if (!deviceCode) return c.html('<p>Unknown or expired code.</p>', 400);
+  const sessJson = await c.env.SESSIONS.get(`oauth_device:${deviceCode}`);
+  if (!sessJson) return c.html('<p>Unknown or expired code.</p>', 400);
+  const sess: DeviceAuthorizationSession = JSON.parse(sessJson);
+
+  if (action === 'deny') {
+    sess.status = 'denied';
+    await c.env.SESSIONS.put(`oauth_device:${deviceCode}`, JSON.stringify(sess), { expirationTtl: 600 });
+    return c.html('<p>Device denied.</p>');
+  }
+
+  const userId = formatUserId(username, c.env.SERVER_NAME);
+  const hash = await getPasswordHash(c.env.DB, userId);
+  if (!hash || !(await verifyPassword(password, hash))) {
+    return c.html('<p>Invalid username or password.</p>', 401);
+  }
+  sess.status = 'approved';
+  sess.user_id = userId;
+  await c.env.SESSIONS.put(`oauth_device:${deviceCode}`, JSON.stringify(sess), { expirationTtl: 600 });
+  return c.html('<p>Device approved. You can close this page and return to the new device.</p>');
+});
 
 export default app;

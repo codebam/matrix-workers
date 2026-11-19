@@ -1896,3 +1896,97 @@ describe('OAuth UIA /oauth/authorize/uia', () => {
     ).toContain('Missing Session');
   });
 });
+
+describe('RFC 8628 device authorization (MSC4108 QR login)', () => {
+  function userDb() {
+    const users = new Map<string, UserRow>([
+      [USER_ID, {
+        user_id: USER_ID, localpart: 'alice', display_name: null, avatar_url: null,
+        password_hash: 'mockok:secret', is_guest: 0, is_deactivated: 0, admin: 0, created_at: 0,
+      }],
+    ]);
+    return createOAuthDb({ users });
+  }
+
+  it('full device flow: pending -> approve -> tokens', async () => {
+    const env = makeEnv({ db: userDb() });
+    const { body: client } = await registerClient(env, {
+      client_name: 'Phone', redirect_uris: [REDIRECT], token_endpoint_auth_method: 'none',
+    });
+    const da = await request('/oauth/device', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: client.client_id, scope: 'openid urn:matrix:client:device:NEWDEV' }),
+    }, env);
+    expect(da.status).toBe(200);
+    const daBody = await da.json() as any;
+    expect(daBody.device_code).toBeTruthy();
+    expect(daBody.user_code).toBeTruthy();
+    expect(daBody.verification_uri_complete).toContain('user_code=');
+
+    const pending = await request('/oauth/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: daBody.device_code, client_id: client.client_id }),
+    }, env);
+    expect(pending.status).toBe(400);
+    expect((await pending.json() as any).error).toBe('authorization_pending');
+
+    const form = new URLSearchParams({ user_code: daBody.user_code, username: 'alice', password: 'secret', action: 'approve' });
+    const approve = await request('/oauth/device/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString(),
+    }, env);
+    expect(approve.status).toBe(200);
+
+    const tok = await request('/oauth/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: daBody.device_code, client_id: client.client_id }),
+    }, env);
+    expect(tok.status).toBe(200);
+    const tokBody = await tok.json() as any;
+    expect(tokBody.access_token).toBeTruthy();
+    expect(tokBody.user_id).toBe(USER_ID);
+    expect(tokBody.device_id).toBe('NEWDEV');
+  });
+
+  it('denied device yields access_denied', async () => {
+    const env = makeEnv({ db: userDb() });
+    const { body: client } = await registerClient(env, {
+      client_name: 'Phone', redirect_uris: [REDIRECT], token_endpoint_auth_method: 'none',
+    });
+    const da = await request('/oauth/device', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: client.client_id }),
+    }, env);
+    const daBody = await da.json() as any;
+    const form = new URLSearchParams({ user_code: daBody.user_code, username: 'alice', password: 'secret', action: 'deny' });
+    await request('/oauth/device/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString(),
+    }, env);
+    const tok = await request('/oauth/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: daBody.device_code, client_id: client.client_id }),
+    }, env);
+    expect((await tok.json() as any).error).toBe('access_denied');
+  });
+
+  it('wrong password does not approve', async () => {
+    const env = makeEnv({ db: userDb() });
+    const { body: client } = await registerClient(env, {
+      client_name: 'Phone', redirect_uris: [REDIRECT], token_endpoint_auth_method: 'none',
+    });
+    const da = await request('/oauth/device', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: client.client_id }),
+    }, env);
+    const daBody = await da.json() as any;
+    const form = new URLSearchParams({ user_code: daBody.user_code, username: 'alice', password: 'wrong', action: 'approve' });
+    const approve = await request('/oauth/device/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString(),
+    }, env);
+    expect(approve.status).toBe(401);
+    const tok = await request('/oauth/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code', device_code: daBody.device_code, client_id: client.client_id }),
+    }, env);
+    expect((await tok.json() as any).error).toBe('authorization_pending');
+  });
+});
