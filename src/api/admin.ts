@@ -2713,26 +2713,44 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
   };
 
   let stored = 0;
-  const stateResp = await federationGet(server, `/_matrix/federation/v1/state/${encodeURIComponent(roomId)}`, c.env.SERVER_NAME, db, c.env.CACHE);
+  let members = 0;
+  const diag: Record<string, unknown> = {};
+  // Synapse's federation /state requires ?event_id= an event the TARGET server
+  // knows; use one authored by that server. There is no /members federation
+  // endpoint — current members come from /state.
+  const latest = await db.prepare(
+    `SELECT event_id FROM events WHERE room_id = ? AND sender LIKE ? ORDER BY stream_ordering DESC LIMIT 1`
+  ).bind(roomId, `%:${server}`).first<{ event_id: string }>();
+  const stateUrl = `/_matrix/federation/v1/state/${encodeURIComponent(roomId)}${latest ? `?event_id=${encodeURIComponent(latest.event_id)}` : ''}`;
+  const stateResp = await federationGet(server, stateUrl, c.env.SERVER_NAME, db, c.env.CACHE);
+  diag.state_status = stateResp.status;
   if (stateResp.ok) {
     const data = await stateResp.json() as { pdus?: any[]; auth_chain?: any[] };
-    for (const ev of [...(data.auth_chain ?? []), ...(data.pdus ?? [])]) if (await storeEv(ev)) stored++;
+    const all = [...(data.auth_chain ?? []), ...(data.pdus ?? [])];
+    // Store non-member state (name/create/topic/…) first so the room renders
+    // quickly; member events are batched below to avoid per-row round trips.
+    for (const ev of all) {
+      if (ev?.type === 'm.room.member') continue;
+      if (await storeEv(ev)) stored++;
+    }
+    const memberEvs = all.filter((ev) => ev?.type === 'm.room.member' && typeof ev.state_key === 'string');
+    for (let i = 0; i < memberEvs.length; i += 100) {
+      const chunk = memberEvs.slice(i, i + 100);
+      const stmts = [];
+      for (const ev of chunk) {
+        const mem = ev.content?.membership;
+        if (!['join', 'invite', 'leave', 'ban', 'knock'].includes(mem)) continue;
+        stmts.push(db.prepare(
+          `INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id) VALUES (?, ?, ?, ?)`
+        ).bind(roomId, ev.state_key, mem, String(ev.event_id ?? '')));
+      }
+      if (stmts.length) { await db.batch(stmts); members += stmts.length; }
+    }
+  } else {
+    diag.state_body = (await stateResp.text()).slice(0, 200);
   }
 
-  let members = 0;
-  let at: string | undefined;
-  for (let page = 0; page < 100; page++) {
-    const q = `?limit=100${at ? `&at=${encodeURIComponent(at)}` : ''}`;
-    const resp = await federationGet(server, `/_matrix/federation/v1/members/${encodeURIComponent(roomId)}${q}`, c.env.SERVER_NAME, db, c.env.CACHE);
-    if (!resp.ok) break;
-    const data = await resp.json() as { chunk?: any[]; end?: string };
-    const chunk = Array.isArray(data.chunk) ? data.chunk : [];
-    for (const ev of chunk) if (await storeEv(ev)) members++;
-    if (chunk.length === 0 || !data.end || data.end === at) break;
-    at = data.end;
-  }
-
-  return c.json({ server, stored_state: stored, stored_members: members });
+  return c.json({ server, stored_state: stored, stored_members: members, diag });
 });
 
 export default app;

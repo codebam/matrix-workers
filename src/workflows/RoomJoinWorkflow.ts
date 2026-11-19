@@ -170,9 +170,12 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           ).bind(roomId, roomId).first<{ c: number | null; n: number | null }>();
           if (!haveEssential?.c || !haveEssential?.n) {
             try {
+              // Synapse's federation /state requires ?event_id=; use the join
+              // event to fetch the current state (name + all current members).
+              // There is no federation /members endpoint.
               const resp = await federationGet(
                 chosenServer ?? remoteServer!,
-                `/_matrix/federation/v1/state/${encodeURIComponent(roomId)}`,
+                `/_matrix/federation/v1/state/${encodeURIComponent(roomId)}?event_id=${encodeURIComponent(joinEventData.event_id)}`,
                 this.env.SERVER_NAME,
                 this.env.DB,
                 this.env.CACHE
@@ -189,34 +192,6 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
                 error: e instanceof Error ? e.message : String(e),
               });
             }
-          }
-
-          // Large rooms omit most members from the join snapshot. Paginate the
-          // federation /members endpoint to store the full member list so the
-          // client shows the correct name/heroes and member count.
-          try {
-            let at: string | undefined;
-            for (let page = 0; page < 100; page++) {
-              const q = `?limit=100${at ? `&at=${encodeURIComponent(at)}` : ''}`;
-              const resp = await federationGet(
-                chosenServer ?? remoteServer!,
-                `/_matrix/federation/v1/members/${encodeURIComponent(roomId)}${q}`,
-                this.env.SERVER_NAME,
-                this.env.DB,
-                this.env.CACHE
-              );
-              if (!resp.ok) break;
-              const data = (await resp.json()) as { chunk?: any[]; end?: string; start?: string };
-              const chunk = Array.isArray(data.chunk) ? data.chunk : [];
-              for (const ev of chunk) await this.storeRemoteStateEvent(ev, roomId);
-              if (chunk.length === 0 || !data.end || data.end === at) break;
-              at = data.end;
-            }
-          } catch (e) {
-            console.warn('[RoomJoinWorkflow] member backfill failed', {
-              roomId,
-              error: e instanceof Error ? e.message : String(e),
-            });
           }
           }
         });
