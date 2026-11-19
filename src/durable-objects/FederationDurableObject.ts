@@ -56,6 +56,10 @@ export class FederationDurableObject extends DurableObject<Env> {
       return this.handleSend(request);
     }
 
+    if (path === '/queue') {
+      return this.handleQueue(request);
+    }
+
     if (path === '/receive') {
       return this.handleReceive(request);
     }
@@ -116,6 +120,37 @@ export class FederationDurableObject extends DurableObject<Env> {
     // Try to send immediately
     await this.processFederationQueue(data.destination);
 
+    return new Response('Queued');
+  }
+
+  // Durable queue-only endpoint: store the PDU and arm the alarm, without an
+  // immediate remote send. Called synchronously by the send path so queueing
+  // survives even if waitUntil subrequests are cancelled; the alarm drains it.
+  private async handleQueue(request: Request): Promise<Response> {
+    const data = await request.json() as {
+      destination: string;
+      event_id: string;
+      room_id: string;
+      pdu: any;
+    };
+    const outboundEvent: OutboundEvent = {
+      event_id: data.event_id,
+      room_id: data.room_id,
+      destination: data.destination,
+      pdu: data.pdu,
+      created_at: Date.now(),
+      retry_count: 0,
+    };
+    await this.ctx.storage.put(`queue:${data.destination}:${data.event_id}`, outboundEvent);
+    // Register a due target so alarm() drains this destination.
+    const existing = await this.ctx.storage.get(`server:${data.destination}`) as FederationTarget | undefined;
+    await this.ctx.storage.put(`server:${data.destination}`, {
+      serverName: data.destination,
+      lastContact: existing?.lastContact ?? 0,
+      retryCount: existing?.retryCount ?? 0,
+      nextRetry: Date.now(),
+    });
+    await this.ctx.storage.setAlarm(Date.now() + 100);
     return new Response('Queued');
   }
 

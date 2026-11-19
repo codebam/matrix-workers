@@ -1516,7 +1516,7 @@ async function queueFederationPdu(
     await Promise.allSettled(batch.map(async (destination) => {
       try {
         const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(destination));
-        await fedDO.fetch(new Request('http://internal/send', {
+        await fedDO.fetch(new Request('http://internal/queue', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ destination, event_id: eventId, room_id: roomId, pdu }),
@@ -1704,14 +1704,11 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   // Notify all room members that a new message was sent (wakes up long-polling syncs)
   await notifyUsersOfEvent(c.env, roomId, event.event_id, eventType);
 
-  // Hand the wire PDU to the federation delivery queue in the background so a
-  // room with hundreds of member servers doesn't block the client's send.
+  // Durably queue the wire PDU for federation before responding (fast storage
+  // puts, batched); the Federation DO alarm performs the actual delivery and
+  // retries, so it survives even if waitUntil subrequests are cancelled.
   if (wirePdu) {
-    c.executionCtx.waitUntil(
-      queueFederationPdu(c.env, remoteServers, wirePdu, event.event_id, roomId).catch(err => {
-        console.error('[rooms] Federation fanout error:', err);
-      })
-    );
+    await queueFederationPdu(c.env, remoteServers, wirePdu, event.event_id, roomId);
   }
 
   // Send push notifications via durable workflow (fire and forget)
