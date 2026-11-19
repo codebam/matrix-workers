@@ -519,14 +519,17 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
     // Matrix authentication service extension (MSC3861/MSC4191)
     // account_management_uri is where users can manage their account
     account_management_uri: `${baseUrl}/admin`,
-    // Supported account management actions per MSC4191
-    // Element X uses these to determine what features are available
+    // Supported account management actions per MSC4191. Only use values the
+    // matrix-dart-sdk enum knows (profile, cross_signing_reset, device_*,
+    // account_deactivate); unknown strings make FluffyChat's non-null enum
+    // lookup throw during discovery.
     account_management_actions_supported: [
-      'org.matrix.profile',              // View/edit profile
-      'org.matrix.sessions_list',        // View list of sessions  
-      'org.matrix.session_view',         // View details of a specific session
-      'org.matrix.session_end',          // End/logout a specific session
-      'org.matrix.cross_signing_reset',  // Reset cross-signing keys (identity reset)
+      'org.matrix.profile',
+      'org.matrix.cross_signing_reset',
+      'org.matrix.devices_list',
+      'org.matrix.device_view',
+      'org.matrix.device_delete',
+      'org.matrix.account_deactivate',
     ],
     // Device authorization endpoint for QR code login (MSC4108)
     device_authorization_endpoint: `${baseUrl}/oauth/device`,
