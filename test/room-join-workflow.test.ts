@@ -378,7 +378,7 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     expect(federationPut).toHaveBeenCalled();
     const putPath = federationPut.mock.calls[0][1];
     expect(putPath).toContain('/_matrix/federation/v2/send_join/');
-    expect(putPath).toContain(encodeURIComponent('$generated:example.com'));
+    expect(putPath).toContain(encodeURIComponent('$wire:reference-hash'));
     // Remote state + auth chain + counter-signed join persisted for auth checks.
     const idempotentIds = storeEventIdempotent.mock.calls.map(
       (c) => (c[1] as { event_id: string }).event_id

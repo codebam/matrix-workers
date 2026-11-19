@@ -12,7 +12,6 @@ import { generateEventId } from '../utils/ids';
 import { calculateContentHash, signJson } from '../utils/crypto';
 import {
   computeWireEventId,
-  isMsc4291RoomVersion,
   redactEventForSigning,
   toWireEventObject,
 } from '../utils/event-signing';
@@ -43,6 +42,10 @@ export interface JoinParams {
   isRemote: boolean;
   remoteServer?: string;
   reason?: string;
+  // Additional participant servers (from directory resolution) to try if the
+  // resident server is unreachable or rejects us (e.g. it fetches keys on a
+  // port we don't serve).
+  servers?: string[];
 }
 
 // Result returned when workflow completes
@@ -70,13 +73,17 @@ interface SerializableEvent {
 
 export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   async run(event: WorkflowEvent<JoinParams>, step: WorkflowStep): Promise<JoinResult> {
-    const { roomId, userId, isRemote, remoteServer, displayName, avatarUrl, reason } = event.payload;
+    const { roomId, userId, isRemote, remoteServer, displayName, avatarUrl, reason, servers } = event.payload;
 
     console.log('[RoomJoinWorkflow] Starting join', { roomId, userId, isRemote, remoteServer });
 
+    // Resident first, then any directory-provided participants, deduplicated.
+    const candidateServers = [...new Set([remoteServer, ...(servers ?? [])].filter((s): s is string => !!s))];
+    let chosenServer = remoteServer;
+
     try {
       // Step 1: For remote joins, get join template from remote server
-      let remoteEventTemplate: { room_version: string; event: any } | null = null;
+      let remoteEventTemplate: { room_version: string; event: any; server?: string } | null = null;
       if (isRemote && remoteServer) {
         remoteEventTemplate = await step.do('make-join', {
           retries: {
@@ -86,8 +93,10 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           },
           timeout: 30000, // 30 seconds in milliseconds
         }, async () => {
-          return await this.makeJoinRequest(remoteServer, roomId, userId);
-        }) as { room_version: string; event: any } | null;
+          return await this.makeJoinWithFallback(candidateServers, roomId, userId);
+        }) as { room_version: string; event: any; server?: string } | null;
+
+        if (remoteEventTemplate?.server) chosenServer = remoteEventTemplate.server;
 
         // Validate the remote-supplied template before trusting any of its
         // fields (auth_events, prev_events, depth, room_id, sender, state_key).
@@ -121,7 +130,7 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           },
           timeout: 30000,
         }, async () => {
-          return await this.sendJoinRequest(remoteServer, roomId, joinEventData);
+          return await this.sendJoinRequest(chosenServer ?? remoteServer, roomId, joinEventData);
         })) as { auth_chain?: any[]; state?: any[]; event?: any };
       }
 
@@ -230,6 +239,33 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   }
 
   // Make an authenticated make_join request to a remote server
+  // Try make_join against the resident server first, then fallback participants.
+  // Some residents fetch our signing key on a port we don't serve (8448) and
+  // reject us; other participants in the same room may accept over 443.
+  private async makeJoinWithFallback(
+    candidates: string[],
+    roomId: string,
+    userId: string
+  ): Promise<{ room_version: string; event: any; server: string }> {
+    let lastError: unknown = new Error('No candidate servers');
+    for (const server of candidates) {
+      try {
+        const result = await this.makeJoinRequest(server, roomId, userId);
+        // A 2xx with a null/empty body means "no template"; fall through to
+        // local creation rather than treating it as a valid template.
+        if (!result) return null as unknown as { room_version: string; event: any; server: string };
+        return { ...result, server };
+      } catch (e) {
+        lastError = e;
+        console.warn('[RoomJoinWorkflow] make_join candidate failed', {
+          server,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    throw lastError;
+  }
+
   private async makeJoinRequest(
     remoteServer: string,
     roomId: string,
@@ -339,14 +375,11 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       prev_events: prevEvents,
     };
 
-    // MSC4291 room versions (12+) do not carry an `event_id` on the wire —
-    // the resident server derives it as the reference hash — and signatures
-    // cover the redacted event, not the full one. Sending an explicit
-    // event_id gets the whole join rejected with "Invalid event JSON".
-    // Earlier room versions (including plain 11) keep the legacy shape.
-    const wireFormat =
-      !!remoteEventTemplate?.event &&
-      isMsc4291RoomVersion(String(remoteEventTemplate.room_version));
+    // Remote joins (any room version) must use the v4+ wire form: the event ID
+    // is the reference hash and signatures cover the *redacted* event. Sending
+    // a random ID or a full-event signature gets the join rejected by the
+    // resident server. Pure-local joins keep the legacy shape below.
+    const wireFormat = !!remoteEventTemplate?.event;
 
     if (wireFormat) {
       const hashed = {
@@ -399,19 +432,29 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
 
     const path = `/_matrix/federation/v2/send_join/${encodeURIComponent(roomId)}/${encodeURIComponent(joinEvent.event_id)}`;
 
-    const response = await federationPut(
-      remoteServer,
-      path,
-      // v4+ events must not carry event_id on the wire; the resident server
-      // derives the reference hash itself.
-      toWireEventObject(joinEvent as unknown as Record<string, unknown>),
-      this.env.SERVER_NAME,
-      this.env.DB,
-      this.env.CACHE
-    );
+    let response: Response;
+    try {
+      response = await federationPut(
+        remoteServer,
+        path,
+        // v4+ events must not carry event_id on the wire; the resident server
+        // derives the reference hash itself.
+        toWireEventObject(joinEvent as unknown as Record<string, unknown>),
+        this.env.SERVER_NAME,
+        this.env.DB,
+        this.env.CACHE
+      );
+    } catch (e) {
+      console.warn('[RoomJoinWorkflow] send_join transport error', {
+        remoteServer,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      throw e;
+    }
 
     if (!response.ok) {
       const error = await response.text();
+      console.warn('[RoomJoinWorkflow] send_join non-OK', { remoteServer, status: response.status, error: error.slice(0, 300) });
       throw new Error(`send_join failed: ${response.status} ${error}`);
     }
 

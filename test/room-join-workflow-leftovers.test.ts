@@ -738,7 +738,7 @@ describe('room-join leftovers content / clock / gate soft flood after #171', () 
       expect(federationGet.mock.calls[0][1]).toContain('ver=12');
       expect(federationPut.mock.calls[0][1]).toContain(encodeURIComponent(roomId));
       expect(federationPut.mock.calls[0][1]).toContain(
-        encodeURIComponent('$generated:example.com')
+        encodeURIComponent('$wire:reference-hash')
       );
     }
   });
