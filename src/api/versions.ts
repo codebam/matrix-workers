@@ -76,14 +76,10 @@ app.get('/.well-known/openid-configuration', (c) => {
     subject_types_supported: ['public'],
     id_token_signing_alg_values_supported: ['RS256', 'ES256'],
     claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'name', 'email'],
-    // Matrix-specific extension
-    'org.matrix.matrix-authentication-service': {
-      // No MAS GraphQL API; omit graphql_endpoint (a null here breaks clients
-      // that cast it to String, e.g. FluffyChat).
-      account: {
-        issuer: baseUrl,
-      },
-    },
+    // Note: no org.matrix.matrix-authentication-service extension here. We do
+    // not implement MAS GraphQL; clients (FluffyChat) cast graphql_endpoint to
+    // String and crash on null/missing. Account management is advertised via
+    // /_matrix/client/v1/auth_metadata instead.
   });
 });
 
