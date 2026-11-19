@@ -70,6 +70,9 @@ vi.mock('../src/api/oidc-auth', async (importOriginal) => {
 });
 
 import adminApp from '../src/api/admin';
+import federationApp from '../src/api/federation';
+import versionsApp from '../src/api/versions';
+import loginApp from '../src/api/login';
 
 const ADMIN = '@admin:example.com';
 const BOB = '@bob:example.com';
@@ -2130,39 +2133,36 @@ describe('admin rooms + media + federation', () => {
   });
 
   it('federation test aggregates well-known/key/version outcomes', async () => {
-    const fetchMock = vi.fn(async (url: string) => {
-      if (String(url).includes('/.well-known/matrix/server')) {
+    const vSpy = vi.spyOn(versionsApp, 'request').mockImplementation(async (path: string) => {
+      if (String(path).includes('/.well-known/matrix/server')) {
         return Response.json({ 'm.server': `${SERVER}:443` });
       }
-      if (String(url).includes('/_matrix/key/v2/server')) {
+      return new Response('nope', { status: 404 });
+    });
+    const fSpy = vi.spyOn(federationApp, 'request').mockImplementation(async (path: string) => {
+      if (String(path).includes('/_matrix/key/v2/server')) {
         return Response.json({ verify_keys: { 'ed25519:a': { key: 'x' } } });
       }
-      if (String(url).includes('/_matrix/federation/v1/version')) {
-        return Response.json({ server: { name: 'tuwunel', version: '1' } });
-      }
-      if (String(url).includes('/.well-known/matrix/client')) {
-        return new Response('nope', { status: 404 });
-      }
-      return new Response('err', { status: 500 });
+      return Response.json({ server: { name: 'tuwunel', version: '1' } });
     });
-    vi.stubGlobal('fetch', fetchMock);
     const res = await req('/admin/api/federation/test');
     const body = await res.json();
     expect(body.tests).toHaveLength(4);
     expect(body.tests.filter((t: { passed: boolean }) => t.passed)).toHaveLength(3);
     expect(body.success).toBe(false);
-    vi.unstubAllGlobals();
+    vSpy.mockRestore();
+    fSpy.mockRestore();
   });
 
   it('federation test records fetch exceptions', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => {
-      throw new Error('network down');
-    }));
+    const vSpy = vi.spyOn(versionsApp, 'request').mockRejectedValue(new Error('network down'));
+    const fSpy = vi.spyOn(federationApp, 'request').mockRejectedValue(new Error('network down'));
     const res = await req('/admin/api/federation/test');
     const body = await res.json();
     expect(body.success).toBe(false);
     expect(body.tests.every((t: { passed: boolean }) => !t.passed)).toBe(true);
-    vi.unstubAllGlobals();
+    vSpy.mockRestore();
+    fSpy.mockRestore();
   });
 });
 
@@ -2173,6 +2173,26 @@ describe('admin config / registration / audit / reports / notices', () => {
     expect(body.server_name).toBe(SERVER);
     expect(body.features.federation).toBe(true);
     expect(body.limits.max_upload_size).toBe(50 * 1024 * 1024);
+  });
+
+  it('blocks registration when the admin toggle disables it', async () => {
+    const adminDO = createAdminDO({ config: { registration_enabled: false } });
+    const env = createEnv({ adminDO });
+    const res = await loginApp.request(
+      'http://localhost/_matrix/client/v3/register',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: 'newuser',
+          password: 'Passw0rd!',
+          auth: { type: 'm.login.dummy' },
+        }),
+      },
+      env
+    );
+    expect(res.status).toBe(403);
+    expect((await res.json()).errcode).toBe('M_FORBIDDEN');
   });
 
   it('gets and puts registration via Admin DO', async () => {

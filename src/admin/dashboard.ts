@@ -2444,6 +2444,7 @@ export const adminDashboardHtml = (serverName: string) => `
     // API helper
     async function api(endpoint, options = {}) {
       const res = await fetch(endpoint, {
+        cache: 'no-store',
         ...options,
         headers: {
           'Authorization': \`Bearer \${accessToken}\`,
@@ -2455,9 +2456,11 @@ export const adminDashboardHtml = (serverName: string) => `
         logout();
         throw new Error('Unauthorized');
       }
-      const data = await res.json();
+      const text = await res.text();
+      let data = {};
+      try { data = text ? JSON.parse(text) : {}; } catch { /* non-JSON error body */ }
       if (!res.ok) {
-        throw new Error(data.error || data.errcode || \`HTTP \${res.status}\`);
+        throw new Error(data.error || data.errcode || \`HTTP \${res.status}: \${text.slice(0, 120)}\`);
       }
       return data;
     }

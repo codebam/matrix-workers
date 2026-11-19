@@ -30,6 +30,22 @@ import { requireAuth, extractAccessToken } from '../middleware/auth';
 
 const app = new Hono<AppEnv>();
 
+// The admin portal's registration toggle lives in the Admin Durable Object.
+// Enforce it here; when the binding is absent (tests) or unreadable, fall back
+// to allowing registration rather than locking everyone out.
+async function registrationDisabled(env: import('../types').Env): Promise<boolean> {
+  if (!env.ADMIN) return false;
+  try {
+    const stub = env.ADMIN.get(env.ADMIN.idFromName('global'));
+    const res = await stub.fetch('http://internal/config');
+    if (!res.ok) return false;
+    const config = (await res.json()) as { registration_enabled?: boolean };
+    return config.registration_enabled === false;
+  } catch {
+    return false;
+  }
+}
+
 // GET /_matrix/client/v3/login - Get supported login flows
 app.get('/_matrix/client/v3/login', async (c) => {
   const flows: Record<string, unknown>[] = [
@@ -405,6 +421,10 @@ app.post('/_matrix/client/v3/register', async (c) => {
   const kind = c.req.query('kind') || 'user';
   if (kind !== 'user' && kind !== 'guest') {
     return Errors.invalidParam('kind', 'Invalid registration kind').toResponse();
+  }
+
+  if (await registrationDisabled(c.env)) {
+    return Errors.forbidden('Registration is disabled').toResponse();
   }
 
   const isGuest = kind === 'guest';

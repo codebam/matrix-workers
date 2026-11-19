@@ -9,8 +9,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 execute matrix-db --file=./migrations/schema.sql --remote",
-    "db:migrate:local": "wrangler d1 execute matrix-db --local --file=./migrations/schema.sql",
+    "db:migrate": "wrangler d1 execute matrix-db-codebam --file=./migrations/schema.sql --remote",
+    "db:migrate:local": "wrangler d1 execute matrix-db-codebam --local --file=./migrations/schema.sql",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:media-presence-soft-concurrent": "vitest run test/media-api-concurrent-race-leftovers.test.ts test/media-api-soft-residual-second-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-third-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-fourth-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-fifth-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-sixth-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-seventh-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-eighth-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-ninth-wave-concurrent-race-leftovers.test.ts test/media-api-soft-residual-tenth-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-concurrent-soft-leftovers.test.ts test/presence-receipts-typing-soft-residual-second-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-third-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-fourth-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-fifth-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-sixth-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-seventh-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-eighth-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-ninth-wave-concurrent-race-leftovers.test.ts test/presence-receipts-typing-soft-residual-tenth-wave-concurrent-race-leftovers.test.ts",

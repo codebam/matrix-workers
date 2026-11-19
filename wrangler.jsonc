@@ -1,6 +1,8 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "matrix-worker",
+	// Fresh codebam.ca instance. SERVER_NAME drives MXIDs (@user:codebam.ca),
+	// discovery base_url, OAuth issuer and federation signatures.
+	"name": "matrix-worker-codebam",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-01-01",
 	"compatibility_flags": [
@@ -12,40 +14,40 @@
 	"d1_databases": [
 		{
 			"binding": "DB",
-			"database_name": "matrix-db",
-			"database_id": "20a0c96e-4689-4c3f-a13d-5c2609206001"
+			"database_name": "matrix-db-codebam",
+			"database_id": "02928f6d-13b2-4938-bd6b-86120b8df99a"
 		}
 	],
 	"kv_namespaces": [
 		{
 			"binding": "SESSIONS",
-			"id": "d58938f6b342452f904e50d719baf287"
+			"id": "e96c8615f19348eebd4de52d0553fe93"
 		},
 		{
 			"binding": "DEVICE_KEYS",
-			"id": "a4f3fefe2fdb45ac99da508ec945cae6"
+			"id": "a7d9aca53cee486f8330fe75f81b558b"
 		},
 		{
 			"binding": "CACHE",
-			"id": "96b2281cd4684db69488ca123f688bdd"
+			"id": "5d1b24e51b7a4f99a21f2619ea61742f"
 		},
 		{
 			"binding": "CROSS_SIGNING_KEYS",
-			"id": "277e185f16bd40aeb9be8e2a63da2eab"
+			"id": "a02d8bcced28443d9d258d0a4eb83426"
 		},
 		{
 			"binding": "ACCOUNT_DATA",
-			"id": "48ba210a0fb84acba18cc83885ea0fee"
+			"id": "63949e48e6664978812eef89785e46e4"
 		},
 		{
 			"binding": "ONE_TIME_KEYS",
-			"id": "a553a406f9b14bb4bceab70366f56bdb"
+			"id": "b142990abe7347839995ba89035fb0e3"
 		}
 	],
 	"r2_buckets": [
 		{
 			"binding": "MEDIA",
-			"bucket_name": "matrix-media-codebam"
+			"bucket_name": "matrix-media-codebam-ca"
 		}
 	],
 	"durable_objects": {
@@ -125,15 +127,29 @@
 		}
 	],
 	"vars": {
-		"SERVER_NAME": "matrix.codebam.ca",
+		"SERVER_NAME": "codebam.ca",
 		"SERVER_VERSION": "0.1.0",
 		"REGISTRATION_REQUIRE_TOKEN": "true"
 	},
+	// Path routes, not a custom domain: codebam.ca stays owned by the
+	// codebam-ca website Worker. Cloudflare evaluates the most specific
+	// matching route first, so these Matrix paths win over the website's
+	// hostname-wide custom domain and everything else falls through to it.
+	// No /matrix prefix: federation and discovery require root-level paths.
+	// Every pattern ends in a wildcard: an exact-path route (no trailing *)
+	// stops matching once a query string is present and falls through to the
+	// website, which broke /admin?action=… from Element's manage-device link.
 	"routes": [
-		{
-			"pattern": "matrix.codebam.ca",
-			"custom_domain": true
-		}
+		"codebam.ca/_matrix/*",
+		"codebam.ca/oauth/*",
+		"codebam.ca/.well-known/matrix/*",
+		"codebam.ca/.well-known/openid-configuration*",
+		"codebam.ca/.well-known/jwks.json*",
+		"codebam.ca/admin*",
+		"codebam.ca/_synapse/*",
+		"codebam.ca/auth/oidc/*",
+		"codebam.ca/calls/*",
+		"codebam.ca/health*"
 	],
 	"send_email": [
 		{
@@ -143,12 +159,12 @@
 	],
 	"workflows": [
 		{
-			"name": "room-join-workflow",
+			"name": "room-join-workflow-codebam",
 			"binding": "ROOM_JOIN_WORKFLOW",
 			"class_name": "RoomJoinWorkflow"
 		},
 		{
-			"name": "push-notification-workflow",
+			"name": "push-notification-workflow-codebam",
 			"binding": "PUSH_NOTIFICATION_WORKFLOW",
 			"class_name": "PushNotificationWorkflow"
 		}

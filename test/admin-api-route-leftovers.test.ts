@@ -105,6 +105,8 @@ vi.mock('../src/api/oidc-auth', async (importOriginal) => {
 });
 
 import adminApp from '../src/api/admin';
+import federationApp from '../src/api/federation';
+import versionsApp from '../src/api/versions';
 
 const ADMIN = '@admin:example.com';
 const BOB = '@bob:example.com';
@@ -3811,9 +3813,8 @@ describe('admin leftovers federation status/servers soft flood after #241', () =
 describe('admin leftovers federation/test soft flood after #241', () => {
   for (let i = 0; i < 10; i++) {
     it(`federation/test fetch-fail soft-${i}`, async () => {
-      vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
-        throw new Error(`net-soft-${i}`);
-      });
+      vi.spyOn(versionsApp, 'request').mockRejectedValue(new Error(`net-soft-${i}`));
+      vi.spyOn(federationApp, 'request').mockRejectedValue(new Error(`net-soft-${i}`));
       const res = await jsonReq('/admin/api/federation/test');
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(false);
@@ -3823,11 +3824,18 @@ describe('admin leftovers federation/test soft flood after #241', () => {
 
   for (let i = 0; i < 8; i++) {
     it(`federation/test mixed HTTP soft-${i}`, async () => {
-      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      vi.spyOn(versionsApp, 'request').mockImplementation(async (input: any) => {
         const url = String(input);
         if (url.includes('/.well-known/matrix/server')) {
           return Response.json({ 'm.server': `${SERVER}:443` });
         }
+        if (url.includes('/.well-known/matrix/client')) {
+          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+        }
+        return new Response('missing', { status: 404 });
+      });
+      vi.spyOn(federationApp, 'request').mockImplementation(async (input: any) => {
+        const url = String(input);
         if (url.includes('/_matrix/key/v2/server')) {
           return i % 2 === 0
             ? Response.json({ verify_keys: { 'ed25519:a': { key: 'x' } } })
@@ -3835,9 +3843,6 @@ describe('admin leftovers federation/test soft flood after #241', () => {
         }
         if (url.includes('/_matrix/federation/v1/version')) {
           return Response.json({ server: { name: 'matrix-worker', version: 't' } });
-        }
-        if (url.includes('/.well-known/matrix/client')) {
-          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
         }
         return new Response('missing', { status: 404 });
       });
@@ -4249,19 +4254,23 @@ describe('admin leftovers media DELETE / login-token clamp / federation-test sof
 
   for (let i = 0; i < 8; i++) {
     it(`federation/test all-success soft-${i}`, async () => {
-      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      vi.spyOn(versionsApp, 'request').mockImplementation(async (input: any) => {
         const url = String(input);
         if (url.includes('/.well-known/matrix/server')) {
           return Response.json({ 'm.server': `${SERVER}:443` });
         }
+        if (url.includes('/.well-known/matrix/client')) {
+          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+        }
+        return new Response('missing', { status: 404 });
+      });
+      vi.spyOn(federationApp, 'request').mockImplementation(async (input: any) => {
+        const url = String(input);
         if (url.includes('/_matrix/key/v2/server')) {
           return Response.json({ verify_keys: { 'ed25519:a': { key: 'x' } } });
         }
         if (url.includes('/_matrix/federation/v1/version')) {
           return Response.json({ server: { name: 'matrix-worker', version: 't' } });
-        }
-        if (url.includes('/.well-known/matrix/client')) {
-          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
         }
         return new Response('missing', { status: 404 });
       });
@@ -4276,19 +4285,23 @@ describe('admin leftovers media DELETE / login-token clamp / federation-test sof
 
   for (let i = 0; i < 8; i++) {
     it(`federation/test empty verify_keys soft-${i}`, async () => {
-      vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+      vi.spyOn(versionsApp, 'request').mockImplementation(async (input: any) => {
         const url = String(input);
         if (url.includes('/.well-known/matrix/server')) {
           return Response.json({ 'm.server': `${SERVER}:443` });
         }
+        if (url.includes('/.well-known/matrix/client')) {
+          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+        }
+        return new Response('missing', { status: 404 });
+      });
+      vi.spyOn(federationApp, 'request').mockImplementation(async (input: any) => {
+        const url = String(input);
         if (url.includes('/_matrix/key/v2/server')) {
           return Response.json({ verify_keys: {} });
         }
         if (url.includes('/_matrix/federation/v1/version')) {
           return Response.json({ server: { name: 'matrix-worker', version: 't' } });
-        }
-        if (url.includes('/.well-known/matrix/client')) {
-          return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
         }
         return new Response('missing', { status: 404 });
       });

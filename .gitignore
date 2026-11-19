@@ -28,6 +28,9 @@ npm-debug.log*
 # Test coverage
 coverage/
 
+# Local database/media backups
+backups/
+
 # TypeScript
 *.tsbuildinfo
 

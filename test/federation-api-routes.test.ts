@@ -1632,6 +1632,39 @@ describe('make_join / send_join / make_leave / send_leave', () => {
     expect((ok.body as { servers_in_room?: string[] }).servers_in_room).toContain(SERVER);
   });
 
+  it('send_join v2 persists the inbound join for legacy rooms', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    const ok = await req(
+      'PUT',
+      `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/%24jlegacy`,
+      env,
+      {
+        room_id: ROOM,
+        type: 'm.room.member',
+        sender: REMOTE_USER,
+        state_key: REMOTE_USER,
+        content: { membership: 'join' },
+        auth_events: [],
+        prev_events: [],
+        origin_server_ts: Date.now(),
+        depth: 5,
+      }
+    );
+    expect(ok.status).toBe(200);
+    const b = ok.body as { state: Array<{ type: string; state_key?: string; content: { membership?: string } }> };
+    const join = b.state.find((s) => s.type === 'm.room.member' && s.state_key === REMOTE_USER);
+    expect(join?.content.membership).toBe('join');
+
+    // The remote user is now a resident member, so make_leave no longer 403s.
+    const leave = await req(
+      'GET',
+      `/_matrix/federation/v1/make_leave/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+      env
+    );
+    expect(leave.status).toBe(200);
+  });
+
   it('make_leave forbids non-members and returns leave template', async () => {
     const db = seedBasicRoom();
     const forbidden = await req(

@@ -103,6 +103,8 @@ vi.mock('../src/api/oidc-auth', async (importOriginal) => {
 });
 
 import adminApp from '../src/api/admin';
+import federationApp from '../src/api/federation';
+import versionsApp from '../src/api/versions';
 
 type SelectBarrier = { match: (sql: string, args: unknown[]) => boolean; count: number };
 
@@ -1913,19 +1915,23 @@ function statusesOf(results: Array<{ status: number }>): number[] {
 }
 
 function mockFederationSelfTestFetch() {
-  return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL) => {
+  vi.spyOn(versionsApp, 'request').mockImplementation(async (input: any) => {
     const url = String(input);
     if (url.includes('/.well-known/matrix/server')) {
       return Response.json({ 'm.server': `${SERVER}:443` });
     }
+    if (url.includes('/.well-known/matrix/client')) {
+      return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
+    }
+    return new Response('missing', { status: 404 });
+  });
+  vi.spyOn(federationApp, 'request').mockImplementation(async (input: any) => {
+    const url = String(input);
     if (url.includes('/_matrix/key/v2/server')) {
       return Response.json({ verify_keys: { 'ed25519:test': { key: 'AAAA' } } });
     }
     if (url.includes('/_matrix/federation/v1/version')) {
       return Response.json({ server: { name: 'matrix-worker', version: 'tuwunel-test-0.1.0' } });
-    }
-    if (url.includes('/.well-known/matrix/client')) {
-      return Response.json({ 'm.homeserver': { base_url: `https://${SERVER}` } });
     }
     return new Response('missing', { status: 404 });
   });

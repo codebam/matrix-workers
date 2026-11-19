@@ -12,6 +12,7 @@ import { encryptSecret } from './oidc-auth';
 import { fetchOIDCDiscovery } from '../services/oidc';
 import { logAdminAction } from '../services/admin-audit';
 import federation from './federation';
+import versions from './versions';
 
 const app = new Hono<AppEnv>();
 
@@ -463,7 +464,7 @@ app.get('/admin/api/federation/status', requireAuth(), requireAdmin, async (c) =
     federation_enabled: true,
     signing_key_id: signingKeyId || `ed25519:a_${serverName.replace(/\./g, '_').substring(0, 4)}`,
     known_servers_count: serversCount?.count || 0,
-  });
+  }, 200, { 'Cache-Control': 'no-store' });
 });
 
 // GET /admin/api/federation/test - Run federation self-tests
@@ -471,10 +472,13 @@ app.get('/admin/api/federation/test', requireAuth(), requireAdmin, async (c) => 
   const serverName = c.env.SERVER_NAME;
   const tests: Array<{ name: string; passed: boolean; message: string }> = [];
 
+  // Self-tests run in-process. A same-zone fetch() to a route-based URL is
+  // not permitted on Cloudflare and falls through to the website Worker, so
+  // the public fetch path cannot verify this server (it returned 404/Network
+  // error under path routing). Mirrors the key-check endpoint's approach.
   // Test 1: Check .well-known/matrix/server
   try {
-    const wellKnownUrl = `https://${serverName}/.well-known/matrix/server`;
-    const resp = await fetch(wellKnownUrl);
+    const resp = await versions.request('http://localhost/.well-known/matrix/server', {}, c.env);
     if (resp.ok) {
       const data = await resp.json() as any;
       tests.push({
@@ -499,8 +503,7 @@ app.get('/admin/api/federation/test', requireAuth(), requireAdmin, async (c) => 
 
   // Test 2: Check /_matrix/key/v2/server
   try {
-    const keysUrl = `https://${serverName}/_matrix/key/v2/server`;
-    const resp = await fetch(keysUrl);
+    const resp = await federation.request('http://localhost/_matrix/key/v2/server', {}, c.env);
     if (resp.ok) {
       const data = await resp.json() as any;
       const hasSigningKeys = data.verify_keys && Object.keys(data.verify_keys).length > 0;
@@ -526,8 +529,7 @@ app.get('/admin/api/federation/test', requireAuth(), requireAdmin, async (c) => 
 
   // Test 3: Check /_matrix/federation/v1/version
   try {
-    const versionUrl = `https://${serverName}/_matrix/federation/v1/version`;
-    const resp = await fetch(versionUrl);
+    const resp = await federation.request('http://localhost/_matrix/federation/v1/version', {}, c.env);
     if (resp.ok) {
       const data = await resp.json() as any;
       tests.push({
@@ -552,8 +554,7 @@ app.get('/admin/api/federation/test', requireAuth(), requireAdmin, async (c) => 
 
   // Test 4: Check .well-known/matrix/client
   try {
-    const clientWellKnown = `https://${serverName}/.well-known/matrix/client`;
-    const resp = await fetch(clientWellKnown);
+    const resp = await versions.request('http://localhost/.well-known/matrix/client', {}, c.env);
     if (resp.ok) {
       const data = await resp.json() as any;
       tests.push({
@@ -582,7 +583,7 @@ app.get('/admin/api/federation/test', requireAuth(), requireAdmin, async (c) => 
     success: allPassed,
     server_name: serverName,
     tests,
-  });
+  }, 200, { 'Cache-Control': 'no-store' });
 });
 
 // GET /admin/api/federation/key-check - Tester-equivalent validation of our own
@@ -740,7 +741,7 @@ app.get('/admin/api/config', requireAuth(), requireAdmin, async (c) => {
     limits: {
       max_upload_size: 50 * 1024 * 1024,
     },
-  });
+  }, 200, { 'Cache-Control': 'no-store' });
 });
 
 // POST /admin/api/make-admin - Make a user an admin
@@ -1494,7 +1495,7 @@ app.get('/admin/api/registration', requireAuth(), requireAdmin, async (c) => {
 
   return c.json({
     enabled: config.registration_enabled,
-  });
+  }, 200, { 'Cache-Control': 'no-store' });
 });
 
 // PUT /admin/api/registration - Toggle registration (via AdminDurableObject)

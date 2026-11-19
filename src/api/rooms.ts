@@ -111,7 +111,6 @@ async function createInitialRoomEvents(
   prebuiltCreate?: { eventId: string; pduBase: Record<string, unknown>; hashes: Record<string, string> }
 ): Promise<string> {
   const db = env.DB;
-  const serverName = env.SERVER_NAME;
   const now = Date.now();
 
   interface PlannedEvent {
@@ -206,9 +205,8 @@ async function createInitialRoomEvents(
       return prepared.wireId;
     }
 
-    const eventId = await generateEventId(serverName, roomVersion);
     const pdu: PDU = {
-      event_id: eventId,
+      event_id: '',
       room_id: roomId,
       sender: creatorId,
       type,
@@ -219,8 +217,21 @@ async function createInitialRoomEvents(
       auth_events: [...authEvents],
       prev_events: [...prevEvents],
     };
-    const hash = await calculateContentHash(pdu as unknown as Record<string, unknown>);
-    pdu.hashes = { sha256: hash };
+    // Room v3+ event IDs are reference hashes and peers verify our server
+    // signature, so legacy rooms hash+sign like derived ones (but keep
+    // room_id and the full auth_events selection). Without a signing key
+    // (local-only/test rooms) fall back to a generated ID, unsigned.
+    const prepared = await prepareOutboundPdu(env, pdu, roomVersion);
+    let eventId: string;
+    if (prepared) {
+      eventId = prepared.wireId;
+      pdu.hashes = prepared.hashes as PDU['hashes'];
+      pdu.signatures = prepared.signatures as PDU['signatures'];
+    } else {
+      eventId = await generateEventId(env.SERVER_NAME, roomVersion);
+      pdu.hashes = { sha256: await calculateContentHash(pdu as unknown as Record<string, unknown>) };
+    }
+    pdu.event_id = eventId;
 
     // Validate row size up front; fail fast before submitting the batch.
     validateEventSize(pdu);
@@ -304,6 +315,13 @@ async function createInitialRoomEvents(
   let guestAccess = 'forbidden';
   if (preset === 'public_chat') guestAccess = 'can_join';
   await plan('m.room.guest_access', { guest_access: guestAccess }, '');
+
+  // 7. E2EE for direct / trusted-private chats: Element expects DMs to be
+  // encrypted and shows "unencrypted" otherwise.
+  const hasEncryption = (options.initial_state ?? []).some((s) => s.type === 'm.room.encryption');
+  if ((options.is_direct || preset === 'trusted_private_chat') && !hasEncryption) {
+    await plan('m.room.encryption', { algorithm: 'm.megolm.v1.aes-sha2' }, '');
+  }
 
   if (options.name) {
     await plan('m.room.name', { name: options.name }, '');
@@ -1349,7 +1367,14 @@ async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): 
     event.hashes = prepared.hashes as PDU['hashes'];
     event.signatures = prepared.signatures as PDU['signatures'];
   } else {
-    event.event_id = await generateEventId(env.SERVER_NAME, roomVersion);
+    const prepared = await prepareOutboundPdu(env, event, roomVersion);
+    if (prepared) {
+      event.event_id = prepared.wireId;
+      event.hashes = prepared.hashes as PDU['hashes'];
+      event.signatures = prepared.signatures as PDU['signatures'];
+    } else {
+      event.event_id = await generateEventId(env.SERVER_NAME, roomVersion);
+    }
   }
   await storeEvent(env.DB, event);
   await fanoutEventToAppServices(env, event);

@@ -606,12 +606,12 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           const keyIds = Object.keys(pdu.signatures[signatory]);
           for (const keyId of keyIds) {
             try {
-              // v4+ signatures cover the *redacted* event, so verify that
-              // form first; fall back to the legacy full-event form for
+              // v4+ signatures cover the *redacted* wire form (no event_id,
+              // no unsigned); fall back to the legacy full-event form for
               // older room versions.
               const isValid =
                 (await verifyRemoteSignature(
-                  redactEventForSigning(pdu as Record<string, unknown>),
+                  redactEventForSigning(toWireEventObject(pdu as Record<string, unknown>)),
                   signatory,
                   keyId,
                   c.env.DB,
@@ -1072,7 +1072,7 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   // Get current room state
   const stateEvents = await c.env.DB.prepare(
     `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.depth, e.auth_events, e.prev_events
+     e.origin_server_ts, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures
      FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
      WHERE rs.room_id = ?`
@@ -1087,6 +1087,8 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     depth: number;
     auth_events: string;
     prev_events: string;
+    hashes: string | null;
+    signatures: string | null;
   }>();
 
   const pdus = stateEvents.results.map(e => ({
@@ -1100,6 +1102,8 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     depth: e.depth,
     auth_events: JSON.parse(e.auth_events),
     prev_events: JSON.parse(e.prev_events),
+    hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
+    signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
   }));
 
   // Get auth chain
@@ -1114,7 +1118,7 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   for (const authId of authEventIds) {
     const authEvent = await c.env.DB.prepare(
       `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events
+       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
        FROM events WHERE event_id = ?`
     ).bind(authId).first();
 
@@ -1125,6 +1129,8 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
         content: JSON.parse((authEvent as any).content),
         auth_events: JSON.parse((authEvent as any).auth_events),
         prev_events: JSON.parse((authEvent as any).prev_events),
+        hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
+        signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
       });
     }
   }
@@ -1681,7 +1687,7 @@ async function persistInboundJoin(
   if (!signingKey) return null;
 
   const signed = await signJson(
-    redactEventForSigning(joinEvent),
+    redactEventForSigning(toWireEventObject(joinEvent)),
     env.SERVER_NAME,
     signingKey.keyId,
     signingKey.privateKeyJwk
@@ -1709,6 +1715,66 @@ async function persistInboundJoin(
   }
 
   return wireId;
+}
+
+// Legacy rooms (v1-10) keep the reference-hash event ID the joining server
+// assigned, so unlike persistInboundJoin we must not recompute a derived ID.
+async function persistLegacyInboundJoin(
+  env: Env,
+  roomId: string,
+  joinEvent: Record<string, unknown>,
+  origin?: string
+): Promise<string | null> {
+  if (
+    joinEvent['room_id'] !== roomId ||
+    joinEvent['type'] !== 'm.room.member' ||
+    (joinEvent['content'] as { membership?: string } | undefined)?.membership !== 'join' ||
+    typeof joinEvent['state_key'] !== 'string' ||
+    joinEvent['state_key'] !== joinEvent['sender'] ||
+    typeof joinEvent['event_id'] !== 'string'
+  ) {
+    return null;
+  }
+  if (origin) {
+    const sender = typeof joinEvent['sender'] === 'string' ? joinEvent['sender'] : '';
+    const senderServer = sender.includes(':') ? sender.slice(sender.indexOf(':') + 1) : '';
+    if (senderServer !== origin) return null;
+  }
+  const eventId = joinEvent['event_id'] as string;
+  const existing = await env.DB.prepare(
+    `SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?`
+  ).bind(roomId, joinEvent['state_key']).first<{ membership: string }>();
+  if (existing?.membership === 'join') return eventId;
+
+  const signingKey = await getServerSigningKey(env.DB);
+  if (signingKey) {
+    // v4+ signatures cover the wire form: no event_id, no unsigned. Signing
+    // with event_id present produces a signature peers cannot verify.
+    const wire = toWireEventObject(joinEvent);
+    const signed = await signJson(
+      redactEventForSigning(wire),
+      env.SERVER_NAME,
+      signingKey.keyId,
+      signingKey.privateKeyJwk
+    );
+    const ourSig = (signed as { signatures?: Record<string, unknown> }).signatures?.[env.SERVER_NAME];
+    joinEvent['signatures'] = {
+      ...((joinEvent['signatures'] as Record<string, unknown> | undefined) ?? {}),
+      ...(ourSig ? { [env.SERVER_NAME]: ourSig } : {}),
+    };
+  }
+  const event = joinEvent as unknown as PDU;
+  await storeEvent(env.DB, event);
+  await updateMembership(env.DB, roomId, event.state_key as string, 'join', eventId);
+  await fanoutEventToAppServices(env, event);
+
+  const localMembers = await env.DB.prepare(
+    `SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join' AND user_id LIKE ?`
+  ).bind(roomId, `%:${env.SERVER_NAME}`).all<{ user_id: string }>();
+  for (const member of localMembers.results ?? []) {
+    await notifyUserSync(env, member.user_id, 'events');
+  }
+  return eventId;
 }
 
 // POST /_matrix/federation/v1/make_join/:roomId/:userId - Prepare join request
@@ -1826,6 +1892,16 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   // then serve the room's state in wire form -- peers only exchange derived
   // IDs, so locally stored events must be translated before they leave.
   const v1Derived = isMsc4291RoomVersion(room.room_version);
+  if (!v1Derived) {
+    // send_join carries the event ID in the URL; the PDU body may omit it.
+    if (!body.event_id) body.event_id = eventId;
+    await persistLegacyInboundJoin(
+      c.env,
+      roomId,
+      body as Record<string, unknown>,
+      c.get('federationOrigin' as any) as string | undefined
+    );
+  }
   if (v1Derived) {
     const storedJoinId = await persistInboundJoin(
       c.env,
@@ -1952,6 +2028,16 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
   // then serve the room's state in wire form -- peers only exchange derived
   // IDs, so locally stored events must be translated before they leave.
   const v2Derived = isMsc4291RoomVersion(room.room_version);
+  if (!v2Derived) {
+    // send_join carries the event ID in the URL; the PDU body may omit it.
+    if (!body.event_id) body.event_id = eventId;
+    await persistLegacyInboundJoin(
+      c.env,
+      roomId,
+      body as Record<string, unknown>,
+      c.get('federationOrigin' as any) as string | undefined
+    );
+  }
   if (v2Derived) {
     const storedJoinId = await persistInboundJoin(
       c.env,
