@@ -590,17 +590,37 @@ function getServerFromRoomId(roomId: string): string | null {
   return match ? match[1] : null;
 }
 
+// Resident server for a room. Legacy room IDs carry a :server suffix; MSC4291
+// (v12) room IDs do not, so fall back to the create event's sender domain.
+async function getRoomResidentServer(
+  db: D1Database,
+  roomId: string
+): Promise<string | null> {
+  const suffix = getServerFromRoomId(roomId);
+  if (suffix) return suffix;
+  const create = await getStateEvent(db, roomId, 'm.room.create');
+  const sender = (create as { sender?: string } | null)?.sender;
+  if (typeof sender === 'string' && sender.includes(':')) {
+    return sender.slice(sender.indexOf(':') + 1);
+  }
+  return null;
+}
+
 // POST /_matrix/client/v3/rooms/:roomId/join - Join a room
 app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
 
-  // Extract server from room ID to check if it's a remote room
-  const roomServer = getServerFromRoomId(roomId);
+  // Extract server from room ID to check if it's a remote room. v12 room IDs
+  // have no suffix, so fall back to the create event's sender domain.
+  const room = await getRoom(c.env.DB, roomId);
+  const roomServer =
+    getServerFromRoomId(roomId) ??
+    (room ? await getRoomResidentServer(c.env.DB, roomId) : null);
   const isRemoteRoom = roomServer && roomServer !== c.env.SERVER_NAME;
 
   // Check if room exists locally
-  const room = await getRoom(c.env.DB, roomId);
+  // (room already loaded above)
 
   // Remote rooms go through the workflow for the federation handshake: either
   // the room is unknown locally, or we only hold invite state received from
@@ -2404,6 +2424,32 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   const room = await getRoom(db, roomId);
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Remote rooms (incl. v12 suffix-less IDs) must complete the federation
+  // handshake with the resident server, not just join locally.
+  const residentServer = await getRoomResidentServer(db, roomId);
+  if (residentServer && residentServer !== c.env.SERVER_NAME) {
+    const mem = await getMembership(db, roomId, userId);
+    if (!mem || mem.membership === 'invite') {
+      const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
+        params: { roomId, userId, isRemote: true, remoteServer: residentServer },
+      });
+      try {
+        const status = await instance.status();
+        if (status.status === 'running' || status.status === 'queued') {
+          return c.json({ room_id: roomId });
+        }
+        const output = status.output as { success?: boolean } | undefined;
+        if (status.status === 'complete' && output?.success) {
+          return c.json({ room_id: roomId });
+        }
+        return Errors.unknown('Failed to join remote room').toResponse();
+      } catch (err) {
+        console.error('[rooms] Workflow error', { roomId, error: err });
+        return Errors.unknown('Failed to join remote room').toResponse();
+      }
+    }
   }
 
   // Check current membership
