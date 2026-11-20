@@ -1104,6 +1104,7 @@ describe('makeFederationRequest / federationGet|Post|Put TOKENMAXX after #63', (
       'local.example.com',
       { keyId: pair.keyId, privateKeyJwk: pair.privateKeyJwk },
       kv,
+      { prepare: () => ({ bind: () => ({ run: async () => ({ meta: { changes: 1 } }) }) }) } as unknown as D1Database,
       body
     );
 

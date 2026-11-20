@@ -41,6 +41,8 @@ import appservice from './api/appservice';
 import thirdparty from './api/thirdparty';
 import identity from './api/identity';
 import dehydratedDevice from './api/dehydrated-device';
+import delayedEvents from './api/delayed-events';
+import rendezvous from './api/rendezvous';
 // import qrLogin from './api/qr-login'; // QR feature commented out - requires MSC4108/OIDC for Element X
 import oidcAuth from './api/oidc-auth';
 import oauth from './api/oauth';
@@ -51,7 +53,7 @@ import { analyticsMiddleware } from './middleware/analytics';
 import { federationGet, federationPost } from './services/federation-keys';
 
 // Import Durable Objects
-export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject } from './durable-objects';
+export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject, DelayedEventsDurableObject } from './durable-objects';
 
 // Import Workflows
 export { RoomJoinWorkflow, PushNotificationWorkflow, FederationCatchupWorkflow, MediaCleanupWorkflow, StateCompactionWorkflow } from './workflows';
@@ -64,8 +66,8 @@ const app = new Hono<AppEnv>();
 app.use('*', cors({
   origin: '*',
   allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowHeaders: ['Content-Type', 'Authorization', 'X-Matrix-Origin'],
-  exposeHeaders: ['Content-Type', 'Content-Length'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-Matrix-Origin', 'If-Match', 'If-None-Match'],
+  exposeHeaders: ['Content-Type', 'Content-Length', 'ETag', 'Location', 'X-Max-Bytes', 'Expires', 'Last-Modified'],
   maxAge: 86400,
 }));
 
@@ -123,6 +125,8 @@ app.route('/', versions);
 // Client-Server API
 app.route('/', login);
 app.route('/', rooms);
+app.route('/', delayedEvents);
+app.route('/', rendezvous);
 app.route('/', sync);
 app.route('/', legacySync);
 app.route('/', slidingSync);
@@ -202,6 +206,12 @@ app.get('/_matrix/client/v3/capabilities', (c) => {
       // by the profile endpoints, so no allowed/disallowed restriction.
       'm.profile_fields': {
         enabled: true,
+      },
+      // MSC4140 delayed events: clients treat an absent capability as
+      // disabled, so advertise the server's limits explicitly.
+      'org.matrix.msc4140.delayed_events': {
+        max_delay_ms: 86400000,
+        max_scheduled: 10,
       },
     },
   });

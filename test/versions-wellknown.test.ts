@@ -22,6 +22,7 @@ describe('versions module /.well-known/matrix/client', () => {
     expect(body).toEqual({
       'm.homeserver': { base_url: 'https://matrix.example.com' },
       'org.matrix.msc3575.proxy': { url: 'https://matrix.example.com' },
+      'io.element.rendezvous': { server: 'https://matrix.example.com' },
     });
   });
 
@@ -116,7 +117,11 @@ describe('versions module /.well-known/openid-configuration', () => {
     const { body } = await getJson('/.well-known/openid-configuration');
     expect(body.response_types_supported).toEqual(['code']);
     expect(body.response_modes_supported).toEqual(['query', 'fragment']);
-    expect(body.grant_types_supported).toEqual(['authorization_code', 'refresh_token']);
+    expect(body.grant_types_supported).toEqual([
+      'authorization_code',
+      'refresh_token',
+      'urn:ietf:params:oauth:grant-type:device_code',
+    ]);
     expect(body.token_endpoint_auth_methods_supported).toEqual([
       'client_secret_basic',
       'client_secret_post',
@@ -136,12 +141,10 @@ describe('versions module /.well-known/openid-configuration', () => {
     ]);
   });
 
-  it('sets Matrix Authentication Service graphql_endpoint to null and account.issuer', async () => {
+  it('omits the MAS extension (FluffyChat null-cast) and advertises the device grant endpoint', async () => {
     const { body } = await getJson('/.well-known/openid-configuration');
-    expect(body['org.matrix.matrix-authentication-service']).toEqual({
-      graphql_endpoint: null,
-      account: { issuer: 'https://matrix.example.com' },
-    });
+    expect(body).not.toHaveProperty('org.matrix.matrix-authentication-service');
+    expect(body.device_authorization_endpoint).toBe('https://matrix.example.com/oauth/device');
   });
 });
 
@@ -327,6 +330,7 @@ describe('versions TOKENMAXX HEAVY after #83 — discovery leftovers', () => {
       env({ LIVEKIT_URL: 'wss://lk.test', LIVEKIT_API_KEY: 'k' })
     );
     expect(Object.keys(body).sort()).toEqual([
+      'io.element.rendezvous',
       'm.homeserver',
       'org.matrix.msc3575.proxy',
       'org.matrix.msc4143.rtc_foci',
@@ -405,23 +409,27 @@ describe('versions TOKENMAXX HEAVY after #83 — discovery leftovers', () => {
         'org.matrix.msc3827.stable',
         'org.matrix.msc3881',
         'org.matrix.msc3882',
+        'org.matrix.msc3886',
+        'org.matrix.msc3906',
         'org.matrix.msc3916.stable',
+        'org.matrix.msc4108',
+        'org.matrix.msc4140',
         'org.matrix.msc4143',
+        'org.matrix.msc4155',
+        'org.matrix.msc4222',
         'org.matrix.simplified_msc3575',
         'uk.half-shot.msc2666.query_mutual_rooms',
       ].sort()
     );
   });
 
-  it('embeds SERVER_NAME into OIDC account.issuer identically to issuer', async () => {
+  it('embeds SERVER_NAME into OIDC issuer and device authorization endpoint', async () => {
     const { body } = await getJson(
       '/.well-known/openid-configuration',
       env({ SERVER_NAME: 'oidc.smtp.eth' })
     );
     expect(body.issuer).toBe('https://oidc.smtp.eth');
-    expect(body['org.matrix.matrix-authentication-service'].account.issuer).toBe(
-      'https://oidc.smtp.eth'
-    );
+    expect(body.device_authorization_endpoint).toBe('https://oidc.smtp.eth/oauth/device');
     expect(body.jwks_uri).toBe('https://oidc.smtp.eth/.well-known/jwks.json');
   });
 

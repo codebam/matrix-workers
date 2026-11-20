@@ -120,6 +120,18 @@ export const Errors = {
     return new MatrixApiError(ErrorCodes.M_TOO_LARGE, message, 413);
   },
 
+  inviteBlocked(message: string = 'The recipient does not accept invites from you'): MatrixApiError {
+    return new MatrixApiError(ErrorCodes.ORG_MATRIX_MSC4155_M_INVITE_BLOCKED, message, 403);
+  },
+
+  delayTooLarge(message: string = 'The requested delay exceeds the maximum allowed'): MatrixApiError {
+    return new MatrixApiError(ErrorCodes.ORG_MATRIX_MSC4140_DELAY_TOO_LARGE, message, 400);
+  },
+
+  concurrentWrite(message: string = 'The rendezvous payload was modified concurrently'): MatrixApiError {
+    return new MatrixApiError(ErrorCodes.M_CONCURRENT_WRITE, message, 412);
+  },
+
   conflict(message: string = 'State changed concurrently; retry the operation'): MatrixApiError {
     // 409 Conflict — the auth basis for the request was invalidated by a
     // concurrent state change. Standard Matrix has no errcode for this case

@@ -1090,7 +1090,7 @@ describe('quinary oauth refresh/grant soft descriptions after #277/#276 tip', ()
         (r) =>
           r.status === 400 &&
           r.body.error_description ===
-            'Only authorization_code and refresh_token grants are supported'
+            'Only authorization_code, refresh_token and device_code grants are supported'
       )
     ).toBe(true);
     expect(results.find((r) => r.status === 200)!.body.access_token).toBeTruthy();
@@ -1123,7 +1123,7 @@ describe('quinary oauth refresh/grant soft descriptions after #277/#276 tip', ()
               }
             : {
                 body: { grant_type: 'client_credentials', client_id: 'cid-1' },
-                desc: 'Only authorization_code and refresh_token grants are supported',
+                desc: 'Only authorization_code, refresh_token and device_code grants are supported',
               };
       const results = await Promise.all([
         request('/oauth/token', urlencoded(soft.body), env),

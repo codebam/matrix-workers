@@ -3566,7 +3566,11 @@ describe('race leftover oidc providers list + auth_metadata fields after #232', 
     for (const r of results) {
       expect(r.body.revocation_endpoint).toBe(`https://${SERVER}/oauth/revoke`);
       expect(r.body.code_challenge_methods_supported).toEqual(['S256', 'plain']);
-      expect(r.body.grant_types_supported).toEqual(['authorization_code', 'refresh_token']);
+      expect(r.body.grant_types_supported).toEqual([
+        'authorization_code',
+        'refresh_token',
+        'urn:ietf:params:oauth:grant-type:device_code',
+      ]);
       expect(r.body.token_endpoint_auth_methods_supported).toContain('none');
       expect(r.body.device_authorization_endpoint).toBe(`https://${SERVER}/oauth/device`);
       expect(r.body.prompt_values_supported).toEqual(['create']);

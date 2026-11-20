@@ -951,16 +951,17 @@ describe('oidc leftovers auth_metadata contract after #143', () => {
     expect(scopes).toContain('urn:matrix:org.matrix.msc2967.client:api:*');
   });
 
-  it('account_management_actions_supported has five entries in source order', async () => {
+  it('account_management_actions_supported has six SDK-known entries in source order', async () => {
     const { body } = await request(META_PATH);
     const actions = (body as { account_management_actions_supported: string[] })
       .account_management_actions_supported;
     expect(actions).toEqual([
       'org.matrix.profile',
-      'org.matrix.sessions_list',
-      'org.matrix.session_view',
-      'org.matrix.session_end',
       'org.matrix.cross_signing_reset',
+      'org.matrix.devices_list',
+      'org.matrix.device_view',
+      'org.matrix.device_delete',
+      'org.matrix.account_deactivate',
     ]);
   });
 
@@ -972,7 +973,11 @@ describe('oidc leftovers auth_metadata contract after #143', () => {
       token_endpoint_auth_methods_supported: string[];
       prompt_values_supported: string[];
     };
-    expect(meta.grant_types_supported).toEqual(['authorization_code', 'refresh_token']);
+    expect(meta.grant_types_supported).toEqual([
+      'authorization_code',
+      'refresh_token',
+      'urn:ietf:params:oauth:grant-type:device_code',
+    ]);
     expect(meta.code_challenge_methods_supported).toEqual(['S256', 'plain']);
     expect(meta.token_endpoint_auth_methods_supported).toEqual([
       'client_secret_basic',

@@ -110,6 +110,70 @@ export async function getPasswordHash(db: D1Database, userId: string): Promise<s
   return result?.password_hash ?? null;
 }
 
+// MSC4155: invite filtering. The recipient's global account data
+// `m.invite_permission_config` (unstable type
+// `org.matrix.msc4155.invite_permission_config`) holds glob lists evaluated
+// in the MSC's order; `m.ignored_user_list` takes precedence. 'block' means
+// invite endpoints must 403; 'ignore' means the invite is accepted but
+// withheld from the recipient's sync responses.
+export type InvitePermission = 'allow' | 'ignore' | 'block';
+
+function globMatches(glob: string, value: string): boolean {
+  const pattern = glob
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*/g, '.*')
+    .replace(/\?/g, '.');
+  return new RegExp(`^${pattern}$`).test(value);
+}
+
+function matchesAny(globs: unknown, value: string): boolean {
+  if (!Array.isArray(globs)) return false;
+  return globs.some((g) => typeof g === 'string' && globMatches(g, value));
+}
+
+export async function getInvitePermission(
+  db: D1Database,
+  recipientUserId: string,
+  inviterUserId: string
+): Promise<InvitePermission> {
+  const rows = await db.prepare(
+    `SELECT event_type, content FROM account_data
+     WHERE user_id = ? AND room_id = ''
+       AND event_type IN ('m.ignored_user_list', 'm.invite_permission_config', 'org.matrix.msc4155.invite_permission_config')`
+  ).bind(recipientUserId).all<{ event_type: string; content: string }>();
+
+  const byType = new Map(rows.results.map((r) => [r.event_type, r.content]));
+  const parse = (type: string): any => {
+    try {
+      return JSON.parse(byType.get(type) ?? 'null');
+    } catch {
+      return null;
+    }
+  };
+
+  const ignoredUsers = parse('m.ignored_user_list')?.ignored_users;
+  if (Array.isArray(ignoredUsers)) {
+    if (ignoredUsers.includes(inviterUserId)) return 'ignore';
+  } else if (ignoredUsers && typeof ignoredUsers === 'object' && inviterUserId in ignoredUsers) {
+    return 'ignore';
+  }
+
+  const config =
+    parse('m.invite_permission_config') ?? parse('org.matrix.msc4155.invite_permission_config');
+  if (!config || typeof config !== 'object') return 'allow';
+  if (config.enabled === false) return 'allow';
+
+  // Server globs match the domain with any port suffix stripped (server ACLs).
+  const inviterServer = inviterUserId.split(':').slice(1).join(':').replace(/:\d+$/, '');
+  if (matchesAny(config.allowed_users, inviterUserId)) return 'allow';
+  if (matchesAny(config.ignored_users, inviterUserId)) return 'ignore';
+  if (matchesAny(config.blocked_users, inviterUserId)) return 'block';
+  if (matchesAny(config.allowed_servers, inviterServer)) return 'allow';
+  if (matchesAny(config.ignored_servers, inviterServer)) return 'ignore';
+  if (matchesAny(config.blocked_servers, inviterServer)) return 'block';
+  return 'allow';
+}
+
 export async function updateUserProfile(
   db: D1Database,
   userId: string,

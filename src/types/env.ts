@@ -23,6 +23,7 @@ export interface Env {
   USER_KEYS: DurableObjectNamespace;
   PUSH: DurableObjectNamespace;
   RATE_LIMIT: DurableObjectNamespace;
+  DELAYED_EVENTS: DurableObjectNamespace;
 
   // Environment variables
   SERVER_NAME: string;

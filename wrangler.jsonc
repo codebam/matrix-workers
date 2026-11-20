@@ -83,6 +83,10 @@
 			{
 				"name": "RATE_LIMIT",
 				"class_name": "RateLimitDurableObject"
+			},
+			{
+				"name": "DELAYED_EVENTS",
+				"class_name": "DelayedEventsDurableObject"
 			}
 		]
 	},
@@ -123,6 +127,12 @@
 			"tag": "v6",
 			"new_sqlite_classes": [
 				"RateLimitDurableObject"
+			]
+		},
+		{
+			"tag": "v7",
+			"new_sqlite_classes": [
+				"DelayedEventsDurableObject"
 			]
 		}
 	],

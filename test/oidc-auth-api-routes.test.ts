@@ -1171,7 +1171,7 @@ describe('GET /_matrix/client/v1/auth_metadata', () => {
       // js-sdk's isValidAuthMetadata requires both response modes; Element
       // logs "Issuer configuration not valid" without them.
       response_modes_supported: ['query', 'fragment'],
-      grant_types_supported: ['authorization_code', 'refresh_token'],
+      grant_types_supported: ['authorization_code', 'refresh_token', 'urn:ietf:params:oauth:grant-type:device_code'],
       code_challenge_methods_supported: ['S256', 'plain'],
       device_authorization_endpoint: `https://${SERVER}/oauth/device`,
       account_management_uri: `https://${SERVER}/admin`,
@@ -1207,10 +1207,11 @@ describe('GET /_matrix/client/v1/auth_metadata', () => {
     expect(meta.account_management_actions_supported).toEqual(
       expect.arrayContaining([
         'org.matrix.profile',
-        'org.matrix.sessions_list',
-        'org.matrix.session_view',
-        'org.matrix.session_end',
         'org.matrix.cross_signing_reset',
+        'org.matrix.devices_list',
+        'org.matrix.device_view',
+        'org.matrix.device_delete',
+        'org.matrix.account_deactivate',
       ])
     );
     expect(meta.token_endpoint_auth_methods_supported).toContain('none');

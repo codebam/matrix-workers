@@ -8,6 +8,7 @@ import {
   getRoomState,
   getEventsSince,
   getLatestStreamPosition,
+  getInvitePermission,
 } from '../services/database';
 import { getToDeviceMessages } from './to-device';
 import {
@@ -304,6 +305,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Parse query parameters
   const since = c.req.query('since');
   const fullState = c.req.query('full_state') === 'true';
+  const useStateAfter = c.req.query('use_state_after') === 'true';
   const filterParam = c.req.query('filter');
 
   // Load filter if specified
@@ -518,9 +520,31 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       joinedRoom.timeline!.limited = true;
     }
 
-    joinedRoom.state!.events = stateEvents;
     joinedRoom.timeline!.events = timelineEvents;
     joinedRoom.timeline!.prev_batch = sincePosition.toString();
+
+    // MSC4222 (opt-in via ?use_state_after=true): state_after replaces state
+    // and carries the room state at the end of the timeline window (i.e. the
+    // current state), so clients can render the latest state without
+    // re-applying the timeline themselves. Without the flag the legacy
+    // `state` section is kept byte-for-byte as before.
+    if (useStateAfter) {
+      delete joinedRoom.state;
+      const afterState = await getRoomState(c.env.DB, roomId);
+      joinedRoom.state_after = {
+        events: afterState.map((e) => ({
+          type: e.type,
+          state_key: e.state_key,
+          content: e.content,
+          sender: e.sender,
+          origin_server_ts: e.origin_server_ts,
+          event_id: e.event_id,
+          room_id: e.room_id,
+        })),
+      };
+    } else {
+      joinedRoom.state!.events = stateEvents;
+    }
 
     // Get room-level account data
     let roomAccountData = await getRoomAccountData(
@@ -567,6 +591,19 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
 
     const state = await getRoomState(c.env.DB, roomId);
+
+    // MSC4155: an 'ignore' decision accepts the invite but withholds it from
+    // the recipient's sync. The inviter is the sender of the invitee's own
+    // m.room.member event.
+    const inviteEvent = state.find(
+      (e) => e.type === 'm.room.member' && e.state_key === userId
+    );
+    if (
+      inviteEvent &&
+      (await getInvitePermission(c.env.DB, userId, inviteEvent.sender)) === 'ignore'
+    ) {
+      continue;
+    }
 
     // Strip state for invited rooms
     let strippedState = state.map(event => ({
@@ -632,7 +669,9 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Check if there are any changes to return
   const hasRoomChanges = Object.keys(response.rooms!.join!).some(roomId => {
     const room = response.rooms!.join![roomId];
-    return room.timeline!.events.length > 0 || room.state!.events.length > 0;
+    return room.timeline!.events.length > 0
+      || (room.state?.events.length ?? 0) > 0
+      || (room.state_after?.events.length ?? 0) > 0;
   });
   const hasInvites = Object.keys(response.rooms!.invite!).length > 0;
   const hasLeaves = Object.keys(response.rooms!.leave!).length > 0;

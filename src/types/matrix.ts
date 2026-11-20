@@ -258,6 +258,10 @@ export interface JoinedRoom {
   state?: {
     events: MatrixEvent[];
   };
+  // MSC4222: room state after the timeline window (current state).
+  state_after?: {
+    events: MatrixEvent[];
+  };
   timeline?: {
     events: MatrixEvent[];
     limited?: boolean;
@@ -415,6 +419,13 @@ export const ErrorCodes = {
   // (power levels / membership) changed between the permission check and the
   // attempted write. Clients should re-fetch state and retry.
   M_CONFLICT: 'M_CONFLICT',
+  // MSC4155 (unstable): the recipient's invite permission config blocks the
+  // inviter.
+  ORG_MATRIX_MSC4155_M_INVITE_BLOCKED: 'ORG.MATRIX.MSC4155.M_INVITE_BLOCKED',
+  // MSC4140 (unstable): requested delay exceeds the server's max_delay_ms.
+  ORG_MATRIX_MSC4140_DELAY_TOO_LARGE: 'ORG.MATRIX.MSC4140_DELAY_TOO_LARGE',
+  // MSC3886: rendezvous payload write with a stale If-Match ETag.
+  M_CONCURRENT_WRITE: 'M_CONCURRENT_WRITE',
 } as const;
 
 export type ErrorCode = typeof ErrorCodes[keyof typeof ErrorCodes];

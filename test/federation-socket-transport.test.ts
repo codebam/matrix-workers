@@ -440,6 +440,7 @@ describe('makeFederationRequest over the socket transport', () => {
       'local.example',
       signingKey!,
       cache,
+      { prepare: () => ({ bind: () => ({ run: async () => ({ meta: { changes: 1 } }) }) }) } as unknown as D1Database,
       { pdus: {} }
     );
 

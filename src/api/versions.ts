@@ -18,6 +18,11 @@ app.get('/.well-known/matrix/client', (c) => {
     'org.matrix.msc3575.proxy': {
       url: baseUrl,
     },
+    // Legacy QR login (MSC3906): Element probes this well-known key for a
+    // rendezvous server; ours speaks the MSC3886 HTTP transport.
+    'io.element.rendezvous': {
+      server: baseUrl,
+    },
   };
 
   // Add MatrixRTC (LiveKit) focus if configured
@@ -165,6 +170,16 @@ app.get('/_matrix/client/versions', (c) => {
       'org.matrix.e2e_cross_signing': true,
       // QR code login (RFC 8628 device authorization grant)
       'org.matrix.msc4108': true,
+      // MSC4222: state_after in sync responses
+      'org.matrix.msc4222': true,
+      // MSC4155: invite filtering (m.invite_permission_config)
+      'org.matrix.msc4155': true,
+      // MSC4140: delayed events
+      'org.matrix.msc4140': true,
+      // MSC3906: sign in with QR (rendezvous flows)
+      'org.matrix.msc3906': true,
+      // MSC3886: simple rendezvous transport
+      'org.matrix.msc3886': true,
       'org.matrix.msc2432': true,
       'org.matrix.msc3440.stable': true,
       'uk.half-shot.msc2666.query_mutual_rooms': true,

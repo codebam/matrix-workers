@@ -1600,6 +1600,7 @@ describe('race capabilities exhaustive key bind after #214', () => {
     'm.3pid_changes',
     'm.get_login_token',
     'm.profile_fields',
+    'org.matrix.msc4140.delayed_events',
   ] as const;
 
   for (let i = 0; i < 12; i++) {
@@ -1615,6 +1616,8 @@ describe('race capabilities exhaustive key bind after #214', () => {
         for (const k of expectedKeys) {
           if (k === 'm.room_versions') {
             expect((caps[k] as { default: string }).default).toBe('10');
+          } else if (k === 'org.matrix.msc4140.delayed_events') {
+            expect(caps[k]).toEqual({ max_delay_ms: 86400000, max_scheduled: 10 });
           } else {
             expect(caps[k]).toEqual({ enabled: true });
           }
@@ -2297,6 +2300,7 @@ describe('race capabilities HEAD + key-set bind after #241', () => {
     'm.3pid_changes',
     'm.get_login_token',
     'm.profile_fields',
+    'org.matrix.msc4140.delayed_events',
   ].sort();
 
   for (let i = 0; i < 12; i++) {

@@ -14,7 +14,7 @@ import {
 } from '../services/federation-keys';
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth, expectedAuthTypes } from '../services/event-auth';
-import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync } from '../services/database';
+import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { prepareOutboundPdu } from './rooms';
@@ -2498,6 +2498,15 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
+  // MSC4155: the local recipient's invite permission config applies to
+  // federation invites too.
+  if ((await getInvitePermission(c.env.DB, stateKey, inviteEvent.sender)) === 'block') {
+    return c.json(
+      { errcode: 'ORG.MATRIX.MSC4155.M_INVITE_BLOCKED', error: 'The recipient does not accept invites from this sender' },
+      403
+    );
+  }
+
   // Persist the invite locally so the invited user sees it in /sync.
   await storeInboundInvite(
     c.env,
@@ -2621,6 +2630,15 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
     return c.json(
       { errcode: 'M_NOT_FOUND', error: 'User not found' },
       404
+    );
+  }
+
+  // MSC4155: the local recipient's invite permission config applies to
+  // federation invites too.
+  if ((await getInvitePermission(c.env.DB, stateKey, inviteEvent.sender)) === 'block') {
+    return c.json(
+      { errcode: 'ORG.MATRIX.MSC4155.M_INVITE_BLOCKED', error: 'The recipient does not accept invites from this sender' },
+      403
     );
   }
 

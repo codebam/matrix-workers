@@ -560,10 +560,8 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #226', () => {
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       12,
-      'users of event',
-      '$evt',
-      'users:',
-      members.join(', ')
+      'local users of event',
+      '$evt'
     );
   });
 
@@ -893,10 +891,8 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #232', () => {
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       1,
-      'users of event',
-      '$solo',
-      'users:',
-      '@solo:example.com'
+      'local users of event',
+      '$solo'
     );
   });
 });
@@ -943,10 +939,8 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #241', () => {
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       0,
-      'users of event',
-      '$none',
-      'users:',
-      ''
+      'local users of event',
+      '$none'
     );
   });
 
@@ -954,6 +948,7 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #241', () => {
     const binds: unknown[][] = [];
     const names: string[] = [];
     const env = {
+      SERVER_NAME: 'example.com',
       DB: {
         prepare(_sql: string) {
           return {
@@ -986,7 +981,8 @@ describe('notify / auth-chain / servers TOKENMAXX leftovers after #241', () => {
       },
     } as any;
     await notifyUsersOfEvent(env, '!lobby:example.com', '$e', 'm.room.message');
-    expect(binds).toEqual([['!lobby:example.com']]);
+    // Local-only fan-out: the membership query is scoped to this server's users.
+    expect(binds).toEqual([['!lobby:example.com', '%:example.com']]);
     expect(names.sort()).toEqual(['@alice:example.com', '@bob:example.com']);
   });
 
@@ -1680,18 +1676,14 @@ describe('notify / auth-chain TOKENMAXX residual tertiary leftovers after #290',
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       0,
-      'users of event',
-      '$e0',
-      'users:',
-      ''
+      'local users of event',
+      '$e0'
     );
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       2,
-      'users of event',
-      '$e1',
-      'users:',
-      '@a:example.com, @b:example.com'
+      'local users of event',
+      '$e1'
     );
   });
 
@@ -1868,18 +1860,14 @@ describe('notify / auth-chain TOKENMAXX residual quaternary leftovers after #310
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       2,
-      'users of event',
-      '$f',
-      'users:',
-      '@ok:example.com, @bad:example.com'
+      'local users of event',
+      '$f'
     );
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       1,
-      'users of event',
-      '$o',
-      'users:',
-      '@solo:example.com'
+      'local users of event',
+      '$o'
     );
   });
 
@@ -2032,10 +2020,8 @@ describe('notify / auth-chain TOKENMAXX residual quinary leftovers after #319', 
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       2,
-      'users of event',
-      '$ok',
-      'users:',
-      '@a:example.com, @b:example.com'
+      'local users of event',
+      '$ok'
     );
   });
 
@@ -2259,18 +2245,14 @@ describe('notify / auth-chain TOKENMAXX residual senary leftovers after #330', (
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       0,
-      'users of event',
-      '$empty',
-      'users:',
-      ''
+      'local users of event',
+      '$empty'
     );
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       1,
-      'users of event',
-      '$full',
-      'users:',
-      '@a:example.com'
+      'local users of event',
+      '$full'
     );
   });
 
@@ -2631,10 +2613,8 @@ describe('notify / auth-chain TOKENMAXX residual septenary leftovers after #336'
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       0,
-      'users of event',
-      '$empty',
-      'users:',
-      ''
+      'local users of event',
+      '$empty'
     );
   });
 });
@@ -3229,10 +3209,8 @@ describe('notify / auth-chain TOKENMAXX residual undecenary leftovers after #395
     expect(console.log).toHaveBeenCalledWith(
       '[database] Notifying',
       0,
-      'users of event',
-      '$empty',
-      'users:',
-      ''
+      'local users of event',
+      '$empty'
     );
     expect(console.error).toHaveBeenCalledWith(
       '[database] Failed to notify users of event:',

@@ -8,6 +8,7 @@ import { requireAuth } from '../middleware/auth';
 import { getTypingForRooms } from './typing';
 import { getReceiptsForRooms } from './receipts';
 import { countNotificationsWithRules } from '../services/push-rule-evaluator';
+import { getInvitePermission } from '../services/database';
 // Room cache helper available for future optimizations
 // import { getRoomMetadata, invalidateRoomCache, type RoomMetadata } from '../services/room-cache';
 
@@ -183,6 +184,7 @@ interface RoomResult {
   heroes?: StrippedHero[];
   initial?: boolean;
   required_state?: any[];
+  state_after?: any[];
   timeline?: any[];
   prev_batch?: string;
   limited?: boolean;
@@ -607,6 +609,26 @@ async function getRoomData(
     }
   }
 
+  // MSC4222: state_after = the current room state (after the timeline window).
+  const afterRows = await db.prepare(`
+    SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts
+    FROM room_state rs JOIN events e ON rs.event_id = e.event_id
+    WHERE rs.room_id = ?
+  `).bind(roomId).all();
+  result.state_after = [];
+  for (const e of afterRows.results as any[]) {
+    try {
+      result.state_after.push({
+        type: e.event_type,
+        state_key: e.state_key,
+        content: JSON.parse(e.content),
+        sender: e.sender,
+        origin_server_ts: e.origin_server_ts,
+        event_id: e.event_id,
+      });
+    } catch { /* ignore parse errors, as required_state does */ }
+  }
+
   // Get timeline
   if (config.timelineLimit && config.timelineLimit > 0) {
     let timelineQuery: string;
@@ -721,7 +743,7 @@ async function getInviteRoomData(
   db: D1Database,
   roomId: string,
   userId: string
-): Promise<RoomResult> {
+): Promise<RoomResult | null> {
   const result: RoomResult = {
     initial: true,
     membership: 'invite',  // MSC4186: explicitly indicate this is an invited room
@@ -768,6 +790,15 @@ async function getInviteRoomData(
         });
       } catch { /* ignore parse errors */ }
     }
+  }
+
+  // MSC4155: an 'ignore' decision accepts the invite but withholds it from
+  // the recipient's sync. Null tells the caller to skip the room entirely.
+  const ownMember = inviteState.find(
+    (e) => e.type === 'm.room.member' && e.state_key === userId
+  );
+  if (ownMember && (await getInvitePermission(db, userId, ownMember.sender)) === 'ignore') {
+    return null;
   }
 
   result.invite_state = inviteState;
@@ -930,6 +961,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         // Always include invited room data (small payload) so client doesn't lose invites on reconnect
         if (roomInfo.membership === 'invite') {
           const roomData = await getInviteRoomData(db, roomInfo.roomId, userId);
+          if (!roomData) continue;
           response.rooms[roomInfo.roomId] = roomData;
           connectionState.roomStates[roomInfo.roomId] = {
             sentState: true,
@@ -1031,6 +1063,7 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       // Always include invited room data (small payload) so client doesn't lose invites on reconnect
       if (membershipResult.membership === 'invite') {
         const roomData = await getInviteRoomData(db, roomId, userId);
+        if (!roomData) continue;
         response.rooms[roomId] = roomData;
         connectionState.roomStates[roomId] = {
           sentState: true,
@@ -1595,6 +1628,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         // Always include invited room data (small payload) so client doesn't lose invites on reconnect
         if (roomInfo.membership === 'invite') {
           const roomData = await getInviteRoomData(db, roomInfo.roomId, userId);
+          if (!roomData) continue;
           hasChanges = true; // Mark that we have actual changes
           response.rooms[roomInfo.roomId] = roomData;
           connectionState.roomStates[roomInfo.roomId] = {
@@ -1698,6 +1732,7 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       // Always include invited room data (small payload) so client doesn't lose invites on reconnect
       if (membershipResult.membership === 'invite') {
         const roomData = await getInviteRoomData(db, roomId, userId);
+        if (!roomData) continue;
         hasChanges = true; // Mark that we have actual changes
         response.rooms[roomId] = roomData;
         connectionState.roomStates[roomId] = {

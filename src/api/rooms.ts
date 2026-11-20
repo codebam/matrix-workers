@@ -3,7 +3,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppEnv, Env, RoomCreateContent, RoomMemberContent, PDU } from '../types';
-import { Errors } from '../utils/errors';
+import { Errors, MatrixApiError } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias, generateOpaqueId } from '../utils/ids';
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
@@ -33,6 +33,7 @@ import {
   getUserById,
   notifyUsersOfEvent,
   validateEventSize,
+  getInvitePermission,
 } from '../services/database';
 import type { JoinResult } from '../workflows';
 
@@ -448,6 +449,16 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
   // Note: invite_3pid and creation_content are reserved for future use
   void body.invite_3pid;
   void body.creation_content;
+
+  // MSC4155: reject the create if any invitee's permission config blocks us.
+  if (Array.isArray(invite)) {
+    for (const invitee of invite) {
+      if (typeof invitee !== 'string') continue;
+      if ((await getInvitePermission(c.env.DB, invitee, userId)) === 'block') {
+        return Errors.inviteBlocked().toResponse();
+      }
+    }
+  }
 
   // Validate room alias if provided
   if (room_alias_local_part) {
@@ -1097,29 +1108,32 @@ app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
 // re-validated immediately before the write. If anything has changed in
 // between, we abort with M_CONFLICT instead of overwriting based on stale
 // auth context. Clients should re-read room state and retry.
-app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
-  const userId = c.get('userId');
-  const roomId = c.req.param('roomId');
-  const eventType = c.req.param('eventType');
-  const stateKey = c.req.param('stateKey') ?? '';
-
+// Core of PUT /rooms/:roomId/state, shared with MSC4140 delayed state events.
+export async function performStateEvent(
+  env: Env,
+  roomId: string,
+  userId: string,
+  eventType: string,
+  stateKey: string,
+  content: any
+): Promise<{ eventId: string } | { error: MatrixApiError }> {
   // Check membership
-  const membership = await getMembership(c.env.DB, roomId, userId);
+  const membership = await getMembership(env.DB, roomId, userId);
   if (!membership || membership.membership !== 'join') {
-    return Errors.forbidden('Not a member of this room').toResponse();
+    return { error: Errors.forbidden('Not a member of this room') };
   }
 
-  let content: any;
-  try {
-    content = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
+  // MSC4155: an invite written through the state endpoint is still an invite.
+  if (eventType === 'm.room.member' && content?.membership === 'invite') {
+    if ((await getInvitePermission(env.DB, stateKey, userId)) === 'block') {
+      return { error: Errors.inviteBlocked() };
+    }
   }
 
   // Capture the auth basis at check-time.
-  const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
-  const powerLevelsEventCheck = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
-  const existingStateEventCheck = await getStateEvent(c.env.DB, roomId, eventType, stateKey);
+  const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
+  const powerLevelsEventCheck = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
+  const existingStateEventCheck = await getStateEvent(env.DB, roomId, eventType, stateKey);
 
   // Power-level permission check. We re-read this just before writing.
   const powerLevels = (powerLevelsEventCheck?.content as any) || {};
@@ -1127,7 +1141,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   const requiredPower = powerLevels.events?.[eventType]
     ?? (eventType === 'm.room.member' ? (powerLevels.state_default ?? 50) : (powerLevels.state_default ?? 50));
   if (userPower < requiredPower) {
-    return Errors.forbidden('Insufficient power level for this state event').toResponse();
+    return { error: Errors.forbidden('Insufficient power level for this state event') };
   }
 
   const authEvents: string[] = [];
@@ -1135,7 +1149,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   if (powerLevelsEventCheck) authEvents.push(powerLevelsEventCheck.event_id);
   if (membership) authEvents.push(membership.eventId);
 
-  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
+  const { events: latestEvents } = await getRoomEvents(env.DB, roomId, undefined, 1);
   const prevEvents = latestEvents.map(e => e.event_id);
 
   const event: PDU = {
@@ -1155,16 +1169,16 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   // power level event or the slot we're writing has been replaced since
   // our check, the original permission decision was made on stale data —
   // refuse rather than silently overwriting another concurrent write.
-  const powerLevelsEventNow = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
-  const existingStateEventNow = await getStateEvent(c.env.DB, roomId, eventType, stateKey);
+  const powerLevelsEventNow = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
+  const existingStateEventNow = await getStateEvent(env.DB, roomId, eventType, stateKey);
   if ((powerLevelsEventCheck?.event_id ?? null) !== (powerLevelsEventNow?.event_id ?? null)) {
-    return Errors.conflict('Power levels changed during request; retry').toResponse();
+    return { error: Errors.conflict('Power levels changed during request; retry') };
   }
   if ((existingStateEventCheck?.event_id ?? null) !== (existingStateEventNow?.event_id ?? null)) {
-    return Errors.conflict(`State event ${eventType}/${stateKey} changed during request; retry`).toResponse();
+    return { error: Errors.conflict(`State event ${eventType}/${stateKey} changed during request; retry`) };
   }
 
-  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
+  const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
 
   // Invalidate room metadata cache if this is a metadata-affecting state event
   const CACHED_STATE_TYPES = ['m.room.name', 'm.room.avatar', 'm.room.topic', 'm.room.canonical_alias', 'm.room.member'];
@@ -1172,10 +1186,10 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
     // Bump the cache generation first (see issue 009 sub-finding 4): even
     // if the subsequent KV delete fails, readers that compare generations
     // will reject the stale cached value.
-    await bumpRoomCacheGeneration(c.env.CACHE, roomId).catch((err) => {
+    await bumpRoomCacheGeneration(env.CACHE, roomId).catch((err) => {
       console.warn(`[rooms] Cache generation bump failed for room ${roomId}:`, err);
     });
-    invalidateRoomCache(c.env.CACHE, roomId).catch((err) => {
+    invalidateRoomCache(env.CACHE, roomId).catch((err) => {
       console.warn(`[rooms] Cache invalidation failed for room ${roomId}:`, err);
     });
   }
@@ -1183,7 +1197,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   // Update membership table if this is a membership event
   if (eventType === 'm.room.member') {
     await updateMembership(
-      c.env.DB,
+      env.DB,
       roomId,
       stateKey,
       content.membership,
@@ -1194,9 +1208,28 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   }
 
   // Notify room members about the state change (wakes up long-polling syncs)
-  await notifyUsersOfEvent(c.env, roomId, eventId, eventType);
+  await notifyUsersOfEvent(env, roomId, eventId, eventType);
 
-  return c.json({ event_id: eventId });
+  return { eventId };
+}
+
+app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const roomId = c.req.param('roomId');
+  const eventType = c.req.param('eventType');
+  const stateKey = c.req.param('stateKey') ?? '';
+
+  let content: any;
+  try {
+    content = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const result = await performStateEvent(c.env, roomId, userId, eventType, stateKey, content);
+  if ('error' in result) return result.error.toResponse();
+
+  return c.json({ event_id: result.eventId });
 });
 
 // GET /_matrix/client/v3/rooms/:roomId/members - Get room members
@@ -1615,30 +1648,28 @@ async function federateInvite(env: Env, roomId: string, inviteEvent: PDU): Promi
 }
 
 // PUT /_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId - Send message
-app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth(), async (c) => {
-  const userId = c.get('userId');
-  const roomId = c.req.param('roomId');
-  const eventType = c.req.param('eventType');
-  const txnId = c.req.param('txnId');
-
+// Core of PUT /rooms/:roomId/send, shared with MSC4140 delayed events so a
+// delayed send travels the same auth, signing and federation path as an
+// immediate one.
+export async function performSendEvent(
+  env: Env,
+  roomId: string,
+  userId: string,
+  eventType: string,
+  content: any,
+  txnId?: string
+): Promise<{ eventId: string; originServerTs: number } | { error: MatrixApiError }> {
   // Check membership
-  const membership = await getMembership(c.env.DB, roomId, userId);
+  const membership = await getMembership(env.DB, roomId, userId);
   if (!membership || membership.membership !== 'join') {
-    return Errors.forbidden('Not a member of this room').toResponse();
+    return { error: Errors.forbidden('Not a member of this room') };
   }
 
-  let content: any;
-  try {
-    content = await c.req.json();
-  } catch {
-    return Errors.badJson().toResponse();
-  }
+  const eventId = await generateEventId(env.SERVER_NAME);
 
-  const eventId = await generateEventId(c.env.SERVER_NAME);
-
-  const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
-  const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
-  const room = await getRoom(c.env.DB, roomId);
+  const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
+  const powerLevelsEvent = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
+  const room = await getRoom(env.DB, roomId);
 
   // In MSC4291 (room version 12), the create event is implicitly part of
   // every non-create event's auth chain and MUST NOT appear explicitly in
@@ -1658,10 +1689,10 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   // the event silently (its /send returns 200 before background processing).
   // The newest event authored by another server is the safest parent: every
   // participant already has it.
-  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
-  const remoteTip = await c.env.DB.prepare(
+  const { events: latestEvents } = await getRoomEvents(env.DB, roomId, undefined, 1);
+  const remoteTip = await env.DB.prepare(
     `SELECT event_id, depth FROM events WHERE room_id = ? AND sender NOT LIKE ? ORDER BY origin_server_ts DESC LIMIT 1`
-  ).bind(roomId, `%:${c.env.SERVER_NAME}`).first<{ event_id: string; depth: number }>();
+  ).bind(roomId, `%:${env.SERVER_NAME}`).first<{ event_id: string; depth: number }>();
   const parent = remoteTip ?? latestEvents[0] ?? null;
   const prevEvents = parent ? [parent.event_id] : [];
 
@@ -1683,10 +1714,10 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
   // so our local view always matches resident servers' view. For MSC4291
   // room versions the derivation happens even with no remote members yet:
   // the stored ID must equal the served ID the moment a remote joins.
-  const remoteServers = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
+  const remoteServers = await getJoinedRemoteServers(env.DB, roomId, env.SERVER_NAME);
   let wirePdu: Record<string, unknown> | null = null;
   if (remoteServers.length > 0 || isMsc4291RoomVersion(roomVersionStr)) {
-    const prepared = await prepareOutboundPdu(c.env, event, roomVersionStr);
+    const prepared = await prepareOutboundPdu(env, event, roomVersionStr);
     if (prepared) {
       event.event_id = prepared.wireId;
       (event as unknown as Record<string, unknown>).hashes = prepared.hashes;
@@ -1698,18 +1729,38 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     }
   }
 
-  await storeEvent(c.env.DB, event);
-  await fanoutEventToAppServices(c.env, event);
+  await storeEvent(env.DB, event);
+  await fanoutEventToAppServices(env, event);
 
   // Notify all room members that a new message was sent (wakes up long-polling syncs)
-  await notifyUsersOfEvent(c.env, roomId, event.event_id, eventType);
+  await notifyUsersOfEvent(env, roomId, event.event_id, eventType);
 
   // Durably queue the wire PDU for federation before responding (fast storage
   // puts, batched); the Federation DO alarm performs the actual delivery and
   // retries, so it survives even if waitUntil subrequests are cancelled.
   if (wirePdu) {
-    await queueFederationPdu(c.env, remoteServers, wirePdu, event.event_id, roomId);
+    await queueFederationPdu(env, remoteServers, wirePdu, event.event_id, roomId);
   }
+
+  return { eventId: event.event_id, originServerTs: event.origin_server_ts };
+}
+
+// PUT /_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId - Send message
+app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const roomId = c.req.param('roomId');
+  const eventType = c.req.param('eventType');
+  const txnId = c.req.param('txnId');
+
+  let content: any;
+  try {
+    content = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const result = await performSendEvent(c.env, roomId, userId, eventType, content, txnId);
+  if ('error' in result) return result.error.toResponse();
 
   // Send push notifications via durable workflow (fire and forget)
   // Only for message and encrypted event types
@@ -1717,12 +1768,12 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     c.executionCtx.waitUntil(
       c.env.PUSH_NOTIFICATION_WORKFLOW.create({
         params: {
-          eventId: event.event_id,
+          eventId: result.eventId,
           roomId,
           eventType,
           sender: userId,
           content,
-          originServerTs: event.origin_server_ts,
+          originServerTs: result.originServerTs,
         },
       }).catch(err => {
         console.error('[rooms] Push notification workflow error:', err);
@@ -1730,7 +1781,7 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     );
   }
 
-  return c.json({ event_id: event.event_id });
+  return c.json({ event_id: result.eventId });
 });
 
 // POST /_matrix/client/v3/rooms/:roomId/invite - Invite a user
@@ -1879,6 +1930,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
       return storeThirdPartyInvite(c, roomId, userId, inviterMembership.eventId, body.address);
     }
     inviteeId = resolved;
+  }
+
+  // MSC4155: the invitee's invite permission config can block this inviter.
+  if ((await getInvitePermission(c.env.DB, inviteeId, userId)) === 'block') {
+    return Errors.inviteBlocked().toResponse();
   }
 
   // Check power levels (captured at check-time; re-validated just before write
