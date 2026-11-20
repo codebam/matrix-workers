@@ -175,6 +175,83 @@ export async function generateSigningKeyPairLegacy(): Promise<{
   };
 }
 
+// ES256 (ECDSA P-256) signing pair for OIDC id_tokens. Workers' native
+// WebCrypto supports ECDSA; jose-based OIDC clients (FluffyChat,
+// matrix_oidc_client) list ES256 among their supported algorithms.
+export async function generateES256KeyPair(): Promise<{
+  publicJwk: JsonWebKey;
+  privateKeyJwk: JsonWebKey;
+  keyId: string;
+}> {
+  const keyPair = (await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  )) as CryptoKeyPair;
+
+  const publicJwk = (await crypto.subtle.exportKey('jwk', keyPair.publicKey)) as JsonWebKey;
+  const privateKeyJwk = (await crypto.subtle.exportKey('jwk', keyPair.privateKey)) as JsonWebKey;
+
+  const keyIdHash = new Uint8Array(
+    await crypto.subtle.digest('SHA-256', new TextEncoder().encode(publicJwk.x!))
+  ).slice(0, 4);
+  const keyId = `es256:${Array.from(keyIdHash)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')}`;
+
+  return { publicJwk, privateKeyJwk, keyId };
+}
+
+// Sign arbitrary bytes with an ECDSA P-256 (ES256) key, returning the
+// DER-encoded signature as it would appear in a JWS.
+export async function signES256(privateKeyJwk: JsonWebKey, data: Uint8Array): Promise<Uint8Array> {
+  const key = await crypto.subtle.importKey(
+    'jwk',
+    privateKeyJwk,
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    false,
+    ['sign']
+  );
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, key, data);
+  return new Uint8Array(sig);
+}
+
+// Build a signed OIDC id_token (JWS, compact serialization, ES256).
+// Claims follow OIDC Core: iss, sub, aud, exp, iat, nonce; profile/email
+// claims are attached when the granted scopes include them.
+export async function mintIdToken(opts: {
+  privateKeyJwk: JsonWebKey;
+  keyId: string;
+  issuer: string;
+  subject: string;
+  audience: string;
+  nonce?: string;
+  lifetimeSeconds?: number;
+  claims?: Record<string, unknown>;
+}): Promise<string> {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const lifetime = opts.lifetimeSeconds ?? 600; // OIDC id_tokens are short-lived
+  const payload: Record<string, unknown> = {
+    iss: opts.issuer,
+    sub: opts.subject,
+    aud: opts.audience,
+    iat: nowSec,
+    exp: nowSec + lifetime,
+  };
+  if (opts.nonce) payload.nonce = opts.nonce;
+  for (const [k, v] of Object.entries(opts.claims ?? {})) {
+    if (v !== undefined && v !== null) payload[k] = v;
+  }
+
+  const header = { alg: 'ES256', kid: opts.keyId, typ: 'JWT' };
+  const encoder = new TextEncoder();
+  const unsigned = `${base64UrlEncode(encoder.encode(JSON.stringify(header)))}.${base64UrlEncode(
+    encoder.encode(JSON.stringify(payload))
+  )}`;
+  const sig = await signES256(opts.privateKeyJwk, encoder.encode(unsigned));
+  return `${unsigned}.${base64UrlEncode(sig)}`;
+}
+
 // Sign a JSON object with Ed25519 per Matrix spec
 export async function signJson(
   obj: Record<string, unknown>,

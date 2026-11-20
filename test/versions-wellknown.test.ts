@@ -129,15 +129,20 @@ describe('versions module /.well-known/openid-configuration', () => {
     ]);
     expect(body.code_challenge_methods_supported).toEqual(['S256', 'plain']);
     expect(body.subject_types_supported).toEqual(['public']);
-    expect(body.id_token_signing_alg_values_supported).toEqual(['RS256', 'ES256']);
+    // Advertised algorithms must match what we actually sign with: the
+    // OIDC key is ES256 (see getOidcSigningKey). Advertising RS256 too made
+    // strict clients pick an algorithm we cannot sign.
+    expect(body.id_token_signing_alg_values_supported).toEqual(['ES256']);
     expect(body.claims_supported).toEqual([
       'sub',
       'iss',
       'aud',
       'exp',
       'iat',
+      'nonce',
       'name',
       'email',
+      'preferred_username',
     ]);
   });
 

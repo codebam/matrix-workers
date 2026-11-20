@@ -535,6 +535,18 @@ app.get('/_matrix/client/v1/auth_metadata', async (c) => {
     device_authorization_endpoint: `${baseUrl}/oauth/device`,
     // Prompt values we support
     prompt_values_supported: ['create'],
+    // Full OIDC fields: matrix_oidc_client (FluffyChat) parses the auth
+    // metadata with strict non-nullable types — jwks_uri absent made its
+    // client registration step crash with "null: type 'minified:W6' is not
+    // a subtype of type 'String" right after POST /oauth/register
+    // succeeded. Mirror the /.well-known/openid-configuration document so
+    // every OIDC consumer finds the same complete provider metadata here.
+    jwks_uri: `${baseUrl}/.well-known/jwks.json`,
+    userinfo_endpoint: `${baseUrl}/oauth/userinfo`,
+    introspection_endpoint: `${baseUrl}/oauth/introspect`,
+    id_token_signing_alg_values_supported: ['ES256'],
+    subject_types_supported: ['public'],
+    claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'nonce', 'preferred_username', 'name', 'picture'],
   };
 
   return c.json(response);

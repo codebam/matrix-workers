@@ -88,8 +88,8 @@ app.get('/.well-known/openid-configuration', (c) => {
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256', 'plain'],
     subject_types_supported: ['public'],
-    id_token_signing_alg_values_supported: ['RS256', 'ES256'],
-    claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'name', 'email'],
+    id_token_signing_alg_values_supported: ['ES256'],
+    claims_supported: ['sub', 'iss', 'aud', 'exp', 'iat', 'nonce', 'name', 'email', 'preferred_username'],
     // Note: no org.matrix.matrix-authentication-service extension here. We do
     // not implement MAS GraphQL; clients (FluffyChat) cast graphql_endpoint to
     // String and crash on null/missing. Account management is advertised via
@@ -98,13 +98,37 @@ app.get('/.well-known/openid-configuration', (c) => {
 });
 
 // GET /.well-known/jwks.json - JSON Web Key Set for token verification
-app.get('/.well-known/jwks.json', (c) => {
-  // Return an empty JWKS - clients can't verify our tokens without keys
-  // In a real implementation, you'd generate and store RSA keys
-  // For now, returning a placeholder that indicates we use opaque tokens
-  return c.json({
-    keys: [],
-  });
+app.get('/.well-known/jwks.json', async (c) => {
+  // Serve the OIDC signing key (ES256, key_version 3) so clients can verify
+  // our id_tokens. Previously returned an empty set — oidc-native clients
+  // (FluffyChat) fetch the JWKS right after discovery and a registration
+  // response without a matching key set cannot complete login. A missing
+  // DB binding (route-test fakes) degrades to the old empty key set.
+  try {
+    const key = await c.env.DB.prepare(
+      `SELECT key_id, public_key FROM server_keys WHERE is_current = 1 AND key_version = 3`
+    ).first<{ key_id: string; public_key: string }>();
+
+    if (key) {
+      const publicJwk = JSON.parse(key.public_key) as JsonWebKey;
+      return c.json({
+        keys: [
+          {
+            kty: 'EC',
+            crv: 'P-256',
+            x: publicJwk.x,
+            y: publicJwk.y,
+            use: 'sig',
+            alg: 'ES256',
+            kid: key.key_id,
+          },
+        ],
+      });
+    }
+  } catch {
+    // fall through to the empty set
+  }
+  return c.json({ keys: [] });
 });
 
 // GET /.well-known/matrix/support - Server support contact information

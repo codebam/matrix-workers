@@ -5,7 +5,7 @@
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
 import { requireAuth } from '../middleware/auth';
-import { hashToken, timingSafeEqual, verifyPassword } from '../utils/crypto';
+import { hashToken, timingSafeEqual, verifyPassword, generateES256KeyPair, mintIdToken } from '../utils/crypto';
 import { generateAccessToken, generateDeviceId, generateOpaqueId, formatUserId } from '../utils/ids';
 import { createDevice, createAccessToken, getUserById, getPasswordHash } from '../services/database';
 
@@ -330,9 +330,95 @@ app.post('/oauth/authorize', async (c) => {
 // Token Endpoint (RFC 6749 Section 4.1.3)
 // ============================================
 
+// ============================================
+// OIDC id_token signing key management
+// ============================================
+
+// The OIDC signing key is an ES256 (ECDSA P-256) pair stored in server_keys
+// with key_version 3 (1 = legacy placeholder, 2 = Ed25519 federation keys).
+// First use generates and persists the key; every later call reuses it.
+// OIDC id_tokens MUST be signed with an algorithm clients accept — jose-based
+// clients (FluffyChat's matrix_oidc_client) list ES256, and WebCrypto in
+// Workers supports ECDSA P-256 natively.
+async function getOidcSigningKey(db: D1Database): Promise<{ keyId: string; privateKeyJwk: JsonWebKey } | null> {
+  // Best-effort lookup wrapped defensively: test fakes and partial DB
+  // states must not break the token exchange — the response simply
+  // proceeds without an id_token and oidc-native clients surface that.
+  try {
+    const existing = await db.prepare(
+      `SELECT key_id, private_key_jwk FROM server_keys WHERE is_current = 1 AND key_version = 3`
+    ).first<{ key_id: string; private_key_jwk: string | null }>();
+    if (existing?.private_key_jwk) {
+      return { keyId: existing.key_id, privateKeyJwk: JSON.parse(existing.private_key_jwk) };
+    }
+  } catch {
+    // fall through to generation
+  }
+  try {
+    const { publicJwk, privateKeyJwk, keyId } = await generateES256KeyPair();
+    await db.prepare(
+      `INSERT OR IGNORE INTO server_keys (key_id, public_key, private_key, private_key_jwk, key_version, valid_from, valid_until, is_current)
+       VALUES (?, ?, ?, ?, 3, ?, ?, 1)`
+    ).bind(
+      keyId,
+      JSON.stringify(publicJwk),
+      JSON.stringify(privateKeyJwk),
+      JSON.stringify(privateKeyJwk),
+      Date.now(),
+      Date.now() + 10 * 365 * 24 * 60 * 60 * 1000
+    ).run();
+    return { keyId, privateKeyJwk };
+  } catch (err) {
+    console.error('[oauth] Failed to generate OIDC signing key:', err);
+    return null;
+  }
+}
+
+// Mint an OIDC id_token for the user of an authorization code, carrying the
+// nonce from the original /oauth/authorize request (OIDC Core §3.1.2.1 —
+// clients reject id_tokens whose nonce does not match theirs) and the
+// profile claims the granted scopes allow.
+async function buildIdToken(
+  c: { env: AppEnv['Bindings'] },
+  authCode: AuthorizationCode,
+  clientId: string
+): Promise<string | null> {
+  const key = await getOidcSigningKey(c.env.DB);
+  if (!key) return null;
+  const issuer = `https://${c.env.SERVER_NAME}`;
+  const scopes = (authCode.scope || '').split(' ');
+  const claims: Record<string, unknown> = {};
+  try {
+    const user = await c.env.DB.prepare(
+      `SELECT user_id, display_name, avatar_url FROM users WHERE user_id = ?`
+    ).bind(authCode.user_id).first<{ user_id: string; display_name: string | null; avatar_url: string | null }>();
+    if (user) {
+      if (scopes.includes('profile')) {
+        if (user.display_name) claims.name = user.display_name;
+        claims.preferred_username = user.user_id.slice(1, user.user_id.indexOf(':'));
+      }
+      if (scopes.includes('email')) claims.email = `${user.user_id.slice(1, user.user_id.indexOf(':'))}@${c.env.SERVER_NAME}`;
+    }
+  } catch {
+    // profile claims are best-effort
+  }  try {
+    return await mintIdToken({
+      privateKeyJwk: key.privateKeyJwk,
+      keyId: key.keyId,
+      issuer,
+      subject: authCode.user_id,
+      audience: clientId,
+      nonce: authCode.nonce,
+      claims,
+    });
+  } catch (err) {
+    console.error('[oauth] Failed to mint id_token:', err);
+    return null;
+  }
+}
+
 // POST /oauth/token - Exchange authorization code for tokens
-app.post('/oauth/token', async (c) => {
-  // Parse request body (form-urlencoded)
+app.post('/oauth/token', async (c) => {  // Parse request body (form-urlencoded)
   const contentType = c.req.header('Content-Type') || '';
   let params: Record<string, string> = {};
 
@@ -439,8 +525,7 @@ app.post('/oauth/token', async (c) => {
     // Extract device ID from scope per MSC2967, accepting both the current
     // and the original URN spellings Element versions may ask for.
     let deviceId: string | undefined;
-    const scopes = authCode.scope?.split(' ') || [];
-    const deviceScopePrefixes = [
+    const scopes = authCode.scope?.split(' ') || [];    const deviceScopePrefixes = [
       'urn:matrix:client:device:',
       'urn:matrix:org.matrix.msc2967.client:device:',
     ];
@@ -481,12 +566,20 @@ app.post('/oauth/token', async (c) => {
       expirationTtl: 30 * 24 * 60 * 60, // 30 days
     });
 
+    // OIDC: id_token is REQUIRED when the granted scope includes openid —
+    // oidc-native clients (FluffyChat, Element Web OIDC) fail the whole
+    // login without it. Nonce carries through from /oauth/authorize.
+    const idToken = scopes.includes('openid')
+      ? await buildIdToken(c, authCode, effectiveClientId)
+      : null;
+
     return c.json({
       access_token: accessToken,
       token_type: 'Bearer',
       expires_in: 86400, // 24 hours
       refresh_token: newRefreshToken,
       scope: authCode.scope,
+      ...(idToken ? { id_token: idToken } : {}),
       // Matrix-specific fields
       user_id: authCode.user_id,
       device_id: deviceId,
