@@ -20,6 +20,12 @@ vi.mock('../src/api/server-notices', () => ({
   sendServerNotice: (...args: unknown[]) => sendServerNotice(...(args as unknown[])),
 }));
 
+const fetchRemoteMediaMock = vi.fn(async () => null);
+vi.mock('../src/api/media', () => ({
+  fetchRemoteMedia: (...args: unknown[]) =>
+    fetchRemoteMediaMock(...(args as [unknown, string, string])),
+}));
+
 import { tryHandleAdminCommand } from '../src/services/bot-commands';
 import { handleRoomMessage } from '../src/services/room-integrations';
 import { relayMatrixToTelegram, processTelegramUpdate } from '../src/services/telegram-bridge';
@@ -55,12 +61,13 @@ function makeDb(opts: FakeOpts = {}) {
     [`${ROOM}\0${TG_BOT}`, 'join'],
   ]);
   const tokens: any[] = [];
+  const mediaRows: any[] = [];
   const bridges = (opts.bridges ?? [{ id: 'tgb1', chat_id: '4711', room_id: ROOM, last_update_id: 0 }]).map(
     (b) => ({ ...b, room_id: b.room_id ?? ROOM, bot_user_id: TG_BOT, tg_token: '111111111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', webhook_secret: 's3cret', enabled: 1, created_at: 1, last_update_id: b.last_update_id ?? 0 })
   );
 
   const db = {
-    users, botRows, memberships, tokens, bridges,
+    users, botRows, memberships, tokens, bridges, mediaRows,
     prepare(sql: string) {
       const stmt = (args: unknown[]) => ({
         async first<T>(): Promise<T | null> {
@@ -145,6 +152,10 @@ function makeDb(opts: FakeOpts = {}) {
             if (b) b.last_update_id = args[0] as number;
             return { meta: { changes: b ? 1 : 0 } };
           }
+          if (sql.includes('INSERT INTO media')) {
+            mediaRows.push({ media_id: args[0], user_id: args[1], content_type: args[2], content_length: args[3], filename: args[4], created_at: args[5] });
+            return { meta: { changes: 1 } };
+          }
           if (sql.includes('INSERT INTO bots')) {
             botRows.set(args[1] as string, { id: args[0], user_id: args[1], kind: args[2], command_prefix: args[3], enabled: 1, created_at: args[4] });
             return { meta: { changes: 1 } };
@@ -181,14 +192,38 @@ function makeDb(opts: FakeOpts = {}) {
   return db;
 }
 
+function makeR2() {
+  const store = new Map<string, { body: ArrayBuffer; httpMetadata?: Record<string, string>; customMetadata?: Record<string, string> }>();
+  return {
+    store,
+    async get(key: string) {
+      const o = store.get(key);
+      if (!o) return null;
+      return { arrayBuffer: async () => o.body, httpMetadata: o.httpMetadata, customMetadata: o.customMetadata };
+    },
+    async put(key: string, body: ArrayBuffer, opts: { httpMetadata?: Record<string, string>; customMetadata?: Record<string, string> } = {}) {
+      store.set(key, { body, httpMetadata: opts.httpMetadata, customMetadata: opts.customMetadata });
+    },
+    async delete(key: string) { store.delete(key); },
+    async head(key: string) {
+      const o = store.get(key);
+      return o ? { httpMetadata: o.httpMetadata, customMetadata: o.customMetadata } : null;
+    },
+  };
+}
+
 function makeEnv(opts: FakeOpts = {}): Env {
   const kv = { get: async () => null, put: async () => undefined, delete: async () => undefined };
+  const media = makeR2();
   return {
     DB: makeDb(opts) as unknown as D1Database,
     SERVER_NAME: SERVER,
     SERVER_VERSION: '0.1.0-test',
     CACHE: kv as unknown as KVNamespace,
     SESSIONS: kv as unknown as KVNamespace,
+    MEDIA: media as unknown as R2Bucket,
+    // Test handle onto the mock bucket (not part of Env).
+    __r2: media,
   } as unknown as Env;
 }
 
@@ -199,6 +234,9 @@ beforeEach(() => {
   performSendEvent.mockClear();
   sendServerNotice.mockClear();
   fetchMock.mockClear();
+  fetchMock.mockImplementation(async () => Response.json({ ok: true }));
+  fetchRemoteMediaMock.mockClear();
+  fetchRemoteMediaMock.mockImplementation(async () => null);
 });
 
 afterEach(() => {
@@ -371,6 +409,297 @@ describe('telegram webhook update processing', () => {
     });
     expect(performSendEvent).toHaveBeenCalledTimes(1);
     expect(performSendEvent.mock.calls[0][4].body).toContain('[telegram photo] look');
+  });
+});
+
+describe('telegram image bridging', () => {
+  const bridge = { id: 'tgb1', bot_user_id: TG_BOT, room_id: ROOM, chat_id: '4711', tg_token: '111111111:AAAA', webhook_secret: 's3cret', last_update_id: 0, enabled: 1, created_at: 1 };
+  const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]).buffer;
+
+  /** Telegram getFile + file-download fetch pair. */
+  function tgFileFetch(bytes: ArrayBuffer, mime = 'image/jpeg') {
+    return async (url: string) => {
+      if (String(url).includes('/getFile')) {
+        return Response.json({ ok: true, result: { file_id: 'F1', file_path: 'photos/file_1.jpg' } });
+      }
+      if (String(url).includes('/file/bot')) {
+        return new Response(bytes, { headers: { 'Content-Type': mime } });
+      }
+      return Response.json({ ok: true });
+    };
+  }
+
+  // --- Telegram -> Matrix ---
+
+  it('photos are downloaded, stored in the media repo, and posted as m.image', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(tgFileFetch(PNG_BYTES));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 200,
+      message: {
+        message_id: 9,
+        from: { id: 7, first_name: 'Ivan', username: 'ivan' },
+        chat: { id: 4711, type: 'private' },
+        photo: [
+          { file_id: 'small', width: 320, height: 240, file_size: 1000 },
+          { file_id: 'big', width: 1280, height: 960, file_size: 4000 },
+        ],
+        caption: 'look at this',
+      },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, roomId, sender, type, content] = performSendEvent.mock.calls[0];
+    expect(roomId).toBe(ROOM);
+    expect(sender).toBe(TG_BOT);
+    expect(type).toBe('m.room.message');
+    expect(content.msgtype).toBe('m.image');
+    expect(content.body).toBe('[TG] Ivan (@ivan): look at this');
+    expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
+    expect(content.info).toMatchObject({
+      mimetype: 'image/jpeg',
+      size: PNG_BYTES.byteLength,
+      w: 1280,
+      h: 960,
+    });
+
+    // The largest of the offered sizes was the one requested.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const getFileBody = JSON.parse((fetchMock.mock.calls[0] as any)[1].body);
+    expect(getFileBody.file_id).toBe('big');
+
+    // Bytes landed in R2 and the metadata row in D1, owned by the bot.
+    const mediaId = String(content.url).split('/')[3];
+    const stored = (env as any).__r2.store.get(mediaId);
+    expect(stored).toBeTruthy();
+    expect(new Uint8Array(stored.body)).toEqual(new Uint8Array(PNG_BYTES));
+    expect(stored.httpMetadata?.contentType).toBe('image/jpeg');
+    const rows = (env.DB as any).mediaRows;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      user_id: TG_BOT,
+      content_type: 'image/jpeg',
+      content_length: PNG_BYTES.byteLength,
+      filename: 'photo.jpg',
+    });
+  });
+
+  it('image documents relay as m.image with the caption as body', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(tgFileFetch(PNG_BYTES, 'image/png'));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 201,
+      message: {
+        message_id: 10,
+        from: { id: 7, first_name: 'Ivan', username: 'ivan' },
+        chat: { id: 4711, type: 'private' },
+        document: { file_id: 'doc1', mime_type: 'image/png', file_name: 'meme.png', file_size: 500 },
+        caption: 'lol',
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, , , type, content] = performSendEvent.mock.calls[0];
+    expect(type).toBe('m.room.message');
+    expect(content.msgtype).toBe('m.image');
+    expect(content.body).toBe('[TG] Ivan (@ivan): lol');
+    expect(content.info.mimetype).toBe('image/png');
+    const rows = (env.DB as any).mediaRows;
+    expect(rows[0].filename).toBe('meme.png');
+  });
+
+  it('static webp stickers relay as m.sticker events', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(tgFileFetch(new Uint8Array([1, 2]).buffer, 'image/webp'));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 202,
+      message: {
+        message_id: 11,
+        from: { id: 7, first_name: 'Ivan', username: 'ivan' },
+        chat: { id: 4711, type: 'private' },
+        sticker: { file_id: 'stk1', mime_type: 'image/webp', width: 512, height: 512, file_size: 900, emoji: 'cat' },
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, , , type, content] = performSendEvent.mock.calls[0];
+    expect(type).toBe('m.sticker');
+    expect(content.msgtype).toBeUndefined();
+    expect(content.emoji).toBe('cat');
+    expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
+    expect(content.info).toMatchObject({ mimetype: 'image/webp', w: 512, h: 512 });
+  });
+
+  it('photos without a caption use the filename in the body', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(tgFileFetch(PNG_BYTES));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 203,
+      message: {
+        message_id: 12,
+        from: { id: 7, first_name: 'Ivan' },
+        chat: { id: 4711, type: 'private' },
+        photo: [{ file_id: 'only', width: 640, height: 480, file_size: 2000 }],
+      },
+    });
+    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan: photo.jpg');
+  });
+
+  it('files over the bot download cap stay placeholders and never fetch', async () => {
+    const env = makeEnv();
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 204,
+      message: {
+        message_id: 13,
+        from: { id: 7, first_name: 'Ivan' },
+        chat: { id: 4711, type: 'private' },
+        photo: [{ file_id: 'huge', width: 800, height: 600, file_size: 25 * 1024 * 1024 }],
+        caption: 'too big',
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan: [telegram photo] too big');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect((env.DB as any).mediaRows).toHaveLength(0);
+  });
+
+  it('download failures fall back to the placeholder instead of dropping the message', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(async () => Response.json({ ok: false, description: 'nope' }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 205,
+      message: {
+        message_id: 14,
+        from: { id: 7, first_name: 'Ivan' },
+        chat: { id: 4711, type: 'private' },
+        photo: [{ file_id: 'f', width: 800, height: 600, file_size: 2000 }],
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan: [telegram photo]');
+    expect((env.DB as any).mediaRows).toHaveLength(0);
+  });
+
+  // --- Matrix -> Telegram ---
+
+  it('matrix m.image relays via sendPhoto with a caption and the bytes', async () => {
+    const env = makeEnv();
+    const bytes = new Uint8Array([1, 2, 3]).buffer;
+    (env as any).__r2.store.set('m1', {
+      body: bytes,
+      httpMetadata: { contentType: 'image/png' },
+      customMetadata: { filename: 'cat.png' },
+    });
+    await handleRoomMessage(env, ROOM, USER, {
+      msgtype: 'm.image',
+      body: 'cat.png',
+      url: `mxc://${SERVER}/m1`,
+      info: { mimetype: 'image/png', size: 3 },
+    }, 'local');
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toContain('/sendPhoto');
+    const form = init.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect(form.get('chat_id')).toBe('4711');
+    expect(form.get('caption')).toBe('Alice Display: cat.png');
+    const photo = form.get('photo') as File;
+    expect(photo).toBeTruthy();
+    expect(photo.name).toBe('cat.png');
+    expect(new Uint8Array(await photo.arrayBuffer())).toEqual(new Uint8Array(bytes));
+  });
+
+  it('remote-server images are fetched through the federation media path', async () => {
+    const env = makeEnv();
+    fetchRemoteMediaMock.mockImplementation(async () => ({
+      body: new Uint8Array([9, 9, 9]).buffer,
+      contentType: 'image/jpeg',
+      filename: 'remote.jpg',
+    }));
+    await handleRoomMessage(env, ROOM, USER, {
+      msgtype: 'm.image',
+      body: 'remote.jpg',
+      url: 'mxc://peer.test/abc',
+      info: { mimetype: 'image/jpeg' },
+    }, 'federated');
+
+    expect(fetchRemoteMediaMock).toHaveBeenCalledWith(env, 'peer.test', 'abc');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toContain('/sendPhoto');
+    const form = init.body as FormData;
+    expect(form.get('caption')).toBe('Alice Display: remote.jpg');
+    expect((form.get('photo') as File).name).toBe('remote.jpg');
+  });
+
+  it('SVGs and >10MB images go out as documents, not photos', async () => {
+    const env = makeEnv();
+    (env as any).__r2.store.set('svg1', {
+      body: new Uint8Array([1]).buffer,
+      httpMetadata: { contentType: 'image/svg+xml' },
+    });
+    await handleRoomMessage(env, ROOM, USER, {
+      msgtype: 'm.image',
+      body: 'pic.svg',
+      url: `mxc://${SERVER}/svg1`,
+      info: { mimetype: 'image/svg+xml' },
+    }, 'local');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    let [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toContain('/sendDocument');
+    expect((init.body as FormData).get('document')).toBeTruthy();
+
+    const env2 = makeEnv();
+    const big = new Uint8Array(11 * 1024 * 1024).buffer;
+    (env2 as any).__r2.store.set('big1', { body: big, httpMetadata: { contentType: 'image/png' } });
+    await handleRoomMessage(env2, ROOM, USER, {
+      msgtype: 'm.image',
+      body: 'big.png',
+      url: `mxc://${SERVER}/big1`,
+      info: { mimetype: 'image/png' },
+    }, 'local');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(String(url)).toContain('/sendDocument');
+  });
+
+  it('unresolvable media falls back to a text notice instead of silence', async () => {
+    const env = makeEnv();
+    await handleRoomMessage(env, ROOM, USER, {
+      msgtype: 'm.image',
+      body: 'gone.png',
+      url: `mxc://${SERVER}/missing`,
+      info: { mimetype: 'image/png' },
+    }, 'local');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toContain('/sendMessage');
+    expect(String(init.body)).toContain('[image] gone.png');
+  });
+
+  it('images sent by the bridge bot never loop back to Telegram', async () => {
+    const env = makeEnv();
+    (env as any).__r2.store.set('m1', { body: new Uint8Array([1]).buffer, httpMetadata: { contentType: 'image/png' } });
+    await handleRoomMessage(env, ROOM, TG_BOT, {
+      msgtype: 'm.image',
+      body: 'loop.png',
+      url: `mxc://${SERVER}/m1`,
+      info: { mimetype: 'image/png' },
+    }, 'local');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('non-image media (m.video) keeps the plain text relay', async () => {
+    const env = makeEnv();
+    await handleRoomMessage(env, ROOM, USER, {
+      msgtype: 'm.video',
+      body: 'clip.mp4',
+      url: `mxc://${SERVER}/v1`,
+      info: { mimetype: 'video/mp4' },
+    }, 'local');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toContain('/sendMessage');
+    expect(String(init.body)).toContain('Alice Display: clip.mp4');
   });
 });
 

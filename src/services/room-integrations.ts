@@ -56,8 +56,10 @@ export async function handleRoomMessage(
       if (consumed) return;
     }
 
-    // Telegram relay (both directions of the bridge share this hook).
-    await relayMatrixToTelegram(env, roomId, sender, body);
+    // Telegram relay (both directions of the bridge share this hook). The
+    // full content is handed over so images (m.image/m.sticker) can be
+    // resolved and uploaded, not just their body text.
+    await relayMatrixToTelegram(env, roomId, sender, content);
   } catch (err) {
     console.error('[room-integrations] hook failed:', err);
   }
