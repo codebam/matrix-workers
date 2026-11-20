@@ -390,6 +390,11 @@ function createFedDb(opts: FedDbOptions = {}) {
                 public_key: k.public_key,
                 valid_from: k.valid_from,
                 valid_until: k.valid_until,
+                // The parameterized key route signs its response and needs
+                // these; absent from the column list, return nothing extra.
+                ...(sql.includes('private_key_jwk')
+                  ? { private_key_jwk: k.private_key_jwk, key_version: k.key_version }
+                  : {}),
               }
             : null) as T;
         }
@@ -1053,11 +1058,18 @@ describe('federation key endpoints', () => {
     expect(db.serverKeys.some((k) => k.key_version === 2)).toBe(true);
   });
 
-  it('GET /_matrix/key/v2/server/:keyId returns specific key or 404', async () => {
+  it('GET /_matrix/key/v2/server/:keyId returns the specific key, SIGNED', async () => {
     const env = makeEnv(keysDb());
     const ok = await req('GET', `/_matrix/key/v2/server/${encodeURIComponent(serverKeyPair.keyId)}`, env);
     expect(ok.status).toBe(200);
-    expect((ok.body as { verify_keys: Record<string, unknown> }).verify_keys[serverKeyPair.keyId]).toBeDefined();
+    const b = ok.body as {
+      verify_keys: Record<string, unknown>;
+      signatures?: Record<string, Record<string, string>>;
+    };
+    expect(b.verify_keys[serverKeyPair.keyId]).toBeDefined();
+    // Conduwuit strictly requires a self-signature on key responses; an
+    // unsigned body 401s every federation call from those servers.
+    expect(b.signatures?.[SERVER]?.[serverKeyPair.keyId]).toBeDefined();
 
     const missing = await req('GET', '/_matrix/key/v2/server/ed25519:missing', env);
     expect(missing.status).toBe(404);

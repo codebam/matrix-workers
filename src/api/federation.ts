@@ -188,8 +188,15 @@ app.get('/_matrix/key/v2/server/:keyId', async (c) => {
   const serverName = c.env.SERVER_NAME;
 
   const key = await c.env.DB.prepare(
-    `SELECT key_id, public_key, valid_from, valid_until FROM server_keys WHERE key_id = ?`
-  ).bind(keyId).first<{ key_id: string; public_key: string; valid_from: number; valid_until: number | null }>();
+    `SELECT key_id, public_key, private_key_jwk, key_version, valid_from, valid_until FROM server_keys WHERE key_id = ?`
+  ).bind(keyId).first<{
+    key_id: string;
+    public_key: string;
+    private_key_jwk: string | null;
+    key_version: number | null;
+    valid_from: number;
+    valid_until: number | null;
+  }>();
 
   if (!key) {
     return Errors.notFound('Key not found').toResponse();
@@ -204,6 +211,22 @@ app.get('/_matrix/key/v2/server/:keyId', async (c) => {
     old_verify_keys: {},
   };
 
+  // Conduwuit-family servers fetch THIS parameterized form when they hold a
+  // specific key id from an Authorization header, and strictly require the
+  // key response to be self-signed — an unsigned body reads as "unable to
+  // acquire the signing key" and 401s every federation call. Synapse uses
+  // the unparameterized form, which is why only these servers failed.
+  if (key.key_version === 2 && key.private_key_jwk) {
+    const signed = await signJson(
+      response,
+      serverName,
+      key.key_id,
+      JSON.parse(key.private_key_jwk)
+    );
+    return c.json(signed);
+  }
+
+  // Legacy v1 placeholder rows cannot be signed; serve them as before.
   return c.json(response);
 });
 
