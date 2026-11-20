@@ -174,3 +174,48 @@ applied to both, additive-only).
   playbook: getMe (can_read_all_group_messages), getWebhookInfo
   (pending_update_count/last_error_message), getChatMember, then a synthetic
   webhook update using the bridge's stored secret to prove our side.
+
+## Admin dashboard additions (2026-11-20, session 6)
+Shipped in `c88c574` (prod `3ceecd7d`), all built on existing routes unless
+noted:
+- **Audit page** over `admin_audit_log` (actor/action/target filters, paging).
+- **Registration tokens** card in Settings: mint (token shown once), list,
+  revoke — previously curl/`!admin` only.
+- **Telegram per-bridge Check** button → new
+  `GET /admin/api/telegram/bridges/:id/webhook-info` (server-side
+  `getWebhookInfo` with the stored token: URL, pending backlog, last error,
+  health badge, privacy-mode refresh hint).
+- **Federation Key Self-Check** button surfacing the existing
+  tester-equivalent `/admin/api/federation/key-check`.
+- **Room federation tools** in the room detail modal: Backfill State (existing
+  route) and Probe Delivery via new
+  `GET /admin/api/rooms/:id/federation-probe?server=X`, which signed-GETs our
+  newest locally-authored event from the remote and reports held/not-held —
+  the manual diagnostic from the delivery debugging as a button.
+
+## Join authorization on federation (2026-11-20, session 6)
+A matrix.org friend following https://matrix.to/#/#codebam_live:codebam.ca got
+Element's vague "Something went wrong". The room was invite-only (created as
+the private admin room; the user later switched it to public). Our side had
+two real gaps: `make_join` served a join template to **anyone**, including
+uninvited users of invite-only rooms, and `send_join` never ran the auth
+rules — origin-vs-sender was the only gate, after which the handler
+countersigned and stored whatever arrived and answered with the room's full
+state.
+
+Fixed in `3c8e9fe` (prod `4bd4d9fb`):
+- `make_join` refuses banned users and uninvited users of invite/knock rooms
+  with 403 `M_FORBIDDEN` (so the client shows the real reason), and refuses
+  requests for users of another server (authenticated origin must equal the
+  joining user's domain). Rooms with no synced state keep the old behavior.
+- `send_join` (v1 and v2) runs `checkEventAuth` against current room state
+  before countersigning/persisting, and returns 403 when persistence rejects
+  the event instead of serving state with a 200 (malformed bodies, origin
+  mismatch).
+- Live-verified with self-signed federation requests: invite-only/uninvited →
+  403 "You are not invited to this room"; public room → 200 template;
+  cross-server make_join → 403; uninvited send_join → 403 "Not authorized to
+  join"; malformed send_join → 403.
+- Test-only note: the membership API fake now models `server_keys` (returns
+  null → unsigned persist) and the 14-column `events` INSERT; `getRoomState`
+  is mocked as an array in the federation API route suite.
