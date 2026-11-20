@@ -71,7 +71,7 @@ async function getRoomTimeline(
 ): Promise<{ chunk: ClientEvent[]; start: string; end: string }> {
   const rows = await db.prepare(
     `SELECT ${EVENT_COLUMNS} FROM events
-     WHERE room_id = ? ORDER BY stream_ordering DESC LIMIT ?`
+     WHERE room_id = ? AND stream_ordering > 0 ORDER BY stream_ordering DESC LIMIT ?`
   ).bind(roomId, limit).all<StoredEventRow>();
 
   const chunk = rows.results.map(toClientEvent);

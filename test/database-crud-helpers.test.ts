@@ -362,6 +362,12 @@ function createCrudDb(seed: {
           const roomId = args[0] as string;
           let rows = events.filter((e) => e.room_id === roomId);
 
+          // stream_ordering = 0 marks state-snapshot rows; timeline queries
+          // carrying the filter must not serve them.
+          if (sql.includes('stream_ordering > 0')) {
+            rows = rows.filter((e) => e.stream_ordering > 0);
+          }
+
           if (sql.includes('stream_ordering < ?')) {
             const fromToken = args[1] as number;
             const limit = args[2] as number;
@@ -1365,6 +1371,44 @@ describe('database storeEvent / getEvent', () => {
     expect(db._state.roomState.size).toBe(0);
   });
 
+  it('storeEventIdempotent stateOnly stores at stream_ordering 0 without allocating', async () => {
+    const db = createCrudDb({ streamPosition: 5 });
+    const event = pdu({
+      event_id: '$snap1',
+      type: 'm.room.member',
+      state_key: '@someone:remote.example',
+      content: { membership: 'join' },
+    });
+    await expect(storeEventIdempotent(db, event, { stateOnly: true })).resolves.toEqual({
+      inserted: true,
+      streamOrdering: 0,
+    });
+    // No stream id consumed: the snapshot row sits outside the timeline.
+    expect(db._state.streamPosition).toBe(5);
+    // Current state still points at the stored event.
+    expect(db._state.roomState.get(`${ROOM}\0m.room.member\0@someone:remote.example`)).toBe('$snap1');
+    const stored = db._state.events.find((e) => e.event_id === '$snap1');
+    expect(stored?.stream_ordering).toBe(0);
+  });
+
+  it('storeEventIdempotent stateOnly collision keeps the original row untouched', async () => {
+    const db = createCrudDb({
+      streamPosition: 3,
+      events: [
+        eventRowFromPdu(
+          pdu({ event_id: '$real', type: 'm.room.message', content: { body: 'live' } }),
+          2
+        ),
+      ],
+    });
+    const snapshot = pdu({ event_id: '$real', type: 'm.room.message', content: { body: 'live' } });
+    await expect(storeEventIdempotent(db, snapshot, { stateOnly: true })).resolves.toEqual({
+      inserted: false,
+      streamOrdering: null,
+    });
+    expect(db._state.events[0].stream_ordering).toBe(2);
+  });
+
   it('getEvent returns null / fully parsed PDU including optional fields', async () => {
     const db = createCrudDb({
       events: [
@@ -1476,6 +1520,34 @@ describe('database getRoomEvents / getRoomState / getStateEvent', () => {
       events: [],
       end: 0,
     });
+  });
+
+  it('getRoomEvents never serves state-snapshot rows (stream_ordering = 0)', async () => {
+    // A big remote room: thousands of backfilled member joins (snapshot,
+    // ordering 0) plus a real recent timeline (orderings 1..3).
+    const snapshot = ['a', 'b', 'c'].map((k, i) =>
+      eventRowFromPdu(
+        pdu({
+          event_id: `$snap-${k}`,
+          type: 'm.room.member',
+          state_key: `@u${i}:remote.example`,
+          content: { membership: 'join' },
+        }),
+        0
+      )
+    );
+    const db = createCrudDb({ events: [...snapshot, ...seededEvents().slice(0, 3)] });
+
+    const back = await getRoomEvents(db, ROOM, undefined, 10, 'b');
+    expect(back.events.map((e) => e.event_id)).toEqual(['$3', '$2', '$1']);
+
+    const fwd = await getRoomEvents(db, ROOM, undefined, 10, 'f');
+    expect(fwd.events.map((e) => e.event_id)).toEqual(['$1', '$2', '$3']);
+
+    // Even a huge limit cannot reach the snapshot rows from the top of the
+    // real timeline: pagination stops at ordering 1, never touching 0.
+    const backAll = await getRoomEvents(db, ROOM, 4, 100, 'b');
+    expect(backAll.events.map((e) => e.event_id)).toEqual(['$3', '$2', '$1']);
   });
 
   it('getRoomEvents defaults limit=50 direction=b and ignores other rooms', async () => {

@@ -150,10 +150,15 @@ function createDb() {
             const roomIds = args.slice(0, -1) as string[];
             from = args[args.length - 1] as number;
             rows = events.filter(e => roomIds.includes(e.room_id) && e.stream_ordering > from);
-          } else if (sql.includes('stream_ordering >')) {
+          } else if (sql.includes('stream_ordering > ?')) {
             rows = events.filter(e => e.room_id === args[0] && e.stream_ordering > (args[1] as number));
           } else {
-            rows = events.filter(e => e.room_id === args[0]);
+            // Covers the state-snapshot filter `stream_ordering > 0`
+            // (literal in SQL text, so no extra bind parameter).
+            const skipSnapshots = sql.includes('stream_ordering > 0');
+            rows = events.filter(
+              e => e.room_id === args[0] && (!skipSnapshots || e.stream_ordering > 0)
+            );
           }
           rows.sort((a, b) =>
             sql.includes('DESC')

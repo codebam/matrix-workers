@@ -169,8 +169,12 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
             ...(Array.isArray(sendJoinResponse?.state) ? sendJoinResponse.state : []),
             ...(sendJoinResponse?.event ? [sendJoinResponse.event] : []),
           ];
+          // State snapshot: store with stream_ordering 0 (invisible to
+          // timeline serving). The echoed join event was already persisted
+          // with a real position in the `persist` step, so the idempotent
+          // insert simply skips it here.
           for (const ev of remoteEvents) {
-            await this.storeRemoteStateEvent(ev, roomId, roomVersion);
+            await this.storeRemoteStateEvent(ev, roomId, roomVersion, true);
           }
 
           // Some residents return a partial snapshot (missing create/name), so
@@ -201,7 +205,7 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
               if (resp.ok) {
                 const data = (await resp.json()) as { pdus?: any[]; auth_chain?: any[] };
                 for (const ev of [...(data.auth_chain ?? []), ...(data.pdus ?? [])]) {
-                  await this.storeRemoteStateEvent(ev, roomId, roomVersion);
+                  await this.storeRemoteStateEvent(ev, roomId, roomVersion, true);
                 }
               }
             } catch (e) {
@@ -253,6 +257,8 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
             // order. storeRemoteStateEvent derives IDs with the room version
             // (v1-10 redaction keeps origin/prev_state, so residents' IDs
             // reproduce exactly) and keeps memberships/state in sync.
+            // Real history: stateOnly stays false so backfilled messages
+            // keep ascending stream positions and appear in the timeline.
             for (const ev of [...pdus].reverse()) {
               await this.storeRemoteStateEvent(ev, roomId, roomVersion);
             }
@@ -540,7 +546,12 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   // those events under phantom IDs that no resident — or event we later
   // receive — ever references, so every auth lookup against them fails
   // ("missing auth event type m.room.power_levels").
-  private async storeRemoteStateEvent(ev: any, roomId: string, roomVersion?: string): Promise<void> {
+  private async storeRemoteStateEvent(
+    ev: any,
+    roomId: string,
+    roomVersion?: string,
+    stateOnly = false
+  ): Promise<void> {
     if (!ev || typeof ev !== 'object' || !ev.type) return;
     try {
       const normalized: Record<string, unknown> = { ...ev };
@@ -552,7 +563,8 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       }
       await storeEventIdempotent(
         this.env.DB,
-        normalized as unknown as Parameters<typeof storeEventIdempotent>[1]
+        normalized as unknown as Parameters<typeof storeEventIdempotent>[1],
+        { stateOnly }
       );
 
       const evStateKey = (ev as { state_key?: unknown }).state_key;

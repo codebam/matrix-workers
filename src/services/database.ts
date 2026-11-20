@@ -398,15 +398,27 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
 export async function storeEventIdempotent(
   db: D1Database,
   event: PDU,
+  opts: { stateOnly?: boolean } = {}
 ): Promise<{ inserted: boolean; streamOrdering: number | null }> {
-  // Allocate stream ordering optimistically. If the event already exists we
-  // simply waste one stream id; this is preferable to checking-then-inserting
-  // (which races) and stream ids are cheap.
-  const posResult = await db.prepare(
-    `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
-  ).first<{ position: number }>();
-
-  const streamOrdering = posResult?.position ?? 1;
+  // State-snapshot events (the backfilled CURRENT STATE of a remote room —
+  // thousands of member joins for a big room) are stored with stream_ordering
+  // 0: they remain fully usable for auth checks, room_state serving and
+  // federation responses, but every timeline-serving query filters
+  // `stream_ordering > 0`, so paginated history shows the actual conversation
+  // instead of a wall of join messages. Real history (live /send, timeline
+  // backfill, locally created events) keeps ascending stream positions.
+  let streamOrdering: number;
+  if (opts.stateOnly) {
+    streamOrdering = 0;
+  } else {
+    // Allocate stream ordering optimistically. If the event already exists
+    // we simply waste one stream id; this is preferable to
+    // checking-then-inserting (which races) and stream ids are cheap.
+    const posResult = await db.prepare(
+      `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
+    ).first<{ position: number }>();
+    streamOrdering = posResult?.position ?? 1;
+  }
 
   const insertResult = await db.prepare(
     `INSERT OR IGNORE INTO events (event_id, room_id, sender, event_type, state_key, content,
@@ -493,12 +505,13 @@ export async function getRoomEvents(
   const params: (string | number)[] = [roomId];
 
   if (direction === 'b') {
-    // Backwards (newest first)
+    // Backwards (newest first). stream_ordering = 0 marks state-snapshot
+    // rows (backfilled current state) — never part of paginated history.
     if (fromToken) {
-      query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering < ? ORDER BY stream_ordering DESC LIMIT ?`;
+      query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering > 0 AND stream_ordering < ? ORDER BY stream_ordering DESC LIMIT ?`;
       params.push(fromToken, limit);
     } else {
-      query = `SELECT * FROM events WHERE room_id = ? ORDER BY stream_ordering DESC LIMIT ?`;
+      query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering > 0 ORDER BY stream_ordering DESC LIMIT ?`;
       params.push(limit);
     }
   } else {
@@ -507,7 +520,7 @@ export async function getRoomEvents(
       query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering > ? ORDER BY stream_ordering ASC LIMIT ?`;
       params.push(fromToken, limit);
     } else {
-      query = `SELECT * FROM events WHERE room_id = ? ORDER BY stream_ordering ASC LIMIT ?`;
+      query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering > 0 ORDER BY stream_ordering ASC LIMIT ?`;
       params.push(limit);
     }
   }

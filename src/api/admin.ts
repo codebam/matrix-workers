@@ -2707,7 +2707,9 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
       if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
         normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
       }
-      await storeEventIdempotent(db, normalized as any);
+      // State snapshot from the resident: stream_ordering 0 keeps it out of
+      // paginated history (this is state, not conversation).
+      await storeEventIdempotent(db, normalized as any, { stateOnly: true });
       if (ev.type === 'm.room.member' && typeof ev.state_key === 'string') {
         const mem = ev.content?.membership;
         if (['join', 'invite', 'leave', 'ban', 'knock'].includes(mem)) {
