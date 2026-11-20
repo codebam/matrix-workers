@@ -219,3 +219,33 @@ Fixed in `3c8e9fe` (prod `4bd4d9fb`):
 - Test-only note: the membership API fake now models `server_keys` (returns
   null → unsigned persist) and the 14-column `events` INSERT; `getRoomState`
   is mocked as an array in the federation API route suite.
+
+## Telegram image bridging (2026-11-20, session 6)
+Shipped in `7d13cb0` (prod `4a29e2d1`). Images now cross the bridge in both
+directions; text relaying is unchanged.
+
+- **Telegram → Matrix**: photos (largest of Telegram's size ladder),
+  image-typed documents and static webp stickers are downloaded via getFile
+  (bot download cap 20MB), stored in the media repo exactly like an upload
+  (R2 + D1 row owned by the bridge bot), and posted as `m.image` / `m.sticker`
+  events referencing `mxc://<server>/<id>` — servable to federated users via
+  the public media download. Animated .tgs / webm stickers, voice, audio and
+  video keep the placeholder text; ANY download/store failure also falls back
+  to that placeholder so the room still hears about the image.
+- **Matrix → Telegram**: `m.image`, `m.sticker` and image-typed `m.file` are
+  resolved from the media repo (local R2 directly; other servers via the
+  signed MSC3916 federation download path with its R2 cache) and uploaded as
+  `sendPhoto` (multipart FormData) with a sender-prefixed caption. SVG and
+  payloads over Telegram's 10MB photo cap go as `sendDocument`; unresolvable
+  media falls back to a text notice (`[image] <body>`) instead of silence.
+  `relayMatrixToTelegram` now takes the full message content, not just body
+  text. Loop prevention is unchanged (bot senders skipped).
+- Live-verified Matrix → Telegram: uploaded a 64×64 PNG through
+  `/_matrix/media/v3/upload`, posted `m.image` into the ops room as
+  @codebam, tail showed the send with zero bridge errors (a rejected
+  sendPhoto would log). Test event
+  `$XRFsdxvSyVowY5tAMuX1S4maDdDrv4_Ay4Wz9e0xvEs`, media
+  `mxc://codebam.ca/MHVrgMcso964ks1-vqNX_FhzjRRfTGuK`.
+- 12 new tests in `test/bots-integrations.test.ts` (both directions,
+  stickers, size caps, fallbacks, loop prevention); suite 345 files /
+  45,451 tests.
