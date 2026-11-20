@@ -886,6 +886,17 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
               await notifyUserSync(c.env, member.user_id, 'events');
             }
             await fanoutEventToAppServices(c.env, { ...pdu, event_id: eventId } as PDU);
+
+            // Bridges (e.g. Telegram) relay accepted federated messages out
+            // of the room. Best-effort; never fails the transaction.
+            if (pdu.type === 'm.room.message') {
+              try {
+                const { handleRoomMessage } = await import('../services/room-integrations');
+                await handleRoomMessage(c.env, roomId, pdu.sender as string, pdu.content as Record<string, unknown>, 'federated');
+              } catch (err) {
+                console.warn('[federation] integrations hook failed:', err);
+              }
+            }
           }
         } catch (e) {
           console.error(`Failed to store event ${eventId}:`, e);

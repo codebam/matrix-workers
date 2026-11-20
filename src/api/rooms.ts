@@ -1298,6 +1298,22 @@ export async function performStateEvent(
   // Notify room members about the state change (wakes up long-polling syncs)
   await notifyUsersOfEvent(env, roomId, eventId, eventType);
 
+  // Bot auto-accept: when a bot user is invited (local or federated invite
+  // through the state path), the homeserver completes the join for it —
+  // bots have no client session to tap "accept" with. Best-effort.
+  if (eventType === 'm.room.member' && content?.membership === 'invite') {
+    try {
+      const { getBotByUserId } = await import('../services/bots');
+      const bot = await getBotByUserId(env.DB, stateKey);
+      if (bot) {
+        await joinBotUserToRoom(env, roomId, stateKey);
+        console.log('[rooms] bot auto-accepted invite', { roomId, bot: stateKey });
+      }
+    } catch (err) {
+      console.warn('[rooms] bot auto-accept failed:', err);
+    }
+  }
+
   // Federate the state event. Member invites travel via the dedicated
   // federation /invite endpoint instead (the invitee's server is not yet in
   // the room, so a transaction PDU cannot be authorized there).
@@ -1481,6 +1497,61 @@ export { prepareOutboundPdu } from '../services/event-wire';
  * Older room versions keep the legacy path (generated ID, no derivation).
  * Mutates `event` in place and returns its stored ID.
  */
+// Server-side join for BOT users. Bots have no client session, so the
+// homeserver performs the join for them: used by the admin bot-creation API
+// and by invite auto-accept. Mirrors the local /join route's semantics
+// (public rooms, or the bot currently holding an invite), stores through the
+// version-aware pipeline, notifies members, and federates the join so remote
+// servers can resolve later references. Returns the join event id or null.
+export async function joinBotUserToRoom(env: Env, roomId: string, botUserId: string): Promise<string | null> {
+  const room = await getRoom(env.DB, roomId);
+  if (!room) return null;
+
+  const currentMembership = await getMembership(env.DB, roomId, botUserId);
+  const joinRulesEvent = await getStateEvent(env.DB, roomId, 'm.room.join_rules');
+  const joinRule = (joinRulesEvent?.content as any)?.join_rule || 'invite';
+  const canJoin = joinRule === 'public' || currentMembership?.membership === 'invite';
+  if (!canJoin) {
+    console.warn('[rooms] bot join refused (not public, no invite)', { roomId, botUserId });
+    return null;
+  }
+  if (currentMembership?.membership === 'join') return null; // already joined
+
+  // Destinations captured before the bot's own (local) row changes; remote
+  // membership rows are unaffected either way.
+  const destinations = await getJoinedRemoteServers(env.DB, roomId, env.SERVER_NAME);
+
+  const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
+  const powerLevelsEvent = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
+  const authEvents: string[] = [];
+  if (createEvent) authEvents.push(createEvent.event_id);
+  if (joinRulesEvent) authEvents.push(joinRulesEvent.event_id);
+  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
+  if (currentMembership) authEvents.push(currentMembership.eventId);
+
+  const { events: latestEvents } = await getRoomEvents(env.DB, roomId, undefined, 1);
+  const prevEvents = latestEvents.map((e) => e.event_id);
+
+  const event: PDU = {
+    event_id: '',
+    room_id: roomId,
+    sender: botUserId,
+    type: 'm.room.member',
+    state_key: botUserId,
+    content: { membership: 'join' },
+    origin_server_ts: Date.now(),
+    depth: (latestEvents[0]?.depth ?? 0) + 1,
+    auth_events: authEvents,
+    prev_events: prevEvents,
+  };
+
+  const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
+  await updateMembership(env.DB, roomId, botUserId, 'join', eventId);
+  await notifyUsersOfEvent(env, roomId, eventId, 'm.room.member');
+  await federateLocalStateEventToRemotes(env, event, roomId, destinations);
+  return eventId;
+}
+
 async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): Promise<string> {
   const room = await getRoom(env.DB, roomId);
   const roomVersion = String(room?.room_version ?? '10');
@@ -1870,6 +1941,18 @@ export async function performSendEvent(
     await queueFederationPdu(env, remoteServers, wirePdu, event.event_id, roomId);
   }
 
+  // Native bots and bridges act on the stored message. Best-effort: never
+  // fails the client send. Bot replies re-enter this pipeline with a bot
+  // sender, which every integration skips (loop prevention).
+  if (eventType === 'm.room.message') {
+    try {
+      const { handleRoomMessage } = await import('../services/room-integrations');
+      await handleRoomMessage(env, roomId, userId, content, 'local');
+    } catch (err) {
+      console.warn('[rooms] integrations hook failed:', err);
+    }
+  }
+
   return { eventId: event.event_id, originServerTs: event.origin_server_ts };
 }
 
@@ -2141,6 +2224,19 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
   // yet, so it travels via the federation invite endpoint rather than a
   // /send transaction.
   await federateInvite(c.env, roomId, event);
+
+  // Bot auto-accept: the homeserver completes the join for invited bots —
+  // they have no client session to accept with.
+  try {
+    const { getBotByUserId } = await import('../services/bots');
+    const bot = await getBotByUserId(c.env.DB, inviteeId);
+    if (bot) {
+      await joinBotUserToRoom(c.env, roomId, inviteeId);
+      console.log('[rooms] bot auto-accepted invite', { roomId, bot: inviteeId });
+    }
+  } catch (err) {
+    console.warn('[rooms] bot auto-accept failed:', err);
+  }
 
   return c.json({});
 });

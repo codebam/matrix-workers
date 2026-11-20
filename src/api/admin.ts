@@ -2761,4 +2761,222 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
   return c.json({ server, stored_state: stored, stored_members: members, diag });
 });
 
+// --- Native bots ---
+
+// POST /admin/api/bots - Create a bot user (no password: bots never log in;
+// the homeserver acts for them). Optionally joins it to a room.
+app.post('/admin/api/bots', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const localpart = String(body.localpart ?? '').toLowerCase();
+  const displayName = typeof body.display_name === 'string' ? body.display_name.slice(0, 100) : undefined;
+  const kind = body.kind === 'telegram' ? 'telegram' : 'admin';
+  const commandPrefix = typeof body.command_prefix === 'string' && body.command_prefix.length <= 16
+    ? body.command_prefix
+    : '!admin';
+  const roomId = typeof body.room_id === 'string' ? body.room_id : undefined;
+
+  if (!/^[a-z0-9._=\-\/+]+$/.test(localpart)) {
+    return c.json({ errcode: 'M_INVALID_USERNAME', error: 'Invalid localpart format' }, 400);
+  }
+  const userId = `@${localpart}:${c.env.SERVER_NAME}`;
+  const existing = await db.prepare(`SELECT user_id FROM users WHERE user_id = ?`).bind(userId).first();
+  const existingBot = await db.prepare(`SELECT id FROM bots WHERE user_id = ?`).bind(userId).first();
+  if (existingBot) {
+    return c.json({ errcode: 'M_USER_IN_USE', error: 'Bot already exists' }, 400);
+  }
+
+  const { createUser } = await import('../services/database');
+  const { createBotRow } = await import('../services/bots');
+  if (!existing) {
+    // No password: a bot account can never log in through the client API.
+    await createUser(db, userId, localpart, null, false);
+  }
+  if (displayName) {
+    await db.prepare(`UPDATE users SET display_name = ? WHERE user_id = ?`).bind(displayName, userId).run();
+  }
+  const id = await generateOpaqueId(12);
+  await createBotRow(db, id, userId, kind, commandPrefix);
+
+  let joined = false;
+  if (roomId) {
+    const { joinBotUserToRoom } = await import('./rooms');
+    joined = (await joinBotUserToRoom(c.env, roomId, userId)) !== null;
+  }
+
+  await logAdminAction(c, {
+    action: 'bot.create',
+    target: userId,
+    details: { kind, command_prefix: commandPrefix, room_id: roomId ?? null, joined },
+  });
+
+  return c.json({ id, user_id: userId, kind, command_prefix: commandPrefix, room_id: roomId ?? null, joined });
+});
+
+// GET /admin/api/bots - List bots
+app.get('/admin/api/bots', requireAuth(), requireAdmin, async (c) => {
+  const { listBots } = await import('../services/bots');
+  return c.json({ bots: await listBots(c.env.DB) });
+});
+
+// POST /admin/api/bots/:id/toggle - Enable/disable a bot
+app.post('/admin/api/bots/:id/toggle', requireAuth(), requireAdmin, async (c) => {
+  const { getBotById, setBotEnabled } = await import('../services/bots');
+  const bot = await getBotById(c.env.DB, c.req.param('id'));
+  if (!bot) return Errors.notFound('Bot not found').toResponse();
+  const enabled = bot.enabled !== 1;
+  await setBotEnabled(c.env.DB, bot.id, enabled);
+  await logAdminAction(c, { action: 'bot.toggle', target: bot.user_id, details: { enabled } });
+  return c.json({ id: bot.id, enabled });
+});
+
+// --- Telegram bridges (webhook-driven, never polled) ---
+
+// POST /admin/api/telegram/bridges - Register a Telegram bot <-> room bridge
+// and point Telegram's webhook at this homeserver. The BotFather token is a
+// server-side credential: it is accepted HERE ONLY, never via room messages.
+app.post('/admin/api/telegram/bridges', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  let body: any;
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const botUserId = typeof body.bot_user_id === 'string'
+    ? body.bot_user_id
+    : `@${String(body.bot_localpart ?? '').toLowerCase()}:${c.env.SERVER_NAME}`;
+  const roomId = body.room_id;
+  const chatId = String(body.chat_id ?? '');
+  const tgToken = String(body.tg_token ?? '');
+  if (!roomId || !chatId || !/^\d+(-?\d+)?$/.test(chatId) || !/^\d+:[A-Za-z0-9_-]{30,}$/.test(tgToken)) {
+    return c.json(
+      { errcode: 'M_INVALID_PARAM', error: 'room_id, numeric chat_id and a BotFather token (123456:ABC...) are required' },
+      400,
+    );
+  }
+
+  // The relay account must be a bot of ours (loop prevention keys off the
+  // bots table), and must be joined to the bridged room.
+  const { getBotByUserId, createBotRow, getBotById } = await import('../services/bots');
+  let bot = await getBotByUserId(db, botUserId);
+  if (!bot) {
+    const { getUserById, createUser } = await import('../services/database');
+    if (!(await getUserById(db, botUserId))) {
+      const localpart = botUserId.slice(1, botUserId.indexOf(':'));
+      if (!/^[a-z0-9._=\-\/+]+$/.test(localpart)) {
+        return c.json({ errcode: 'M_INVALID_USERNAME', error: 'Invalid bot localpart' }, 400);
+      }
+      await createUser(db, botUserId, localpart, null, false);
+    }
+    const id = await generateOpaqueId(12);
+    await createBotRow(db, id, botUserId, 'telegram', '!tg');
+    bot = await getBotById(db, id);
+  }
+
+  const { joinBotUserToRoom } = await import('./rooms');
+  const joined = (await joinBotUserToRoom(c.env, roomId, botUserId)) !== null;
+  const membership = await db
+    .prepare(`SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?`)
+    .bind(roomId, botUserId)
+    .first<{ membership: string }>();
+  if (membership?.membership !== 'join') {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'Bot could not join the room (invite it first, or use a public room)' },
+      403,
+    );
+  }
+
+  const { createBridge, setBridgeWebhook } = await import('../services/telegram-bridge');
+  const bridge = await createBridge(db, { botUserId, roomId, chatId, tgToken });
+  const publicBaseUrl = `https://${c.env.SERVER_NAME}`;
+  const webhook = await setBridgeWebhook(bridge, publicBaseUrl);
+  if (!webhook.ok) {
+    // Telegram rejected the token or the webhook URL: roll back the bridge.
+    const { deleteBridge } = await import('../services/telegram-bridge');
+    await deleteBridge(db, bridge.id);
+    return c.json(
+      { errcode: 'M_UNKNOWN', error: `Telegram setWebhook failed: ${webhook.description ?? 'unknown error'}` },
+      502,
+    );
+  }
+
+  await logAdminAction(c, {
+    action: 'telegram_bridge.create',
+    target: bridge.id,
+    details: { bot_user_id: botUserId, room_id: roomId, chat_id: chatId },
+  });
+
+  // Never echo the token back; the webhook URL alone is fine to show.
+  return c.json({
+    id: bridge.id,
+    bot_user_id: botUserId,
+    room_id: roomId,
+    chat_id: chatId,
+    webhook_url: `${publicBaseUrl}/admin/api/telegram/webhook/${bridge.id}`,
+    joined,
+  });
+});
+
+// GET /admin/api/telegram/bridges - List bridges (token never returned)
+app.get('/admin/api/telegram/bridges', requireAuth(), requireAdmin, async (c) => {
+  const { listBridges } = await import('../services/telegram-bridge');
+  const bridges = await listBridges(c.env.DB);
+  return c.json({
+    bridges: bridges.map((b) => ({
+      id: b.id,
+      bot_user_id: b.bot_user_id,
+      room_id: b.room_id,
+      chat_id: b.chat_id,
+      enabled: b.enabled === 1,
+      last_update_id: b.last_update_id,
+      token_fingerprint: `…${b.tg_token.slice(-4)}`,
+    })),
+  });
+});
+
+// DELETE /admin/api/telegram/bridges/:id - Remove the Telegram webhook + row
+app.delete('/admin/api/telegram/bridges/:id', requireAuth(), requireAdmin, async (c) => {
+  const { getBridgeById, deleteBridge, deleteBridgeWebhook } = await import('../services/telegram-bridge');
+  const bridge = await getBridgeById(c.env.DB, c.req.param('id'));
+  if (!bridge) return Errors.notFound('Bridge not found').toResponse();
+  await deleteBridgeWebhook(bridge.tg_token);
+  await deleteBridge(c.env.DB, bridge.id);
+  await logAdminAction(c, { action: 'telegram_bridge.delete', target: bridge.id, details: { room_id: bridge.room_id } });
+  return c.json({ deleted: true });
+});
+
+// POST /admin/api/telegram/webhook/:id - Telegram's update delivery target.
+// Deliberately NOT behind matrix auth: Telegram calls it directly. The
+// X-Telegram-Bot-Api-Secret-Token header we set at setWebhook time is the
+// credential. Always answers 200: Telegram retries non-2xx, and a poisoned
+// update would otherwise replay forever.
+app.post('/admin/api/telegram/webhook/:id', async (c) => {
+  const id = c.req.param('id');
+  const secret = c.req.header('X-Telegram-Bot-Api-Secret-Token');
+  const { getBridgeById, processTelegramUpdate } = await import('../services/telegram-bridge');
+
+  const bridge = await getBridgeById(c.env.DB, id);
+  if (!bridge || bridge.enabled !== 1 || !secret || secret !== bridge.webhook_secret) {
+    // Do not reveal whether the bridge exists.
+    return c.json({}, 403);
+  }
+
+  let update: any;
+  try {
+    update = await c.req.json();
+  } catch {
+    return c.json({});
+  }
+  await processTelegramUpdate(c.env, bridge, update);
+  return c.json({});
+});
+
 export default app;
