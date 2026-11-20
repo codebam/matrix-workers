@@ -71,13 +71,15 @@ should 200 for the new message, and their /state should show membership=join.
 
 ## Deploy state
 - dev (`wrangler.dev.jsonc`): **fully current** — `8c371499` (all fixes).
-- prod: ca886c09 + previous session's commits only. **PENDING (HITL): deploy
-  `97d9422` + `9ebd7f5` to prod**, then run the heal procedure above. The dev
-  repro already validated the receiver-side fixes; the prod deploy additionally
-  fixes prod's own joins to remote v10 rooms and the heal's member fanout.
-- Optional cleanup after prod verification: prod's KV/edge caches
-  (`federation:keys:dev.codebam.ca`, discovery) already expired naturally;
-  no seeded keys were left behind (no D1 key seeding was needed).
+- prod: **deployed `4cf0853f`** (user-approved) — `97d9422` + `9ebd7f5` + `e34f69c`
+  are live on codebam.ca. Live validation with both sides current:
+  clean-room join + send DELIVERED (fed-repro3); GNU/Linux-class heal
+  mechanics DELIVERED — leave + rejoin events federate and are accepted, the
+  post-heal message displays (fed-repro4, all 4 PDUs accepted=1).
+- The fed-repro2 poison variant cannot heal while the poison remains in the
+  stored DAG (leave/rejoin auth-reference the poisoned creator join; real
+  Synapse backfills missing auth via /event fetches, dev's strict port does
+  not). In-process mock peer tests remain the poison coverage.
 
 ## Known minor gaps (documented, not blocking)
 - **Join/send race:** the client /join returns 200 while RoomJoinWorkflow
