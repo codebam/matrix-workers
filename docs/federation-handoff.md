@@ -153,9 +153,14 @@ applied to both, additive-only).
   static import cycles).
 - Live-validated on dev: create+join, !admin status/token mint, webhook
   403/200, TG→Matrix in-room relay, Matrix→TG attempt.
-- Setup on prod (DONE 2026-11-20): management room
+- Setup on prod (COMPLETE + user-verified 2026-11-20): management room
   `!K8i7iW7ofA1apMUCfUnuBGyh:codebam.ca` (alias **#linux_chat:codebam.ca**,
   moved from the GNU/Linux room at the user's request), `@adminbot:codebam.ca`
-  created and joined via invite auto-accept, `!admin help` verified live.
-  Remaining: run `scripts/telegram-bridge-setup.sh` (local, gitignored by the
-  *.sh policy) with a BotFather token + chat id to light up the Telegram side.
+  joined via invite auto-accept and answering `!admin` commands live, and
+  Telegram bridge `tgb_GBf2vdDXHDUDF-5Y` (`@tgbot:codebam.ca` <-> the room,
+  supergroup chat) live in both directions (user-verified). Each bot is a
+  SEPARATE Matrix user needing its own invite to private rooms — the setup
+  script `scripts/telegram-bridge-setup.sh` (local, gitignored by the *.sh
+  policy) now sends the invite itself before registering. En-route fix:
+  negative/supergroup chat ids were rejected by an over-strict validation
+  regex (`c0f3ae9`, deployed `c7d7c378`).
