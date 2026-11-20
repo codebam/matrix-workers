@@ -33,8 +33,8 @@ const REDACTION_KEEP_TOP_LEVEL = [
   'origin_server_ts',
 ];
 
-// Per-event-type content keys retained by the redaction algorithm. Types not
-// listed here have their content stripped entirely.
+// Per-event-type content keys retained by the redaction algorithm (v11+
+// rules). Types not listed here have their content stripped entirely.
 const REDACTION_KEEP_CONTENT: Record<string, string[]> = {
   'm.room.member': ['membership', 'join_authorised_via_users_server'],
   'm.room.join_rules': ['join_rule', 'allow'],
@@ -53,15 +53,34 @@ const REDACTION_KEEP_CONTENT: Record<string, string[]> = {
   'm.room.redaction': ['redacts'],
 };
 
-// m.room.create keeps its full content.
-const CONTENT_KEEP_ALL = new Set(['m.room.create']);
+// Room versions 1-10 redact differently from 11+: m.room.create keeps only
+// `creator` (11+ adds `room_version`), and m.room.power_levels does not keep
+// `invite`. Signing a v10 event with v11 rules produces a reference hash and
+// signature the receiving server rejects.
+const REDACTION_KEEP_CONTENT_V10: Record<string, string[]> = {
+  ...REDACTION_KEEP_CONTENT,
+  'm.room.create': ['creator'],
+  'm.room.power_levels': REDACTION_KEEP_CONTENT['m.room.power_levels'].filter((k) => k !== 'invite'),
+};
+
+// m.room.create keeps its full content at v11+ (creator + room_version).
+const CONTENT_KEEP_ALL_V11 = new Set(['m.room.create']);
+
+function isLegacyRedaction(roomVersion: string | undefined): boolean {
+  const num = parseInt(roomVersion ?? '', 10);
+  return Number.isFinite(num) && num <= 10;
+}
 
 /**
- * Apply the Matrix redaction algorithm (v11 rules) to an event object.
+ * Apply the Matrix redaction algorithm to an event object, using the rules
+ * of the given room version (defaults to v11+ rules).
  *
  * Returns a new object; the input is not modified.
  */
-export function redactEventForSigning(event: Record<string, unknown>): Record<string, unknown> {
+export function redactEventForSigning(
+  event: Record<string, unknown>,
+  roomVersion?: string
+): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const key of REDACTION_KEEP_TOP_LEVEL) {
     if (key in event) {
@@ -70,8 +89,9 @@ export function redactEventForSigning(event: Record<string, unknown>): Record<st
   }
 
   const type = typeof event.type === 'string' ? event.type : '';
+  const legacy = isLegacyRedaction(roomVersion);
 
-  if (CONTENT_KEEP_ALL.has(type)) {
+  if (!legacy && CONTENT_KEEP_ALL_V11.has(type)) {
     // Full content retained.
     return redacted;
   }
@@ -82,7 +102,8 @@ export function redactEventForSigning(event: Record<string, unknown>): Record<st
       : {};
   const kept: Record<string, unknown> = {};
 
-  for (const key of REDACTION_KEEP_CONTENT[type] ?? []) {
+  const keepList = legacy ? REDACTION_KEEP_CONTENT_V10 : REDACTION_KEEP_CONTENT;
+  for (const key of keepList[type] ?? []) {
     if (key in content) {
       kept[key] = content[key];
     }
@@ -105,8 +126,11 @@ export function redactEventForSigning(event: Record<string, unknown>): Record<st
  * Canonical JSON of the event as used for both the reference hash and event
  * signatures: the redacted event with `signatures` and `unsigned` removed.
  */
-export function eventSigningCanonicalJson(event: Record<string, unknown>): string {
-  const redacted = redactEventForSigning(event);
+export function eventSigningCanonicalJson(
+  event: Record<string, unknown>,
+  roomVersion?: string
+): string {
+  const redacted = redactEventForSigning(event, roomVersion);
   delete redacted['signatures'];
   delete redacted['unsigned'];
   return canonicalJson(redacted);
@@ -116,16 +140,22 @@ export function eventSigningCanonicalJson(event: Record<string, unknown>): strin
  * Reference hash of an event: SHA-256 (URL-safe unpadded base64) of the
  * signing canonical JSON.
  */
-export async function computeEventReferenceHash(event: Record<string, unknown>): Promise<string> {
-  return sha256(eventSigningCanonicalJson(event));
+export async function computeEventReferenceHash(
+  event: Record<string, unknown>,
+  roomVersion?: string
+): Promise<string> {
+  return sha256(eventSigningCanonicalJson(event, roomVersion));
 }
 
 /**
  * Derive the event ID for an event in a v4+ room version: `$` followed by
  * the reference hash.
  */
-export async function computeWireEventId(event: Record<string, unknown>): Promise<string> {
-  return `$${await computeEventReferenceHash(event)}`;
+export async function computeWireEventId(
+  event: Record<string, unknown>,
+  roomVersion?: string
+): Promise<string> {
+  return `$${await computeEventReferenceHash(event, roomVersion)}`;
 }
 
 /**

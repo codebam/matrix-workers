@@ -8,10 +8,11 @@ import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias, generateOpaqueId } from '../utils/ids';
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
-import { calculateContentHash, signJson, sha256 } from '../utils/crypto';
-import { computeEventReferenceHash, computeWireEventId, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
-import { getServerSigningKey, federationGet } from '../services/federation-keys';
+import { calculateContentHash, sha256 } from '../utils/crypto';
+import { computeEventReferenceHash, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId } from '../utils/event-signing';
+import { federationGet } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
+import { legacyWireForRoom, prepareOutboundPdu } from '../services/event-wire';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import {
   createRoom,
@@ -1369,52 +1370,9 @@ async function getJoinedRemoteServers(db: D1Database, roomId: string, serverName
   }
 }
 
-// Prepare a locally-created event for the federation wire (v4+ event format,
-// room versions 11+): attach the content hash, derive the reference-hash
-// event ID, and sign the redacted event. Returns null when no signing key is
-// available (delivery is skipped; the event stays local-only).
-export async function prepareOutboundPdu(
-  env: Env,
-  event: PDU,
-  roomVersion?: string
-): Promise<{
-  wireId: string;
-  hashes: Record<string, string>;
-  signatures: Record<string, unknown>;
-  wire: Record<string, unknown>;
-} | null> {
-  try {
-    const source = toWireEventObject(event as unknown as Record<string, unknown>);
-    // `unsigned` is local-only and must not travel on the wire.
-    delete source['unsigned'];
-    // MSC4291: the create event carries no room_id (its ID is derived from
-    // the room ID), so neither the content hash nor the reference hash may
-    // cover one.
-    if (roomVersion && isMsc4291RoomVersion(roomVersion) && event.type === 'm.room.create') {
-      delete source['room_id'];
-    }
-    const hashes = { sha256: await calculateContentHash(source) };
-    const hashed = { ...source, hashes };
-    const wireId = await computeWireEventId(hashed);
-
-    const signingKey = await getServerSigningKey(env.DB);
-    if (!signingKey) {
-      console.warn('[rooms] No signing key available; skipping federation delivery');
-      return null;
-    }
-    const signed = await signJson(
-      redactEventForSigning(hashed),
-      env.SERVER_NAME,
-      signingKey.keyId,
-      signingKey.privateKeyJwk
-    );
-    const signatures = (signed as { signatures?: Record<string, unknown> }).signatures || {};
-    return { wireId, hashes, signatures, wire: { ...hashed, signatures } };
-  } catch (err) {
-    console.error('[rooms] prepareOutboundPdu failed:', err);
-    return null;
-  }
-}
+// Moved to services/event-wire (shared with the federation serving paths);
+// re-exported for existing importers.
+export { prepareOutboundPdu } from '../services/event-wire';
 
 /**
  * Prepare a locally-created event for storage and federation in MSC4291 room
@@ -1596,12 +1554,16 @@ async function federateInvite(env: Env, roomId: string, inviteEvent: PDU): Promi
     // MSC4291 (room version 12): the create event is implicit and must not
     // appear in auth_events. Strip it from a copy, before hashing and
     // signing, so the prepared wire event is self-consistent.
+    const legacyWire = await legacyWireForRoom(env, roomId, roomVersion);
     const forWire = (event: PDU): PDU => {
-      if (!createIsImplicit || !createEventId) return event;
-      return {
-        ...event,
-        auth_events: (event.auth_events ?? []).filter((id) => id !== createEventId),
-      };
+      let auth = event.auth_events ?? [];
+      if (createIsImplicit && createEventId) auth = auth.filter((id) => id !== createEventId);
+      let prev = event.prev_events ?? [];
+      if (legacyWire) {
+        auth = auth.map((id) => legacyWire.idMap.get(id) ?? id);
+        prev = prev.map((id) => legacyWire.idMap.get(id) ?? id);
+      }
+      return { ...event, auth_events: auth, prev_events: prev };
     };
 
     const preparedInvite = await prepareOutboundPdu(env, forWire(inviteEvent), roomVersion);
@@ -1694,7 +1656,17 @@ export async function performSendEvent(
     `SELECT event_id, depth FROM events WHERE room_id = ? AND sender NOT LIKE ? ORDER BY origin_server_ts DESC LIMIT 1`
   ).bind(roomId, `%:${env.SERVER_NAME}`).first<{ event_id: string; depth: number }>();
   const parent = remoteTip ?? latestEvents[0] ?? null;
-  const prevEvents = parent ? [parent.event_id] : [];
+  let prevEvents = parent ? [parent.event_id] : [];
+
+  // Legacy rooms we created store pre-fix events under v11-rule IDs;
+  // reference the translated wire IDs so the new event is stored under the
+  // same ID federation peers derive.
+  const legacyWire = await legacyWireForRoom(env, roomId, roomVersionStr);
+  let authEventsFinal = authEvents;
+  if (legacyWire) {
+    authEventsFinal = authEvents.map((id) => legacyWire.idMap.get(id) ?? id);
+    prevEvents = prevEvents.map((id) => legacyWire.idMap.get(id) ?? id);
+  }
 
   const event: PDU = {
     event_id: eventId,
@@ -1705,7 +1677,7 @@ export async function performSendEvent(
     origin_server_ts: Date.now(),
     unsigned: { transaction_id: txnId },
     depth: (parent?.depth ?? 0) + 1,
-    auth_events: authEvents,
+    auth_events: authEventsFinal,
     prev_events: prevEvents,
   };
 

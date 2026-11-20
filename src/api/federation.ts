@@ -13,11 +13,11 @@ import {
   type ServerKeyResponse,
 } from '../services/federation-keys';
 import { validateUrl } from '../utils/url-validator';
-import { checkEventAuth, expectedAuthTypes } from '../services/event-auth';
+import { checkEventAuth } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
-import { prepareOutboundPdu } from './rooms';
+import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
 import { resolveState } from '../services/state-resolution';
 
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
@@ -1018,7 +1018,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
   const eventId = c.req.param('eventId');
 
-  const event = await c.env.DB.prepare(
+  let event = await c.env.DB.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
      origin_server_ts, depth, auth_events, prev_events, hashes, signatures
      FROM events WHERE event_id = ?`
@@ -1038,10 +1038,41 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
   }>();
 
   if (!event) {
+    // The requested ID may be a derived wire ID of a legacy locally-created
+    // room; resolve it through that room's derivation.
+    const legacyRooms = await c.env.DB.prepare(
+      `SELECT r.room_id, r.room_version FROM rooms r
+       JOIN room_state rs ON rs.room_id = r.room_id AND rs.event_type = 'm.room.create'
+       JOIN events ce ON ce.event_id = rs.event_id
+       WHERE CAST(r.room_version AS INTEGER) BETWEEN 3 AND 10 AND ce.sender LIKE ?`
+    ).bind(`%:${c.env.SERVER_NAME}`).all<{ room_id: string; room_version: string }>();
+    for (const r of legacyRooms.results ?? []) {
+      const w = await deriveRoomWireEvents(c.env, r.room_id, r.room_version);
+      if (!w) continue;
+      const storedId = [...w.idMap.entries()].find(([, wid]) => wid === eventId)?.[0];
+      if (!storedId) continue;
+      const wirePdu = w.wireById.get(storedId);
+      if (wirePdu) {
+        return c.json({
+          origin: c.env.SERVER_NAME,
+          origin_server_ts: Date.now(),
+          pdus: [wirePdu],
+        });
+      }
+    }
     return Errors.notFound('Event not found').toResponse();
   }
 
   const eventRoom = await getRoom(c.env.DB, event.room_id);
+  const evWire = await wireForRoom(c.env, event.room_id, eventRoom?.room_version ?? '10');
+  const evWirePdu = evWire?.wireById.get(event.event_id);
+  if (evWirePdu) {
+    return c.json({
+      origin: c.env.SERVER_NAME,
+      origin_server_ts: Date.now(),
+      pdus: [evWirePdu],
+    });
+  }
 
   const pdu: PDU = {
     event_id: event.event_id,
@@ -1139,6 +1170,16 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     }
   }
 
+  const stateWire = await wireForRoom(c.env, roomId, stateRoom?.room_version ?? '10');
+  if (stateWire) {
+    const joined = buildWireJoinState(stateWire, stateEvents.results.map((e) => e.event_id));
+    return c.json({
+      origin: c.env.SERVER_NAME,
+      origin_server_ts: Date.now(),
+      pdus: joined.state,
+      auth_chain: joined.authChain,
+    });
+  }
   return c.json({
     origin: c.env.SERVER_NAME,
     origin_server_ts: Date.now(),
@@ -1154,8 +1195,8 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
 
   // Verify room exists
   const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
@@ -1208,6 +1249,24 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
     authChainIds = Array.from(authChainSet);
   }
 
+  const idsWire = await wireForRoom(c.env, roomId, room.room_version);
+  if (idsWire) {
+    const pduIds = stateEventIds.map((id) => idsWire.idMap.get(id) ?? id);
+    const inState = new Set(pduIds);
+    const authSet = new Set<string>();
+    const queue = [...pduIds];
+    while (queue.length > 0) {
+      const id = queue.pop()!;
+      const ev = idsWire.wireById.get(id);
+      for (const ref of ((ev?.auth_events as string[] | undefined) ?? [])) {
+        if (!inState.has(ref) && !authSet.has(ref)) {
+          authSet.add(ref);
+          queue.push(ref);
+        }
+      }
+    }
+    return c.json({ pdu_ids: pduIds, auth_chain_ids: [...authSet] });
+  }
   return c.json({
     pdu_ids: stateEventIds,
     auth_chain_ids: authChainIds,
@@ -1242,7 +1301,9 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
   const MAX_AUTH_CHAIN_SIZE = 500;
   const authChain: PDU[] = [];
   const visited = new Set<string>();
-  const toProcess = JSON.parse(event.auth_events) as string[];
+  const authWire = await wireForRoom(c.env, roomId, room.room_version);
+  let toProcess = JSON.parse(event.auth_events) as string[];
+  if (authWire) toProcess = toProcess.map((id) => authWire.idMap.get(id) ?? id);
 
   while (toProcess.length > 0 && authChain.length < MAX_AUTH_CHAIN_SIZE) {
     const authId = toProcess.shift()!;
@@ -1269,7 +1330,8 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
     }>();
 
     if (authEvent) {
-      authChain.push({
+      const wireForm = authWire?.wireById.get(authEvent.event_id);
+      authChain.push((wireForm ?? omitWireEventId({
         event_id: authEvent.event_id,
         room_id: authEvent.room_id,
         sender: authEvent.sender,
@@ -1282,10 +1344,10 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
         prev_events: JSON.parse(authEvent.prev_events),
         hashes: authEvent.hashes ? JSON.parse(authEvent.hashes) : undefined,
         signatures: authEvent.signatures ? JSON.parse(authEvent.signatures) : undefined,
-      });
+      }, room.room_version)) as PDU);
 
-      // Add this event's auth_events to process
-      const moreAuthEvents = JSON.parse(authEvent.auth_events) as string[];
+      // Add this event's auth_events to process (wire IDs when derived)
+      const moreAuthEvents = (wireForm?.auth_events as string[] | undefined) ?? JSON.parse(authEvent.auth_events) as string[];
       for (const id of moreAuthEvents) {
         if (!visited.has(id)) {
           toProcess.push(id);
@@ -1373,10 +1435,13 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
   }));
 
+  const bfWire = await wireForRoom(c.env, roomId, room.room_version);
   return c.json({
     origin: c.env.SERVER_NAME,
     origin_server_ts: Date.now(),
-    pdus: pdus.map((p) => omitWireEventId(p, room.room_version)),
+    pdus: bfWire
+      ? events.map((e: any) => bfWire.wireById.get(e.event_id)).filter(Boolean)
+      : pdus.map((p) => omitWireEventId(p, room.room_version)),
   });
 });
 
@@ -1478,8 +1543,11 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
     }
   }
 
+  const gmWire = await wireForRoom(c.env, roomId, room.room_version);
   return c.json({
-    events: events.map((p) => omitWireEventId(p, room.room_version)),
+    events: gmWire
+      ? events.map((p: any) => gmWire.wireById.get(p.event_id)).filter(Boolean)
+      : events.map((p) => omitWireEventId(p, room.room_version)),
   });
 });
 
@@ -1488,170 +1556,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
 // locally-created events under generated IDs that reference each other by
 // those IDs, but federation peers only ever exchange derived IDs -- every
 // outbound use (make_join templates, send_join state) must translate.
-// Returns null for room versions whose event IDs are not derived (v1-v10
-// keep the legacy wire format).
-// Auth event types the receiving server's selection algorithm expects come
-// from services/event-auth (expectedAuthTypes) so the creation path and the
-// serving derivation cannot drift apart.
-
-// Derive the wire form of every event in a room for MSC4291 room versions
-// (12): the create event's ID is "$" + its reference hash (never carrying a
-// room_id), every other event gets a reference-hash ID, intra-room
-// references are translated, and each event's auth_events are reduced to the
-// set the receiving server's auth selection expects (extras and anything
-// that does not resolve are rejected on receipt). Returns null for room
-// versions whose event IDs are not derived (v1-v11 keep the legacy wire
-// format).
-async function deriveRoomWireEvents(
-  env: Env,
-  roomId: string,
-  roomVersion: string
-): Promise<{ idMap: Map<string, string>; wireById: Map<string, Record<string, unknown>> } | null> {
-  if (!isMsc4291RoomVersion(roomVersion)) return null;
-
-  const idMap = new Map<string, string>();
-  const wireById = new Map<string, Record<string, unknown>>();
-
-  const createRow = await env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`
-  ).bind(roomId).first<{ event_id: string }>();
-  const createEventId = createRow?.event_id;
-
-  const all = await env.DB.prepare(
-    `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-     FROM events WHERE room_id = ?
-     ORDER BY depth ASC, stream_ordering ASC`
-  ).bind(roomId).all();
-
-  const refTargets = new Map<string, { type: string; stateKey: string }>();
-
-  // Single pass in dependency order: auth/prev references always point at
-  // earlier events, so each event's final wire form (and derived ID) is
-  // settled before any event that references it. References are translated
-  // to derived IDs, auth_events are reduced to the receiving server's
-  // expected selection, and the hash/signature computation happens last so
-  // the served bytes hash back to the served ID.
-  for (const row of all.results as any[]) {
-    const event: PDU = {
-      event_id: row.event_id,
-      room_id: row.room_id,
-      sender: row.sender,
-      type: row.event_type,
-      content: JSON.parse(row.content),
-      origin_server_ts: row.origin_server_ts,
-      depth: row.depth,
-      auth_events: JSON.parse(row.auth_events),
-      prev_events: JSON.parse(row.prev_events),
-      hashes: row.hashes ? JSON.parse(row.hashes) : undefined,
-      signatures: row.signatures ? JSON.parse(row.signatures) : undefined,
-    };
-    // `state_key` exists only on state events. Adding the key with an
-    // undefined value for other events would survive into the canonical JSON
-    // as `"state_key":null` (canonicalJson maps undefined to null), giving
-    // the event a different reference hash than the bytes we serve and store
-    // -- a phantom ID that cascades into every event referencing it.
-    if (row.state_key !== null && row.state_key !== undefined) {
-      event.state_key = row.state_key;
-    }
-    // MSC4291: the create event is implicit, never listed.
-    if (createEventId) {
-      event.auth_events = event.auth_events.filter((id) => id !== createEventId);
-    }
-
-    // Translate intra-room references to the derived wire IDs of the
-    // events already processed.
-    for (const key of ['auth_events', 'prev_events'] as const) {
-      event[key] = event[key].map((id) => (idMap.has(id) ? idMap.get(id)! : id));
-    }
-
-    // Reduce auth_events to the receiving server's expected selection: the
-    // receiver's receipt checks reject unexpected entries. References that
-    // cannot be classified (e.g. remote-side synthetic IDs) pass through
-    // untouched, and the create is never listed.
-    if (row.event_type !== 'm.room.create') {
-      const expected = expectedAuthTypes(
-        row.event_type,
-        row.sender,
-        row.state_key ?? undefined,
-        event.content as Record<string, unknown>
-      );
-      const kept: string[] = [];
-      const seen = new Set<string>();
-      const push = (id: unknown): void => {
-        if (typeof id === 'string' && !seen.has(id)) {
-          seen.add(id);
-          kept.push(id);
-        }
-      };
-      for (const ref of event.auth_events) {
-        const target = refTargets.get(ref);
-        if (!target) {
-          push(ref);
-          continue;
-        }
-        if (target.type === 'm.room.create') continue;
-        if (expected.has(`${target.type}\u0000${target.stateKey}`)) push(ref);
-      }
-      event.auth_events = kept;
-    }
-
-    // Derivation recomputes the content hash and adds our signature; any
-    // signatures already on the event (e.g. the joining server's own
-    // signature on its join) are preserved by the merge inside signing.
-    const prepared = await prepareOutboundPdu(env, event, roomVersion);
-    if (!prepared) continue;
-    idMap.set(row.event_id, prepared.wireId);
-    wireById.set(row.event_id, prepared.wire);
-    wireById.set(prepared.wireId, prepared.wire);
-    const info = { type: row.event_type as string, stateKey: (row.state_key ?? '') as string };
-    refTargets.set(row.event_id, info);
-    refTargets.set(prepared.wireId, info);
-  }
-
-  return { idMap, wireById };
-}
-
-// Build the send_join response state for room versions 11+: the current room
-// state plus the transitive auth chain, every event in wire form (derived
-// ID, no explicit event_id field, hashes and signatures intact).
-function buildWireJoinState(
-  wire: { idMap: Map<string, string>; wireById: Map<string, Record<string, unknown>> },
-  stateIds: string[]
-): { state: Record<string, unknown>[]; authChain: Record<string, unknown>[] } {
-  const stateSet = new Set<string>();
-  for (const id of stateIds) {
-    stateSet.add(id);
-    const derived = wire.idMap.get(id);
-    if (derived) stateSet.add(derived);
-  }
-  const state = stateIds
-    .map((id) => wire.wireById.get(id))
-    .filter(Boolean) as Record<string, unknown>[];
-
-  const chainIds = new Set<string>();
-  const queue: string[] = [];
-  for (const ev of state) {
-    for (const ref of (ev.auth_events as string[] | undefined) ?? []) queue.push(ref);
-  }
-  while (queue.length > 0) {
-    const id = queue.pop()!;
-    if (chainIds.has(id) || stateSet.has(id) || !wire.wireById.has(id)) continue;
-    chainIds.add(id);
-    const ev = wire.wireById.get(id)!;
-    for (const ref of (ev.auth_events as string[] | undefined) ?? []) queue.push(ref);
-  }
-
-  return {
-    state,
-    authChain: [...chainIds]
-      .map((id) => wire.wireById.get(id))
-      .filter(Boolean) as Record<string, unknown>[],
-  };
-}
-
+// Wire derivation lives in services/event-wire (shared with outbound paths).
 // Countersign a joining server's m.room.member join event and persist it as
 // current state. The joining server signs first; the resident server (us)
 // adds its own signature -- both must survive -- and stores the event under
@@ -1660,7 +1565,8 @@ async function persistInboundJoin(
   env: Env,
   roomId: string,
   joinEvent: Record<string, unknown>,
-  origin?: string
+  origin?: string,
+  roomVersion?: string
 ): Promise<string | null> {
   if (
     joinEvent['room_id'] !== roomId ||
@@ -1691,7 +1597,7 @@ async function persistInboundJoin(
   if (!signingKey) return null;
 
   const signed = await signJson(
-    redactEventForSigning(toWireEventObject(joinEvent)),
+    redactEventForSigning(toWireEventObject(joinEvent), roomVersion),
     env.SERVER_NAME,
     signingKey.keyId,
     signingKey.privateKeyJwk
@@ -1702,7 +1608,7 @@ async function persistInboundJoin(
     ...(ourSig ? { [env.SERVER_NAME]: ourSig } : {}),
   };
 
-  const wireId = await computeWireEventId(joinEvent);
+  const wireId = await computeWireEventId(joinEvent, roomVersion);
   joinEvent['event_id'] = wireId;
 
   const event = joinEvent as unknown as PDU;
@@ -1829,7 +1735,7 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
   const wireRef = (id: string): string => makerWire?.idMap.get(id) ?? id;
 
   const authEvents: string[] = [];
-  if (createEvent && !makerWire) authEvents.push(createEvent.event_id);
+  if (createEvent && !isMsc4291RoomVersion(room.room_version)) authEvents.push(wireRef(createEvent.event_id));
   if (powerLevelsEvent) authEvents.push(wireRef(powerLevelsEvent.event_id));
   if (inviteeMembership) authEvents.push(wireRef(inviteeMembership.event_id));
   if (joinRulesEvent) authEvents.push(wireRef(joinRulesEvent.event_id));
@@ -1895,8 +1801,8 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   // Room versions 11+ (derived event IDs): countersign and store the join,
   // then serve the room's state in wire form -- peers only exchange derived
   // IDs, so locally stored events must be translated before they leave.
-  const v1Derived = isMsc4291RoomVersion(room.room_version);
-  if (!v1Derived) {
+  let wire = await wireForRoom(c.env, roomId, room.room_version);
+  if (!wire) {
     // send_join carries the event ID in the URL; the PDU body may omit it.
     if (!body.event_id) body.event_id = eventId;
     await persistLegacyInboundJoin(
@@ -1906,18 +1812,20 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
       c.get('federationOrigin' as any) as string | undefined
     );
   }
-  if (v1Derived) {
+  if (wire) {
     const storedJoinId = await persistInboundJoin(
       c.env,
       roomId,
       body as Record<string, unknown>,
-      c.get('federationOrigin' as any) as string | undefined
+      c.get('federationOrigin' as any) as string | undefined,
+      room.room_version
     );
     if (storedJoinId) {
       console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
     }
-    const wire = await deriveRoomWireEvents(c.env, roomId, room.room_version);
-    if (wire) {
+    // Re-derive after persisting so the join itself is in the served state.
+    wire = (await wireForRoom(c.env, roomId, room.room_version)) ?? wire;
+    {
       const stateRows = await c.env.DB.prepare(
         `SELECT event_id FROM room_state WHERE room_id = ?`
       ).bind(roomId).all<{ event_id: string }>();
@@ -2031,8 +1939,8 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
   // Room versions 11+ (derived event IDs): countersign and store the join,
   // then serve the room's state in wire form -- peers only exchange derived
   // IDs, so locally stored events must be translated before they leave.
-  const v2Derived = isMsc4291RoomVersion(room.room_version);
-  if (!v2Derived) {
+  let wire = await wireForRoom(c.env, roomId, room.room_version);
+  if (!wire) {
     // send_join carries the event ID in the URL; the PDU body may omit it.
     if (!body.event_id) body.event_id = eventId;
     await persistLegacyInboundJoin(
@@ -2042,18 +1950,20 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
       c.get('federationOrigin' as any) as string | undefined
     );
   }
-  if (v2Derived) {
+  if (wire) {
     const storedJoinId = await persistInboundJoin(
       c.env,
       roomId,
       body as Record<string, unknown>,
-      c.get('federationOrigin' as any) as string | undefined
+      c.get('federationOrigin' as any) as string | undefined,
+      room.room_version
     );
     if (storedJoinId) {
       console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
     }
-    const wire = await deriveRoomWireEvents(c.env, roomId, room.room_version);
-    if (wire) {
+    // Re-derive after persisting so the join itself is in the served state.
+    wire = (await wireForRoom(c.env, roomId, room.room_version)) ?? wire;
+    {
       const stateRows = await c.env.DB.prepare(
         `SELECT rs.event_id, e.sender, e.event_type, e.content FROM room_state rs
          JOIN events e ON rs.event_id = e.event_id
@@ -2268,8 +2178,8 @@ app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
 
   // Verify room exists
   const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
@@ -2309,8 +2219,8 @@ app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
 
   // Verify room exists
   const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
@@ -3222,8 +3132,8 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
 
   // Verify room exists
   const room = await db.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
@@ -3871,8 +3781,8 @@ app.get('/_matrix/federation/v1/timestamp_to_event/:roomId', async (c) => {
 
   // Verify room exists
   const room = await db.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
