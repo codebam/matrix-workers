@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env, PDU } from '../src/types';
 import { SynapsePeer, peerSigningKey, installNodeEd25519Shim } from './helpers/synapse-peer';
 import { prepareOutboundPdu } from '../src/services/event-wire';
+import { computeWireEventId } from '../src/utils/event-signing';
 
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => async (c: any, next: () => Promise<void>) => {
@@ -83,6 +84,11 @@ function makeDb() {
       const stmt = (args: any[]) => ({
         async first<T>(): Promise<T | null> {
           if (sql.includes('UPDATE stream_positions')) return { position: ++stream } as T;
+          if (sql.includes('INSERT INTO room_memberships')) {
+            // tryInsertJoinMembership: upsert to join + RETURNING event_id.
+            memberships.set(`${args[0]}\0${args[1]}`, { membership: 'join', event_id: args[2] });
+            return { event_id: args[2] } as T;
+          }
           if (sql.includes('FROM server_keys')) return (serverKeys[0] ?? null) as T;
           if (sql.includes('SELECT membership, event_id FROM room_memberships')) {
             const m = memberships.get(`${args[0]}\0${args[1]}`);
@@ -117,6 +123,16 @@ function makeDb() {
           return null as T;
         },
         async all<T>(): Promise<{ results: T[] }> {
+          if (sql.includes('FROM remote_server_keys')) {
+            // fetchRemoteServerKeys: serve the local signing key so inbound
+            // signature verification never hits the network.
+            return {
+              results: [{
+                server_name: 'example.com', key_id: signing.keyId, public_key: signing.verifyKeyB64,
+                valid_from: 0, valid_until: Date.now() + 86_400_000, fetched_at: Date.now(), verified: 1,
+              }] as T[],
+            };
+          }
           if (sql.includes('SELECT DISTINCT user_id FROM room_memberships')) {
             return {
               results: [...memberships.entries()]
@@ -161,6 +177,19 @@ function makeDb() {
           return { results: [] as T[] };
         },
         async run() {
+          if (sql.includes('INSERT OR IGNORE INTO events')) {
+            if (events.has(args[0])) return { meta: { changes: 0 } };
+            if (sql.includes('unsigned')) {
+              // storeEventIdempotent: 14 columns (with unsigned).
+              const [event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering] = args;
+              events.set(event_id, { event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering });
+            } else {
+              // Inbound /send storage: 13 columns (no unsigned).
+              const [event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures, stream_ordering] = args;
+              events.set(event_id, { event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned: null, depth, auth_events, prev_events, hashes, signatures, stream_ordering });
+            }
+            return { meta: { changes: 1 } };
+          }
           if (sql.includes('INSERT INTO events')) {
             const [event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering] = args;
             events.set(event_id, { event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering });
@@ -200,6 +229,9 @@ function makeEnv(): Env {
       get: () => ({
         fetch: async (req: Request) => {
           const { pdu, room_id } = await req.json() as { pdu: any; room_id: string };
+          if (process.env.PEER_DEBUG) {
+            console.log('DELIVER', room_id, pdu.type, 'auth:', JSON.stringify(pdu.auth_events));
+          }
           await peer.receiveSend(room_id, pdu, SERVER);
           return Response.json({ ok: true });
         },
@@ -402,5 +434,96 @@ describe('GNU/Linux-class delivery against a Synapse-rules peer', () => {
     const { event_id: _m, ...msgWire } = { ...msg, hashes: preparedMsg!.hashes, signatures: preparedMsg!.signatures } as PDU;
     expect(await peer.receiveSend(LOCAL_ROOM, msgWire as PDU, SERVER)).toBeNull();
     expect(lroom.timeline).toHaveLength(1);
+  });
+});
+describe('inbound wire-ID derivation must use the room version (v10 phantom-ID bug)', () => {
+  it('inbound v10 /send PDU is stored under the sender v10-rule reference hash, not a v11+ phantom', async () => {
+    const create = await seedStateEvent(ROOM, PEER_USER, 'm.room.create', '', { creator: PEER_USER, room_version: '10' }, [], 1);
+    const creatorJoin = await seedStateEvent(ROOM, PEER_USER, 'm.room.member', PEER_USER, { membership: 'join' }, [create], 2);
+    const pl = await seedStateEvent(ROOM, PEER_USER, 'm.room.power_levels', '', { users: { [PEER_USER]: 100 }, state_default: 50, events_default: 0 }, [create, creatorJoin], 3);
+    db.memberships.set(`${ROOM}\0${PEER_USER}`, { membership: 'join', event_id: creatorJoin });
+
+    // A power_levels event authored by the resident: its reference hash
+    // DIFFERS between v10 and v11+ redaction (v10 drops `invite`), so a
+    // version-blind receiver derives a phantom ID the sender never used.
+    const plUpdate: Record<string, unknown> = {
+      room_id: ROOM, sender: PEER_USER, type: 'm.room.power_levels', state_key: '',
+      content: { users: { [PEER_USER]: 100, [USER]: 50 }, users_default: 0, invite: 25, state_default: 50 },
+      origin_server_ts: 1_700_000_000_006, depth: 6,
+      auth_events: [create, pl, creatorJoin], prev_events: [pl],
+    };
+    const prepared = await prepareOutboundPdu(env, plUpdate as PDU, '10');
+    const senderId = prepared!.wireId;
+    const { event_id: _e, ...wire } = prepared!.wire as Record<string, unknown>;
+
+    const res = await federationApp.request(
+      'http://localhost/_matrix/federation/v1/send/1795000000000',
+      { method: 'PUT', body: JSON.stringify({ pdus: [wire], edus: [] }) },
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json() as { pdus: Record<string, unknown> };
+    // The receiver derived the SENDER's ID (v10 rules) and accepted it.
+    expect(body.pdus[senderId]).toEqual({});
+    expect(db.events.has(senderId)).toBe(true);
+
+    // Pin the divergence this regression protects: a version-blind (v11+
+    // rules) derivation yields a different, phantom ID that must not be used.
+    const versionBlind = await computeWireEventId(wire);
+    expect(versionBlind).not.toBe(senderId);
+    expect(db.events.has(versionBlind)).toBe(false);
+  });
+});
+
+describe('GNU/Linux-class heal: local member transitions must federate to residents', () => {
+  it('leave + re-join fan out to the remote member; the post-heal message displays', async () => {
+    // LOCAL room: we are the resident; a remote user (peer.test) is joined.
+    const create = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.create', '', { creator: USER, room_version: '10' }, [], 1);
+    const creatorJoin = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.member', USER, { membership: 'join' }, [create], 2);
+    const pl = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.power_levels', '', { users: { [USER]: 100 }, state_default: 50, events_default: 0 }, [create, creatorJoin], 3);
+    const jr = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.join_rules', '', { join_rule: 'public' }, [create, pl, creatorJoin], 4);
+    const peerJoin = await seedStateEvent(LOCAL_ROOM, PEER_USER, 'm.room.member', PEER_USER, { membership: 'join' }, [create, pl, jr], 5);
+    db.memberships.set(`${LOCAL_ROOM}\0${USER}`, { membership: 'join', event_id: creatorJoin });
+    db.memberships.set(`${LOCAL_ROOM}\0${PEER_USER}`, { membership: 'join', event_id: peerJoin });
+
+    // Resident view: the peer ingests the same state (wire forms).
+    const stateWires = [];
+    for (const id of [create, creatorJoin, pl, jr, peerJoin]) {
+      const { event_id: _e, ...wire } = rowToPdu(db.events.get(id));
+      stateWires.push(wire);
+    }
+    await peer.ingestStateUnchecked(LOCAL_ROOM, stateWires as PDU[], SERVER);
+    expect(peer.rejections).toEqual([]);
+
+    // The user leaves via the client API. Without state-event fanout the
+    // remote member's server never learns this, and the eventual re-join is
+    // an event its auth checks cannot resolve later messages against.
+    const leaveRes = await roomsApp.request(
+      `http://localhost/_matrix/client/v3/rooms/${encodeURIComponent(LOCAL_ROOM)}/leave`,
+      { method: 'POST', body: JSON.stringify({}) }, env,
+    );
+    expect(leaveRes.status).toBe(200);
+    expect(
+      peer.rooms.get(LOCAL_ROOM)!.state.get(`m.room.member\0${USER}`)?.content.membership
+    ).toBe('leave');
+
+    // The user re-joins via the client API; the resident peer sees the join.
+    const joinRes = await roomsApp.request(
+      `http://localhost/_matrix/client/v3/join/${encodeURIComponent(LOCAL_ROOM)}`,
+      { method: 'POST', body: JSON.stringify({}) }, env,
+    );
+    expect(joinRes.status).toBe(200);
+    expect(
+      peer.rooms.get(LOCAL_ROOM)!.state.get(`m.room.member\0${USER}`)?.content.membership
+    ).toBe('join');
+
+    // The post-heal message is accepted and displayed.
+    const sent = await performSendEvent(env, LOCAL_ROOM, USER, 'm.room.message', { body: 'healed', msgtype: 'm.text' }, 'txnh');
+    console.log('SENT:', JSON.stringify(sent), 'REJECTIONS:', JSON.stringify(peer.rejections));
+    expect('eventId' in sent).toBe(true);
+    expect(
+      peer.rooms.get(LOCAL_ROOM)!.timeline.some((p) => p.content?.body === 'healed')
+    ).toBe(true);
+    expect(peer.rejections).toEqual([]);
   });
 });

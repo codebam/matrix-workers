@@ -845,6 +845,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
     await notifyUsersOfEvent(c.env, roomId, memberResult.eventId, 'm.room.member');
   }
 
+  // Federate the join to remote members so their servers can resolve later
+  // events that auth-reference it.
+  const joinDestinations = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
+  await federateLocalStateEventToRemotes(c.env, event, roomId, joinDestinations);
+
   return c.json({ room_id: roomId });
 });
 
@@ -906,6 +911,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
 
   // Notify room members about the leave
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  // Federate the leave to remote members so their servers can resolve later
+  // events that auth-reference it.
+  const leaveDestinations = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
+  await federateLocalStateEventToRemotes(c.env, event, roomId, leaveDestinations);
 
   return c.json({});
 });
@@ -1206,6 +1216,17 @@ export async function performStateEvent(
 
   const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
 
+  // Destinations for federation fanout: captured before any membership row
+  // mutates, plus the affected user's server for membership events.
+  const remoteServers = await getJoinedRemoteServers(env.DB, roomId, env.SERVER_NAME);
+  let fanoutDestinations = remoteServers;
+  if (eventType === 'm.room.member') {
+    const targetDomain = stateKey.includes(':') ? stateKey.slice(stateKey.indexOf(':') + 1) : '';
+    if (targetDomain && targetDomain !== env.SERVER_NAME && !remoteServers.includes(targetDomain)) {
+      fanoutDestinations = [...remoteServers, targetDomain];
+    }
+  }
+
   // Invalidate room metadata cache if this is a metadata-affecting state event
   const CACHED_STATE_TYPES = ['m.room.name', 'm.room.avatar', 'm.room.topic', 'm.room.canonical_alias', 'm.room.member'];
   if (CACHED_STATE_TYPES.includes(eventType)) {
@@ -1235,6 +1256,15 @@ export async function performStateEvent(
 
   // Notify room members about the state change (wakes up long-polling syncs)
   await notifyUsersOfEvent(env, roomId, eventId, eventType);
+
+  // Federate the state event. Member invites travel via the dedicated
+  // federation /invite endpoint instead (the invitee's server is not yet in
+  // the room, so a transaction PDU cannot be authorized there).
+  if (eventType === 'm.room.member' && content?.membership === 'invite') {
+    await federateInvite(env, roomId, event);
+  } else {
+    await federateLocalStateEventToRemotes(env, event, roomId, fanoutDestinations);
+  }
 
   return { eventId };
 }
@@ -1556,6 +1586,51 @@ async function queueFederationPdu(
         console.error(`[rooms] Federation queueing failed for ${destination}:`, err);
       }
     }));
+  }
+}
+
+// Federate a locally-created state/membership event to the room's remote
+// servers. Mirrors the message send path: refs translated from the stored ID
+// space into the wire space, v4+ wire form derived (content hash, redacted
+// signature), then queued through the Federation DO for alarm-batched
+// delivery with retries. Without this, remote servers never see local
+// membership transitions — a leave + re-join "heal" sends later messages
+// referencing a join event the resident never received, so it rejects them
+// ("missing auth event type m.room.member") and the room stays broken.
+// Best-effort: never fails the caller.
+async function federateLocalStateEventToRemotes(
+  env: Env,
+  event: PDU,
+  roomId: string,
+  destinations: string[]
+): Promise<void> {
+  if (destinations.length === 0) return;
+  try {
+    const room = await getRoom(env.DB, roomId);
+    const roomVersion = String(room?.room_version ?? '10');
+    const createIsImplicit = isMsc4291RoomVersion(roomVersion);
+    const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
+    const createEventId = createEvent?.event_id;
+
+    const legacyWire = await legacyWireForRoom(env, roomId, roomVersion);
+    let auth = event.auth_events ?? [];
+    if (createIsImplicit && createEventId) auth = auth.filter((id) => id !== createEventId);
+    let prev = event.prev_events ?? [];
+    if (legacyWire) {
+      auth = auth.map((id) => legacyWire.idMap.get(id) ?? id);
+      prev = prev.map((id) => legacyWire.idMap.get(id) ?? id);
+    }
+
+    const prepared = await prepareOutboundPdu(
+      env,
+      { ...event, auth_events: auth, prev_events: prev } as PDU,
+      roomVersion
+    );
+    if (!prepared) return;
+    console.log(`[rooms] Federation state PDU prepared for ${prepared.wireId} -> ${destinations.join(', ')}`);
+    await queueFederationPdu(env, destinations, prepared.wire, event.event_id, roomId);
+  } catch (err) {
+    console.error('[rooms] State event federation fanout failed:', err);
   }
 }
 
@@ -2122,11 +2197,23 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
+  // Destinations must be captured BEFORE the target's membership row flips
+  // to leave, and must include the target's server: it is still a room member
+  // at the event's point in the DAG and its server must learn of the kick.
+  const targetDomain = targetId.includes(':') ? targetId.slice(targetId.indexOf(':') + 1) : '';
+  const kickRemoteServers = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
+  const kickDestinations =
+    targetDomain && targetDomain !== c.env.SERVER_NAME && !kickRemoteServers.includes(targetDomain)
+      ? [...kickRemoteServers, targetDomain]
+      : kickRemoteServers;
+
   const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(c.env.DB, roomId, targetId, 'leave', eventId);
 
   // Notify room members about the kick
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  await federateLocalStateEventToRemotes(c.env, event, roomId, kickDestinations);
 
   return c.json({});
 });
@@ -2197,11 +2284,22 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
     prev_events: prevEvents,
   };
 
+  // Destinations before the target's row flips to ban; the target's server
+  // must still learn of the ban.
+  const banTargetDomain = targetId.includes(':') ? targetId.slice(targetId.indexOf(':') + 1) : '';
+  const banRemoteServers = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
+  const banDestinations =
+    banTargetDomain && banTargetDomain !== c.env.SERVER_NAME && !banRemoteServers.includes(banTargetDomain)
+      ? [...banRemoteServers, banTargetDomain]
+      : banRemoteServers;
+
   const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
   await updateMembership(c.env.DB, roomId, targetId, 'ban', eventId);
 
   // Notify room members about the ban
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  await federateLocalStateEventToRemotes(c.env, event, roomId, banDestinations);
 
   return c.json({});
 });
@@ -2280,6 +2378,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/unban', requireAuth(), async (c) => {
 
   // Notify room members about the unban
   await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
+
+  const unbanDestinations = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
+  await federateLocalStateEventToRemotes(c.env, event, roomId, unbanDestinations);
 
   return c.json({});
 });
@@ -2653,6 +2754,11 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
 
   await storeEventIdempotent(db, event);
   await tryInsertJoinMembership(db, roomId, userId, eventId);
+
+  // Federate the join to remote members so their servers can resolve later
+  // events that auth-reference it.
+  const joinDestinations = await getJoinedRemoteServers(db, roomId, c.env.SERVER_NAME);
+  await federateLocalStateEventToRemotes(c.env, event, roomId, joinDestinations);
 
   return c.json({ room_id: roomId });
 });
