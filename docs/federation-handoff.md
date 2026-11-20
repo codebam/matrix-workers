@@ -1,10 +1,9 @@
 # Federation delivery handoff (2026-11-19/20, session 2)
 
 Context: continuing from `29a74df`. Goal unchanged: make codebam.ca↔matrix.org
-delivery reliable (GNU/Linux room `!iDwfRnmIeZCSTKVEim:halogen.city`, v10) and
-validate against the dev.codebam.ca instance. Both open items from the previous
-handoff are now root-caused; see "GNU/Linux live status" for the one user action
-still outstanding.
+delivery reliable (GNU/Linux room `!iDwfRnmIeZCSTKVEim:halogen.city`, v9) and
+validate against the dev.codebam.ca instance. Four root causes found and
+fixed across sessions 2-4; see "GNU/Linux live status" for the state of play.
 
 ## What this session found and fixed (all pushed to origin/main)
 
@@ -70,16 +69,46 @@ stores state under correct IDs. Verify from here: signed
 should 200 for the new message, and their /state should show membership=join.
 
 ## Deploy state
-- dev (`wrangler.dev.jsonc`): **fully current** — `8c371499` (all fixes).
-- prod: **deployed `4cf0853f`** (user-approved) — `97d9422` + `9ebd7f5` + `e34f69c`
-  are live on codebam.ca. Live validation with both sides current:
-  clean-room join + send DELIVERED (fed-repro3); GNU/Linux-class heal
-  mechanics DELIVERED — leave + rejoin events federate and are accepted, the
-  post-heal message displays (fed-repro4, all 4 PDUs accepted=1).
+- dev (`wrangler.dev.jsonc`): **fully current** — `81480314` (all fixes).
+- prod: **deployed `cf229fc6`** (user-approved) — everything through `a54dbe8`:
+  `e34f69c` (well-known delegation), `97d9422` (version-aware wire IDs +
+  augmentation stability), `9ebd7f5` (member/state fanout), `c6cf603` (join
+  fallback servers), `eda805c` (remote rooms serve as-stored), `a54dbe8`
+  (spec v1-10 redaction keeps origin/prev_state + post-join timeline
+  backfill).
 - The fed-repro2 poison variant cannot heal while the poison remains in the
   stored DAG (leave/rejoin auth-reference the poisoned creator join; real
   Synapse backfills missing auth via /event fetches, dev's strict port does
   not). In-process mock peer tests remain the poison coverage.
+
+## Session 4 (2026-11-20): the deepest root cause + the heal, no-leave
+1. **v1-10 redaction keeps `origin` and `prev_state`** (spec; dropped only in
+   v11). Our keep-list omitted them, so EVERY pre-2023 Synapse event (they
+   carry `origin`) derived a phantom ID. Proven by brute-forcing keep-set
+   variants against matrix.org's held copy of the GNU/Linux v9 create: the
+   real ID reproduces only with origin+prev_state kept. Fixture-pinned.
+2. **Remote-created rooms serve as-stored** (`eda805c`): re-deriving their
+   events can never reproduce residents' IDs (we don't store `origin`), so
+   every re-derived reference was phantom. Now gated on provable local
+   authorship of the create.
+3. **The GNU/Linux room was healed WITHOUT the user leaving** (user's
+   request): a fresh join was minted server-side against matrix.org
+   (`make_join` → v9-signed `send_join` → accepted `$IcgDoT4y…`), then the
+   room state re-synced from matrix.org's `/state` serve under REAL IDs
+   (`/tmp/resync-room.py`, sanity-gated against the ids matrix.org's own
+   join template referenced). Prod's slots now: create `$vg_GNDV…`,
+   join_rules `$4Jl6Tts…`, power_levels `$g-tExIy…` (the CURRENT 2022-08 PL,
+   previously stale), member(@codebam) `$IcgDoT4y…`. matrix.org's resolved
+   membership: `join`. Next user message should display.
+   Caveats: the pre-fix phantom rows from the first admin backfill attempt
+   remain as inert rows and poisoned that route's anchor selection (it picks
+   the newest matrix.org-authored row); `halogen.city` federation is broken
+   (302 → dewrito.net 404) — joins now fall back to the inviter/participating
+   servers (`c6cf603`).
+4. **Post-join timeline backfill** (`a54dbe8`): joining `#gaming:nixos.org`
+   synced members but no history because the join flow stores only state.
+   New workflow step fetches federation `/backfill` (limit 50, anchored at
+   the join) and stores oldest-first; a re-join of that room pulls history.
 
 ## Known minor gaps (documented, not blocking)
 - **Join/send race:** the client /join returns 200 while RoomJoinWorkflow
