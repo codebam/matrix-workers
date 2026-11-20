@@ -366,3 +366,27 @@ joined via the preview, it was on another account/server.
   served pre-flip state).
 - Live state refreshes ran twice (25 state events + ~9.6k members each,
   stored as invisible snapshots); room_state now matches the residents.
+
+## Newly-joined rooms unnamed in running sessions (2026-11-20, session 7 end)
+After joining Nix / NixOS and Jovian Experiments, both clients rendered the
+rooms without names/avatars. Root cause (classic /sync): the join's state
+snapshot is stored outside the timeline (negative stream positions — the
+session-7 snapshot fix), so an INCREMENTAL sync relayed the user's join
+event but never the room state; a running session saw "Unnamed Room" until
+a full re-sync. Fix (`d52ae1a`, prod `85544662`): when the incremental
+window contains the user's own join event, the room's state block carries
+the full current state. Sliding sync was verified CORRECT already (live
+probe with an Element-X-style request returned both rooms with name +
+required_state) — stale Element X names are client session cache; restart
+the app.
+
+Adjacent fix: the admin Backfill State membership batch wrote ~4.9k
+room_memberships rows with event_id='' (v3+ state PDUs carry no event_id).
+The local user's own row was among them — and performSendEvent reads that
+event id to build auth_events, so their messages would have carried '' as
+an auth reference. The batch now derives wire IDs; the local rows were
+repaired in-place (real join event ids).
+
+Cleanup: the temp peek user @fedpeek5626 left the room and was
+deactivated; @codebam:codebam.ca is the (repaired) resident member keeping
+our server in Nix / NixOS.
