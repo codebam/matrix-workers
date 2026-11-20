@@ -6,6 +6,12 @@
 	// checks on inbound PDUs so dev reproduces resident-server rejections.
 	"name": "matrix-worker-codebam-dev",
 	"main": "src/index.ts",
+	// Expose the default workers.dev domain (matrix-worker-codebam-dev.codebam.workers.dev)
+	// so prod can federate with us across zones: prod's worker cannot fetch
+	// dev.codebam.ca directly (same-zone routing returns 522), but the
+	// workers.dev hostname is an ordinary external origin. The well-known
+	// below delegates federation there.
+	"workers_dev": true,
 	"compatibility_date": "2025-01-01",
 	"compatibility_flags": [
 		"nodejs_compat",
@@ -88,7 +94,11 @@
 		"SERVER_NAME": "dev.codebam.ca",
 		"SERVER_VERSION": "0.1.0-dev",
 		"REGISTRATION_REQUIRE_TOKEN": "true",
-		"FEDERATION_STRICT_AUTH": "true"
+		"FEDERATION_STRICT_AUTH": "true",
+		// Delegate federation to the workers.dev domain: same-zone fetches from
+		// the prod worker to dev.codebam.ca fail (HTTP 522), so peers resolve
+		// us via well-known to this off-zone hostname instead.
+		"FEDERATION_WELL_KNOWN_M_SERVER": "matrix-worker-codebam-dev.codebam.workers.dev:443"
 	},
 	"routes": [
 		"dev.codebam.ca/_matrix/*",

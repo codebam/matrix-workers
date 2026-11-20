@@ -55,6 +55,13 @@ export interface Env {
   // the key is rejected for signature verification. Default 7 days.
   FEDERATION_KEY_MAX_STALENESS_MS?: string;
 
+  // Optional override for the /.well-known/matrix/server `m.server` value
+  // (federation delegation target). Use when SERVER_NAME's hostname is not
+  // directly fetchable by peers (same-zone worker routing); delegate to an
+  // externally routable host such as the worker's workers.dev domain.
+  // Unset → `${SERVER_NAME}:443`.
+  FEDERATION_WELL_KNOWN_M_SERVER?: string;
+
   // OIDC encryption key for client secrets (32 random bytes, base64 encoded)
   // Generate with: openssl rand -base64 32
   // Set with: npx wrangler secret put OIDC_ENCRYPTION_KEY

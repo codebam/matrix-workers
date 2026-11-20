@@ -1589,3 +1589,22 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     expect(vers.body.versions.at(-1)).toBe('v1.17');
   });
 });
+
+describe('versions leftovers server well-known m.server delegation override', () => {
+  it('delegates to FEDERATION_WELL_KNOWN_M_SERVER when set', async () => {
+    const { status, body } = await get(
+      '/.well-known/matrix/server',
+      env({ SERVER_NAME: 'example.com', FEDERATION_WELL_KNOWN_M_SERVER: 'worker.example.workers.dev:443' })
+    );
+    expect(status).toBe(200);
+    expect(body['m.server']).toBe('worker.example.workers.dev:443');
+  });
+  it('ignores an empty override and falls back to SERVER_NAME', async () => {
+    const { status, body } = await get(
+      '/.well-known/matrix/server',
+      env({ SERVER_NAME: 'example.com', FEDERATION_WELL_KNOWN_M_SERVER: '' })
+    );
+    expect(status).toBe(200);
+    expect(body['m.server']).toBe('example.com:443');
+  });
+});

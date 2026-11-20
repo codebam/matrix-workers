@@ -41,8 +41,15 @@ app.get('/.well-known/matrix/client', (c) => {
 // GET /.well-known/matrix/server
 app.get('/.well-known/matrix/server', (c) => {
   const serverName = c.env.SERVER_NAME;
+  // Optional federation delegation override. When the SERVER_NAME hostname is
+  // served by this worker through a path other servers cannot fetch directly
+  // (e.g. a proxied route on a shared Cloudflare zone: same-zone worker fetches
+  // fail with 522/530 instead of reaching the worker), delegate to a host that
+  // behaves like an ordinary external origin — such as this worker's own
+  // workers.dev domain. Unset or empty: the spec's direct form, `${SERVER_NAME}:443`.
+  const mServer = c.env.FEDERATION_WELL_KNOWN_M_SERVER || `${serverName}:443`;
   return c.json({
-    'm.server': `${serverName}:443`,
+    'm.server': mServer,
   });
 });
 
