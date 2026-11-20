@@ -305,7 +305,9 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Parse query parameters
   const since = c.req.query('since');
   const fullState = c.req.query('full_state') === 'true';
-  const useStateAfter = c.req.query('use_state_after') === 'true';
+  const useStateAfter =
+    c.req.query('use_state_after') === 'true' ||
+    c.req.query('org.matrix.msc4222.use_state_after') === 'true';
   const filterParam = c.req.query('filter');
 
   // Load filter if specified

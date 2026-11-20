@@ -337,6 +337,25 @@ describe('MSC4222 state_after in /sync', () => {
     expect(joined.state_after.events[0].content).toEqual({ name: 'New' });
   });
 
+  it('accepts the unstable org.matrix.msc4222.use_state_after param (Element web)', async () => {
+    getUserRooms.mockImplementation(async (_db: unknown, _u: string, m?: string) =>
+      m === 'join' ? [ROOM] : []
+    );
+    const newName = makePdu({
+      type: 'm.room.name', event_id: '$name-new', state_key: '', content: { name: 'New' },
+    });
+    getRoomState.mockResolvedValue([newName]);
+
+    const env = createEnv();
+    const res = await syncApp.request(
+      'http://localhost/_matrix/client/v3/sync?org.matrix.msc4222.use_state_after=true', {}, env
+    );
+    const body = await json(res);
+    const joined = body.rooms.join[ROOM];
+    expect(joined.state).toBeUndefined();
+    expect(joined.state_after.events.map((e: any) => e.event_id)).toEqual(['$name-new']);
+  });
+
   it('without the flag the legacy state section is kept and no extra state load happens', async () => {
     getUserRooms.mockImplementation(async (_db: unknown, _u: string, m?: string) =>
       m === 'join' ? [ROOM] : []
