@@ -2856,7 +2856,7 @@ app.post('/admin/api/telegram/bridges', requireAuth(), requireAdmin, async (c) =
   const roomId = body.room_id;
   const chatId = String(body.chat_id ?? '');
   const tgToken = String(body.tg_token ?? '');
-  if (!roomId || !chatId || !/^\d+(-?\d+)?$/.test(chatId) || !/^\d+:[A-Za-z0-9_-]{30,}$/.test(tgToken)) {
+  if (!roomId || !chatId || !/^-?\d+$/.test(chatId) || !/^\d+:[A-Za-z0-9_-]{30,}$/.test(tgToken)) {
     return c.json(
       { errcode: 'M_INVALID_PARAM', error: 'room_id, numeric chat_id and a BotFather token (123456:ABC...) are required' },
       400,
