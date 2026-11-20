@@ -1564,6 +1564,7 @@ export const adminDashboardHtml = (serverName: string) => `
         <a class="nav-item" data-page="rooms"><svg class="icon"><use href="#icon-message-square"/></svg><span>Rooms</span><span class="nav-shortcut">g r</span></a>
         <a class="nav-item" data-page="media"><svg class="icon"><use href="#icon-folder"/></svg><span>Media</span></a>
         <a class="nav-item" data-page="reports"><svg class="icon"><use href="#icon-alert-triangle"/></svg><span>Reports</span><span class="badge-count hidden" id="reportsBadge">0</span></a>
+        <a class="nav-item" data-page="audit"><svg class="icon"><use href="#icon-shield"/></svg><span>Audit</span></a>
         <a class="nav-item" data-page="federation"><svg class="icon"><use href="#icon-globe"/></svg><span>Federation</span></a>
         <a class="nav-item" data-page="bots"><svg class="icon"><use href="#icon-bot"/></svg><span>Bots &amp; Bridges</span></a>
         <a class="nav-item" data-page="idp"><svg class="icon"><use href="#icon-key"/></svg><span>Identity Providers</span></a>
@@ -1820,11 +1821,67 @@ export const adminDashboardHtml = (serverName: string) => `
         <div class="pagination" id="reportsPagination"></div>
       </section>
 
+      <!-- Audit Page -->
+      <section id="page-audit" class="page hidden">
+        <div class="header">
+          <h2>Audit Log</h2>
+        </div>
+
+        <div class="card" style="margin-bottom: 20px;">
+          <div class="card-body">
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px;">
+              <input type="text" class="form-control" id="auditActor" placeholder="Filter by actor (@user:server)" oninput="auditFilterChanged()">
+              <input type="text" class="form-control" id="auditAction" placeholder="Filter by action (e.g. user.deactivate)" oninput="auditFilterChanged()">
+              <input type="text" class="form-control" id="auditTarget" placeholder="Filter by target" oninput="auditFilterChanged()">
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3>Entries <span style="font-weight: 400; font-size: 13px; color: var(--text-secondary);" id="auditTotal"></span></h3>
+          </div>
+          <div class="card-body">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Actor</th>
+                  <th>Action</th>
+                  <th>Target</th>
+                  <th>Success</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody id="auditTable">
+                <tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">Loading…</td></tr>
+              </tbody>
+            </table>
+            <div style="display: flex; justify-content: center; margin-top: 15px; gap: 10px;">
+              <button class="btn btn-secondary" id="auditPrev" onclick="loadAudit(Math.max(0, auditOffset - 100))">Previous</button>
+              <button class="btn btn-secondary" id="auditNext" onclick="loadAudit(auditOffset + 100)">Next 100</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Federation Page -->
       <section id="page-federation" class="page hidden">
         <div class="header">
           <h2>Federation</h2>
-          <button class="btn btn-primary" onclick="testFederation()">Test Federation</button>
+          <div style="display: flex; gap: 10px;">
+            <button class="btn btn-secondary" onclick="runKeyCheck()">Key Self-Check</button>
+            <button class="btn btn-primary" onclick="testFederation()">Test Federation</button>
+          </div>
+        </div>
+
+        <!-- Key Self-Check Results -->
+        <div class="card hidden" id="federationKeyCheckCard" style="margin-bottom: 20px;">
+          <div class="card-header">
+            <h3>Signing Key Self-Check <span id="federationKeyCheckBadge" style="margin-left: 8px;"></span></h3>
+          </div>
+          <div class="card-body" id="federationKeyCheckResults">
+          </div>
         </div>
 
         <!-- Federation Status Card -->
@@ -2025,6 +2082,27 @@ export const adminDashboardHtml = (serverName: string) => `
             </div>
             <p style="margin-top: 10px; color: var(--text-secondary); font-size: 13px;">
               When disabled, new user registration will be blocked.
+            </p>
+          </div>
+        </div>
+
+        <!-- Registration Tokens -->
+        <div class="card">
+          <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3>Registration Tokens</h3>
+            <button class="btn btn-primary" onclick="document.getElementById('tokenUses').value='1'; document.getElementById('tokenHours').value='168'; document.getElementById('tokenNote').value=''; openModal('createTokenModal')">Mint Token</button>
+          </div>
+          <div class="card-body">
+            <table class="table">
+              <thead>
+                <tr><th>ID</th><th>Note</th><th>Uses Left</th><th>Expires</th><th>State</th><th>Actions</th></tr>
+              </thead>
+              <tbody id="tokensTable">
+                <tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">Loading…</td></tr>
+              </tbody>
+            </table>
+            <p style="margin-top: 10px; color: var(--text-secondary); font-size: 13px;">
+              Minted tokens are shown exactly once at creation. Tokens are consumed at registration.
             </p>
           </div>
         </div>
@@ -2276,6 +2354,53 @@ export const adminDashboardHtml = (serverName: string) => `
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal('createBridgeModal')">Cancel</button>
         <button class="btn btn-primary" onclick="createBridge()">Register Bridge</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Token Modal -->
+  <div class="modal-overlay" id="createTokenModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Mint Registration Token</h3>
+        <button class="modal-close" onclick="closeModal('createTokenModal')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Uses (1–100)</label>
+          <input type="number" class="form-control" id="tokenUses" value="1" min="1" max="100">
+        </div>
+        <div class="form-group">
+          <label>Expires in (hours)</label>
+          <input type="number" class="form-control" id="tokenHours" value="168" min="1" max="8760">
+        </div>
+        <div class="form-group">
+          <label>Note (optional)</label>
+          <input type="text" class="form-control" id="tokenNote" placeholder="who/what this is for">
+        </div>
+        <div class="form-group" id="tokenResultGroup" style="display: none;">
+          <label>Token (shown once — copy it now)</label>
+          <input type="text" class="form-control" id="tokenResult" readonly onclick="this.select()" style="font-family: monospace;">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('createTokenModal')">Close</button>
+        <button class="btn btn-primary" id="mintTokenBtn" onclick="mintToken()">Mint</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Telegram Webhook Modal -->
+  <div class="modal-overlay" id="tgWebhookModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Telegram Webhook Status</h3>
+        <button class="modal-close" onclick="closeModal('tgWebhookModal')">&times;</button>
+      </div>
+      <div class="modal-body" id="tgWebhookContent">
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('tgWebhookModal')">Close</button>
       </div>
     </div>
   </div>
@@ -2584,8 +2709,9 @@ export const adminDashboardHtml = (serverName: string) => `
         case 'reports': loadReports(); break;
         case 'federation': loadFederation(); break;
         case 'bots': loadBots(); break;
+        case 'audit': loadAudit(0); break;
         case 'idp': loadIdpProviders(); break;
-        case 'config': loadConfig(); loadRegistrationStatus(); break;
+        case 'config': loadConfig(); loadRegistrationStatus(); loadTokens(); break;
       }
     }
 
@@ -3370,6 +3496,13 @@ export const adminDashboardHtml = (serverName: string) => `
             \`).join('')}
             \${data.members.length > 20 ? \`<tr><td colspan="2">... and \${data.members.length - 20} more</td></tr>\` : ''}
           </table>
+          <h4 style="margin: 20px 0 10px;">Federation Tools</h4>
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap;">
+            <input type="text" class="form-control" id="roomFedServer" placeholder="remote.server (e.g. matrix.org)" style="max-width: 280px;">
+            <button class="btn btn-secondary" onclick="roomBackfill('\${escapeAttr(data.room_id)}')">Backfill State</button>
+            <button class="btn btn-secondary" onclick="roomProbe('\${escapeAttr(data.room_id)}')">Probe Delivery</button>
+          </div>
+          <div id="roomFedResults" style="margin-top: 10px; font-size: 13px; color: var(--text-secondary);"></div>
         \`;
         openModal('roomModal');
       } catch (err) {
@@ -3609,7 +3742,10 @@ export const adminDashboardHtml = (serverName: string) => `
             <td>\${escapeHtml(b.chat_id)}</td>
             <td><code>\${escapeHtml(b.token_fingerprint || '')}</code></td>
             <td><span class="badge \${b.enabled ? 'badge-success' : 'badge-danger'}">\${b.enabled ? 'Armed' : 'Disabled'}</span><div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">update #\${b.last_update_id}</div></td>
-            <td><button class="btn btn-sm btn-danger" onclick="deleteBridge('\${b.id}')">Remove</button></td>
+            <td style="white-space: nowrap;">
+              <button class="btn btn-sm btn-secondary" onclick="checkWebhook('\${b.id}')">Check</button>
+              <button class="btn btn-sm btn-danger" onclick="deleteBridge('\${b.id}')">Remove</button>
+            </td>
           </tr>
         \`).join('');
       } catch (err) {
@@ -3689,6 +3825,207 @@ export const adminDashboardHtml = (serverName: string) => `
         loadBridgesTable();
       } catch (err) {
         showToast(\`Failed to remove: \${err.message}\`, 'error');
+      }
+    }
+
+    async function checkWebhook(bridgeId) {
+      const content = document.getElementById('tgWebhookContent');
+      content.innerHTML = '<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div><span>Asking Telegram…</span></div>';
+      openModal('tgWebhookModal');
+      try {
+        const data = await api(\`/admin/api/telegram/bridges/\${bridgeId}/webhook-info\`);
+        const w = data.webhook || {};
+        const rows = [
+          ['URL', w.url ? escapeHtml(w.url) : '<em>none — setWebhook missing</em>'],
+          ['Pending updates', typeof w.pending_update_count === 'number' ? w.pending_update_count : '?'],
+          ['Last error', w.last_error_message ? \`<span style="color: var(--danger);">\${escapeHtml(w.last_error_message)}</span>\` : '<span style="color: var(--success);">none</span>'],
+          ['Last error date', w.last_error_date ? formatDate(w.last_error_date * 1000) : '—'],
+          ['Max connections', w.max_connections ?? '—'],
+          ['Allowed updates', Array.isArray(w.allowed_updates) ? w.allowed_updates.join(', ') : '—'],
+          ['Custom certificate', w.has_custom_certificate ? 'yes' : 'no'],
+        ];
+        const noUrl = !w.url;
+        const pending = typeof w.pending_update_count === 'number' && w.pending_update_count > 0;
+        content.innerHTML = \`
+          <div style="margin-bottom: 12px;">
+            <span class="badge \${noUrl ? 'badge-danger' : pending ? 'badge-warning' : 'badge-success'}">\${noUrl ? 'Webhook not set' : pending ? 'Pending backlog' : 'Healthy'}</span>
+          </div>
+          <table class="table">
+            \${rows.map(r => \`<tr><td style="width: 160px; color: var(--text-secondary);">\${r[0]}</td><td style="font-family: monospace; font-size: 12px; word-break: break-all;">\${r[1]}</td></tr>\`).join('')}
+          </table>
+          \${noUrl ? '<p style="color: var(--text-secondary); font-size: 13px; margin-top: 10px;">Re-register the bridge to re-arm the webhook.</p>' : ''}
+          \${pending ? '<p style="color: var(--text-secondary); font-size: 13px; margin-top: 10px;">A pending backlog means Telegram has updates it could not deliver — check the error above, and remember: after privacy-mode changes, renew the membership (admin-toggle or remove &amp; re-add the bot).</p>' : ''}
+        \`;
+      } catch (err) {
+        content.innerHTML = \`<div style="color: var(--danger);">Failed: \${escapeHtml(err.message)}</div>\`;
+      }
+    }
+
+    // Audit log
+    let auditOffset = 0;
+    let auditFilterTimer = null;
+    function auditFilterChanged() {
+      clearTimeout(auditFilterTimer);
+      auditFilterTimer = setTimeout(() => loadAudit(0), 400);
+    }
+
+    async function loadAudit(offset = 0) {
+      auditOffset = offset;
+      const tbody = document.getElementById('auditTable');
+      try {
+        const actor = document.getElementById('auditActor').value.trim();
+        const action = document.getElementById('auditAction').value.trim();
+        const target = document.getElementById('auditTarget').value.trim();
+        const params = new URLSearchParams({ limit: '100', offset: String(offset) });
+        if (actor) params.set('actor', actor);
+        if (action) params.set('action', action);
+        if (target) params.set('target', target);
+        const data = await api(\`/admin/api/audit?\${params}\`);
+        document.getElementById('auditTotal').textContent = \`(\${data.total} total)\`;
+        if (!data.entries || data.entries.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No audit entries</td></tr>';
+        } else {
+          tbody.innerHTML = data.entries.map(e => \`
+            <tr>
+              <td style="white-space: nowrap;">\${formatDate(e.ts)}</td>
+              <td>\${escapeHtml(e.actor_user_id)}</td>
+              <td><code>\${escapeHtml(e.action)}</code></td>
+              <td style="font-family: monospace; font-size: 12px; word-break: break-all;">\${escapeHtml(e.target || '-')}</td>
+              <td><span class="badge \${e.success ? 'badge-success' : 'badge-danger'}">\${e.success ? 'ok' : 'failed'}</span></td>
+              <td style="font-size: 12px; color: var(--text-secondary); max-width: 260px; overflow: hidden; text-overflow: ellipsis;">\${e.details ? escapeHtml(typeof e.details === 'string' ? e.details : JSON.stringify(e.details)) : ''}</td>
+            </tr>
+          \`).join('');
+        }
+        document.getElementById('auditPrev').style.visibility = offset > 0 ? 'visible' : 'hidden';
+        document.getElementById('auditNext').style.visibility = (offset + 100) < data.total ? 'visible' : 'hidden';
+      } catch (err) {
+        console.error('Failed to load audit:', err);
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--danger);">Failed to load audit log</td></tr>';
+      }
+    }
+
+    // Registration tokens
+    async function loadTokens() {
+      const tbody = document.getElementById('tokensTable');
+      try {
+        const data = await api('/admin/api/registration-tokens');
+        if (!data.tokens || data.tokens.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No tokens</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.tokens.map(t => \`
+          <tr>
+            <td style="font-family: monospace; font-size: 12px;">\${escapeHtml(t.id)}</td>
+            <td>\${escapeHtml(t.note || '-')}</td>
+            <td>\${t.uses_remaining}</td>
+            <td>\${t.expires_at ? formatDate(t.expires_at) : 'never'}</td>
+            <td><span class="badge \${t.revoked ? 'badge-danger' : (t.uses_remaining > 0 ? 'badge-success' : 'badge-warning')}">\${t.revoked ? 'revoked' : (t.uses_remaining > 0 ? 'active' : 'spent')}</span></td>
+            <td>\${!t.revoked && t.uses_remaining > 0 ? \`<button class="btn btn-sm btn-danger" onclick="revokeToken('\${escapeAttr(t.id)}')">Revoke</button>\` : ''}</td>
+          </tr>
+        \`).join('');
+      } catch (err) {
+        console.error('Failed to load tokens:', err);
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--danger);">Failed to load tokens</td></tr>';
+      }
+    }
+
+    async function mintToken() {
+      const uses = parseInt(document.getElementById('tokenUses').value, 10) || 1;
+      const hours = parseInt(document.getElementById('tokenHours').value, 10) || 168;
+      const note = document.getElementById('tokenNote').value.trim();
+      try {
+        const data = await api('/admin/api/registration-tokens', {
+          method: 'POST',
+          body: JSON.stringify({ uses, expires_in_hours: hours, note: note || undefined })
+        });
+        document.getElementById('tokenResult').value = data.token;
+        document.getElementById('tokenResultGroup').style.display = 'block';
+        document.getElementById('tokenResult').select();
+        showToast('Token minted — copy it now, it is not shown again', 'success');
+        loadTokens();
+      } catch (err) {
+        showToast(\`Failed to mint: \${err.message}\`, 'error');
+      }
+    }
+
+    async function revokeToken(id) {
+      if (!confirm(\`Revoke token \${id}? Outstanding uses die immediately.\`)) return;
+      try {
+        await api(\`/admin/api/registration-tokens/\${encodeURIComponent(id)}\`, { method: 'DELETE' });
+        showToast('Token revoked', 'success');
+        loadTokens();
+      } catch (err) {
+        showToast(\`Failed to revoke: \${err.message}\`, 'error');
+      }
+    }
+
+    // Federation key self-check
+    async function runKeyCheck() {
+      const card = document.getElementById('federationKeyCheckCard');
+      const results = document.getElementById('federationKeyCheckResults');
+      const badge = document.getElementById('federationKeyCheckBadge');
+      card.classList.remove('hidden');
+      results.innerHTML = '<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div><span>Validating our signing key response…</span></div>';
+      badge.innerHTML = '';
+      try {
+        const data = await api('/admin/api/federation/key-check');
+        const allOk = data.AllChecksOK === true;
+        badge.innerHTML = \`<span class="badge \${allOk ? 'badge-success' : 'badge-danger'}">\${allOk ? 'All checks OK' : 'Checks failed'}</span>\`;
+        const keyRows = Object.entries(data.Ed25519Checks || {}).map(([kid, k]) => \`
+          <tr>
+            <td><code>\${escapeHtml(kid)}</code></td>
+            <td>\${k.ValidEd25519 ? '✅' : '❌'}</td>
+            <td>\${k.MatchingSignature ? '✅' : '❌'}</td>
+          </tr>
+        \`).join('');
+        results.innerHTML = \`
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 15px;">
+            <div><div style="font-size: 12px; color: var(--text-secondary);">MatchingServerName</div><div>\${data.MatchingServerName ? '✅' : '❌'}</div></div>
+            <div><div style="font-size: 12px; color: var(--text-secondary);">FutureValidUntilTS</div><div>\${data.FutureValidUntilTS ? '✅' : '❌'}</div></div>
+            <div><div style="font-size: 12px; color: var(--text-secondary);">HasEd25519Key</div><div>\${data.HasEd25519Key ? '✅' : '❌'}</div></div>
+            <div><div style="font-size: 12px; color: var(--text-secondary);">AllEd25519ChecksOK</div><div>\${data.AllEd25519ChecksOK === true ? '✅' : (data.AllEd25519ChecksOK === false ? '❌' : '—')}</div></div>
+          </div>
+          \${keyRows ? \`<table class="table"><thead><tr><th>Key</th><th>Valid Ed25519</th><th>Matching Signature</th></tr></thead><tbody>\${keyRows}</tbody></table>\` : ''}
+          \${data.error ? \`<p style="color: var(--danger);">\${escapeHtml(data.error)}</p>\` : ''}
+          <p style="color: var(--text-secondary); font-size: 12px; margin-top: 10px;">Mirrors the Federation Tester's CheckKeys semantics: strict peers reject the whole key response unless every published verify key is valid AND self-signed.</p>
+        \`;
+      } catch (err) {
+        badge.innerHTML = '<span class="badge badge-danger">Error</span>';
+        results.innerHTML = \`<div style="color: var(--danger);">\${escapeHtml(err.message)}</div>\`;
+      }
+    }
+
+    // Room federation tools (room detail modal)
+    function roomFedResultsHtml(html) {
+      const el = document.getElementById('roomFedResults');
+      if (el) el.innerHTML = html;
+    }
+
+    async function roomBackfill(roomId) {
+      const server = (document.getElementById('roomFedServer').value || '').trim();
+      if (!server) { showToast('Enter a remote server name first', 'error'); return; }
+      roomFedResultsHtml('<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div><span>Fetching state from ' + escapeHtml(server) + '…</span></div>');
+      try {
+        const data = await api(\`/admin/api/rooms/\${encodeURIComponent(roomId)}/backfill?server=\${encodeURIComponent(server)}\`, { method: 'POST' });
+        roomFedResultsHtml(\`<span style="color: var(--success);">Backfilled \${data.stored_state} state events, \${data.stored_members} memberships from \${escapeHtml(data.server)}.</span> <span style="color: var(--text-secondary);">Note: uses the anchor our DB knows; check room state if results look stale.</span>\`);
+      } catch (err) {
+        roomFedResultsHtml(\`<span style="color: var(--danger);">Backfill failed: \${escapeHtml(err.message)}</span>\`);
+      }
+    }
+
+    async function roomProbe(roomId) {
+      const server = (document.getElementById('roomFedServer').value || '').trim();
+      if (!server) { showToast('Enter a remote server name first', 'error'); return; }
+      roomFedResultsHtml('<div style="display: flex; align-items: center; gap: 10px;"><div class="spinner"></div><span>Probing ' + escapeHtml(server) + '…</span></div>');
+      try {
+        const data = await api(\`/admin/api/rooms/\${encodeURIComponent(roomId)}/federation-probe?server=\${encodeURIComponent(server)}\`);
+        const state = data.held === true ? '✅' : (data.held === false ? '❌' : '⚠️');
+        roomFedResultsHtml(\`
+          <div>\${state} \${escapeHtml(data.note || data.error || '')}</div>
+          <div style="font-size: 11px; color: var(--text-secondary); margin-top: 4px; font-family: monospace;">probed event: \${escapeHtml(data.event_id || '?')}</div>
+        \`);
+      } catch (err) {
+        roomFedResultsHtml(\`<span style="color: var(--danger);">Probe failed: \${escapeHtml(err.message)}</span>\`);
       }
     }
 

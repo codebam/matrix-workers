@@ -2993,4 +2993,73 @@ app.post('/admin/api/telegram/webhook/:id', async (c) => {
   return c.json({});
 });
 
+// GET /admin/api/telegram/bridges/:id/webhook-info - Ask Telegram (with the
+// stored token) how the webhook is doing: armed URL, pending updates, last
+// delivery error. The exact diagnostic for "bridge only goes one way".
+app.get('/admin/api/telegram/bridges/:id/webhook-info', requireAuth(), requireAdmin, async (c) => {
+  const { getBridgeById } = await import('../services/telegram-bridge');
+  const bridge = await getBridgeById(c.env.DB, c.req.param('id'));
+  if (!bridge) return Errors.notFound('Bridge not found').toResponse();
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${bridge.tg_token}/getWebhookInfo`);
+    const data = (await res.json()) as { ok?: boolean; result?: Record<string, unknown>; description?: string };
+    if (!data.ok) {
+      return c.json({ ok: false, error: data.description ?? 'Telegram rejected the request (revoked token?)' }, 502);
+    }
+    return c.json({ ok: true, webhook: data.result });
+  } catch (err) {
+    return c.json({ ok: false, error: err instanceof Error ? err.message : 'network failure' }, 502);
+  }
+});
+
+// GET /admin/api/rooms/:roomId/federation-probe?server=X - Remote-resolution
+// probe: does the given server hold our newest locally-authored event in
+// this room? The signed-GET technique from the federation debugging saga,
+// as a button. held=false means delivery to that server is failing.
+app.get('/admin/api/rooms/:roomId/federation-probe', requireAuth(), requireAdmin, async (c) => {
+  const roomId = c.req.param('roomId');
+  const server = c.req.query('server');
+  if (!server || server === c.env.SERVER_NAME) {
+    return Errors.invalidParam('server', 'A remote (non-local) server name is required').toResponse();
+  }
+  const latest = await c.env.DB.prepare(
+    `SELECT event_id, origin_server_ts FROM events
+     WHERE room_id = ? AND sender LIKE ? ORDER BY origin_server_ts DESC LIMIT 1`
+  ).bind(roomId, `%:${c.env.SERVER_NAME}`).first<{ event_id: string; origin_server_ts: number }>();
+  if (!latest) {
+    return c.json({ server, held: null, error: 'no locally-authored events in this room to probe with' });
+  }
+  try {
+    const res = await federationGet(
+      server,
+      `/_matrix/federation/v1/event/${encodeURIComponent(latest.event_id)}`,
+      c.env.SERVER_NAME,
+      c.env.DB,
+      c.env.CACHE
+    );
+    if (res.status === 404) {
+      return c.json({
+        server, event_id: latest.event_id, held: false, status: 404,
+        note: 'the remote server does not hold this event — outbound delivery to it is failing',
+      });
+    }
+    if (!res.ok) {
+      return c.json({
+        server, event_id: latest.event_id, held: null, status: res.status,
+        note: `probe returned HTTP ${res.status} — investigate with wrangler tail`,
+      });
+    }
+    return c.json({
+      server, event_id: latest.event_id, held: true, status: 200,
+      origin_server_ts: latest.origin_server_ts,
+      note: 'the remote server holds and serves our latest event — delivery is working',
+    });
+  } catch (err) {
+    return c.json({
+      server, event_id: latest.event_id, held: null,
+      error: err instanceof Error ? err.message : 'probe failed',
+    });
+  }
+});
+
 export default app;
