@@ -154,9 +154,10 @@ applied to both, additive-only).
 - Live-validated on dev: create+join, !admin status/token mint, webhook
   403/200, TG→Matrix in-room relay, Matrix→TG attempt.
 - Setup on prod (COMPLETE + user-verified 2026-11-20): management room
-  `!K8i7iW7ofA1apMUCfUnuBGyh:codebam.ca` (alias **#linux_group:codebam.ca** —
-  renamed from #linux_chat at the user's request; aliases re-point via
-  create-new + delete-old, the room ID is unaffected), `@adminbot:codebam.ca`
+  `!K8i7iW7ofA1apMUCfUnuBGyh:codebam.ca` (alias now **#codebam_live:codebam.ca**,
+  re-pointed by the user through Element's UI after the trailing-slash route
+  fix `f3d7724e` — aliases re-point via create-new + delete-old, the room ID
+  is unaffected), `@adminbot:codebam.ca`
   joined via invite auto-accept and answering `!admin` commands live, and
   Telegram bridge `tgb_GBf2vdDXHDUDF-5Y` (`@tgbot:codebam.ca` <-> the room,
   supergroup chat) live in both directions (user-verified). Each bot is a
@@ -165,3 +166,11 @@ applied to both, additive-only).
   policy) now sends the invite itself before registering. En-route fix:
   negative/supergroup chat ids were rejected by an over-strict validation
   regex (`c0f3ae9`, deployed `c7d7c378`).
+- Telegram gotchas learned (both hit live): group bots default to PRIVACY
+  MODE (only mentions/commands reach the webhook — BotFather /setprivacy →
+  Disable), and Telegram's per-membership routing does not refresh after the
+  setting change until the membership is renewed — toggling the bot's group
+  ADMIN status on/off (the user's fix) or remove+re-add does it. Diagnostic
+  playbook: getMe (can_read_all_group_messages), getWebhookInfo
+  (pending_update_count/last_error_message), getChatMember, then a synthetic
+  webhook update using the bridge's stored secret to prove our side.
