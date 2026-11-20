@@ -286,3 +286,51 @@ code/pre/links now survive both directions. Pure converter module:
 - Live-verified Telegram → Matrix (both directions USER-VERIFIED
   2026-11-20): Telegram-formatted text (entities) arrived in the room with
   real bold/links rendered by Element.
+
+## Room history: state snapshots and replays out of the timeline (2026-11-20, session 7)
+Trigger: previewing #users:nixos.org showed "hundreds of join messages and
+no conversation". Three separate causes, all fixed:
+
+1. **The alias moved.** #users:nixos.org no longer resolves to the old
+   !hzgkCxLtCOTmFXGauj:nixos.org room (the fossil our preview served —
+   1959 member events, zero messages). It now resolves live (via
+   /query/directory, since we hold no local alias row) to the community's
+   current room **!6oudZq5zJjAyrxL2uY:0upti.me ("Nix / NixOS")**. The old
+   room lingers only in old sessions' history.
+2. **State snapshots were timeline material** (76ab116 + 3eb0a38, prod
+   6628034d): joining a large remote room stored its full current state
+   (thousands of member joins) with real stream positions, so paginated
+   history and peeks served the join wall. Snapshots now store at NEGATIVE
+   stream positions — events.stream_ordering carries a UNIQUE index
+   (migration 016), so each snapshot negates its own allocation; every
+   timeline query filters `stream_ordering > 0` (getRoomEvents,
+   getRoomTimeline, sliding-sync initial window). room_state,
+   room_memberships, auth checks and federation serving are unaffected —
+   only timeline visibility changes. The RoomJoinWorkflow's send_join
+   state echo + full-state backfill + the admin Backfill State route mark
+   stateOnly; the timeline backfill (real history) does not.
+3. **Conduwuit replays historical events via ordinary /send transactions**
+   (fadd14d, prod 81d1bf40): a newly joined server receives ~2000 old
+   member events (timestamps from 2025!) at the NEWEST stream positions,
+   burying fresh conversation. Replay guard in the PDU loop: an
+   m.room.member event arriving out of chronology (older than the newest
+   event we hold) stores at a negated position. Late-retried legitimate
+   events lose only their timeline line — state still updates.
+
+**One-off prod cleanups** (user-approved; original orderings backed up to
+/tmp/opencode/backup-*.json — reversible by re-negating WHERE
+stream_ordering < 0 within the recorded ranges):
+- new room: negated 2500 snapshot rows (<window start), then 1952 replayed
+  member events + 24 replayed state events (ts < join ts)
+- GNU/Linux room: 49 + 22 rows; old fossil: 1974 rows (between join and
+  leave), leaving only join/leave visible
+Final live state of !6oudZq…:0upti.me — /messages backward page is
+20 messages + join/reaction/redactions; /sync initial timeline 18 real
+messages; room name resolves ("Nix / NixOS").
+
+**Temp peek user**: @fedpeek5626:codebam.ca (admin-created, password in
+session history only) is joined to the new room to keep our server
+resident (live traffic + working previews) — REMOVE IT (leave room,
+deactivate) once the real account joins. Note: the user's earlier "join"
+of the new room never reached this server (no local join event) — if they
+joined via the preview, it was on another account/server.
