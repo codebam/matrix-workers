@@ -246,6 +246,10 @@ directions; text relaying is unchanged.
   sendPhoto would log). Test event
   `$XRFsdxvSyVowY5tAMuX1S4maDdDrv4_Ay4Wz9e0xvEs`, media
   `mxc://codebam.ca/MHVrgMcso964ks1-vqNX_FhzjRRfTGuK`.
+- Live-verified Telegram → Matrix (both directions USER-VERIFIED
+  2026-11-20): a photo sent in the bridged Telegram chat appeared in the
+  Matrix room as an m.image posted by @tgbot; tail showed a single clean
+  webhook POST with zero bridge errors.
 - 12 new tests in `test/bots-integrations.test.ts` (both directions,
   stickers, size caps, fallbacks, loop prevention); suite 345 files /
   45,451 tests.
