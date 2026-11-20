@@ -2707,8 +2707,8 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
       if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
         normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
       }
-      // State snapshot from the resident: stream_ordering 0 keeps it out of
-      // paginated history (this is state, not conversation).
+      // State snapshot from the resident: negated stream ordering keeps it
+      // out of paginated history (this is state, not conversation).
       await storeEventIdempotent(db, normalized as any, { stateOnly: true });
       if (ev.type === 'm.room.member' && typeof ev.state_key === 'string') {
         const mem = ev.content?.membership;
@@ -2750,9 +2750,20 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
       for (const ev of chunk) {
         const mem = ev.content?.membership;
         if (!['join', 'invite', 'leave', 'ban', 'knock'].includes(mem)) continue;
+        // State PDUs for v3+ rooms carry no event_id — derive the wire ID
+        // so a membership row never points at '' (our own users' messages
+        // read this event id when building auth_events).
+        let memberId = typeof ev.event_id === 'string' && ev.event_id ? ev.event_id : '';
+        if (!memberId) {
+          try {
+            memberId = await computeWireEventId(ev as Record<string, unknown>, roomVersion);
+          } catch {
+            continue;
+          }
+        }
         stmts.push(db.prepare(
           `INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id) VALUES (?, ?, ?, ?)`
-        ).bind(roomId, ev.state_key, mem, String(ev.event_id ?? '')));
+        ).bind(roomId, ev.state_key, mem, memberId));
       }
       if (stmts.length) { await db.batch(stmts); members += stmts.length; }
     }

@@ -489,6 +489,38 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       }
     }
 
+    // A room joined within this window must carry its full state even on an
+    // INCREMENTAL sync: the join's state snapshot is stored outside the
+    // timeline (negative stream positions — invisible to the `> since`
+    // window), so a client with a running session would otherwise learn the
+    // room exists but never receive its name/topic/avatar and render it as
+    // "Unnamed Room". Initial syncs already include full state below.
+    if (!isInitial) {
+      const joinedInWindow = events.some(
+        (e) =>
+          e.type === 'm.room.member' &&
+          e.state_key === userId &&
+          (e.content as { membership?: string } | undefined)?.membership === 'join'
+      );
+      if (joinedInWindow) {
+        const state = await getRoomState(c.env.DB, roomId);
+        for (const event of state) {
+          const clientEvent = {
+            type: event.type,
+            state_key: event.state_key,
+            content: event.content,
+            sender: event.sender,
+            origin_server_ts: event.origin_server_ts,
+            event_id: event.event_id,
+            room_id: event.room_id,
+          };
+          if (!stateEvents.find(e => e.event_id === event.event_id)) {
+            stateEvents.push(clientEvent);
+          }
+        }
+      }
+    }
+
     // Include full state if requested or initial sync
     if (fullState || !hasSinceToken) {
       const state = await getRoomState(c.env.DB, roomId);

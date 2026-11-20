@@ -399,6 +399,42 @@ describe('GET /_matrix/client/v3/sync — empty baseline', () => {
     expect(memberships).toContain('invite');
     expect(memberships).not.toContain('leave');
   });
+
+  it('incremental sync of a newly joined room carries its full state', async () => {
+    getUserRooms.mockImplementation(async (_db: unknown, _userId: string, membership?: string) => {
+      if (membership === 'join') return [ROOM];
+      return [];
+    });
+    // The window holds only the user's join: the join's state snapshot lives
+    // at negative stream positions, invisible to the `> since` window.
+    getEventsSince.mockResolvedValue([
+      {
+        event_id: '$join1', room_id: ROOM, sender: USER, type: 'm.room.member',
+        state_key: USER, content: { membership: 'join' }, origin_server_ts: 5,
+      } as PDU,
+    ]);
+    getRoomState.mockResolvedValue([
+      {
+        event_id: '$name1', room_id: ROOM, sender: BOB, type: 'm.room.name',
+        state_key: '', content: { name: 'The Room' }, origin_server_ts: 4,
+      } as PDU,
+      {
+        event_id: '$join1', room_id: ROOM, sender: USER, type: 'm.room.member',
+        state_key: USER, content: { membership: 'join' }, origin_server_ts: 5,
+      } as PDU,
+    ]);
+    const env = createEnv();
+    const { body } = await syncRequest(env, 'since=s2_td0');
+
+    const join = ((body.rooms as { join: Record<string, { state: { events: Array<{ type: string; content: { name?: string } }> }; timeline: { events: unknown[] } }> }).join)[ROOM];
+    expect(join).toBeTruthy();
+    const stateTypes = join.state.events.map((e) => e.type);
+    // Without this the client renders the room with no name/avatar ("Unnamed
+    // Room") until a full re-sync.
+    expect(stateTypes).toContain('m.room.name');
+    expect(join.state.events.find((e) => e.type === 'm.room.name')!.content.name).toBe('The Room');
+    expect(join.timeline.events).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
