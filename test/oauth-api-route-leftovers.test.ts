@@ -415,7 +415,7 @@ describe('oauth leftovers: POST /oauth/register', () => {
     expect(stored.redirect_uris).toEqual(uris);
   });
 
-  it('ignores unknown metadata fields without failing (contacts/logo/etc)', async () => {
+  it('echoes registered metadata fields back (RFC 7591 §3.2.1)', async () => {
     const env = makeEnv();
     const { status, body } = await registerClient(env, {
       client_name: 'Meta',
@@ -431,8 +431,16 @@ describe('oauth leftovers: POST /oauth/register', () => {
     });
     expect(status).toBe(201);
     expect(body.client_id).toMatch(/^client_[0-9a-f]{32}$/);
-    expect(body).not.toHaveProperty('contacts');
-    expect(body).not.toHaveProperty('logo_uri');
+    // RFC 7591: the registration response echoes the client metadata.
+    // matrix-dart-sdk's registration parser hard-casts client_uri (and the
+    // sibling URI fields) to String — omitting them crashed FluffyChat's
+    // OIDC login with a null-type error right after the 201.
+    expect(body.client_uri).toBe('https://x');
+    expect(body.logo_uri).toBe('https://x/l.png');
+    expect(body.tos_uri).toBe('https://x/t');
+    expect(body.policy_uri).toBe('https://x/p');
+    expect(body.application_type).toBe('web');
+    expect(body.contacts).toEqual(['a@b.c']);
   });
 
   it.each([

@@ -172,6 +172,19 @@ app.post('/oauth/register', async (c) => {
     client_id_issued_at: Math.floor(client.created_at / 1000),
   };
 
+  // RFC 7591 §3.2.1: the response echoes the registered client metadata.
+    // matrix-dart-sdk's registration parser hard-casts client_uri to String
+    // (msc_2966_oidc_dynamic_client_registration.dart: OidcClientInformation
+    // .fromJson) — omitting the URI fields here crashed FluffyChat's login
+    // with "null: type 'minified:W6' is not a subtype of type 'String'"
+    // immediately after the 201.
+    if (body.client_uri) response.client_uri = body.client_uri;
+    if (body.logo_uri) response.logo_uri = body.logo_uri;
+    if (body.tos_uri) response.tos_uri = body.tos_uri;
+    if (body.policy_uri) response.policy_uri = body.policy_uri;
+    if (body.application_type) response.application_type = body.application_type;
+    if (body.contacts) response.contacts = body.contacts;
+
   // Only include client_secret if using secret-based auth
   if (tokenEndpointAuthMethod !== 'none') {
     response.client_secret = clientSecret;
