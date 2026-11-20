@@ -334,3 +334,35 @@ resident (live traffic + working previews) — REMOVE IT (leave room,
 deactivate) once the real account joins. Note: the user's earlier "join"
 of the new room never reached this server (no local join event) — if they
 joined via the preview, it was on another account/server.
+
+## Conduwuit interop + nixos room follow-ups (2026-11-20, session 7 cont.)
+- **Parameterized key endpoint was unsigned** (`b749624`, prod `cf1a32ad`):
+  GET /_matrix/key/v2/server/:keyId returned an unsigned key document.
+  Conduwuit-family servers fetch THIS form (they hold the key id from the
+  Authorization header) and strictly require self-signed key responses —
+  every federation call from matrix.0upti.me failed with "Unable to acquire
+  your signing key". Synapse uses the unparameterized form (already signed),
+  which is why only Conduwuit peers 401'd and joins silently succeeded via
+  fallback servers. The response is now signed with the v2 key (legacy v1
+  rows stay unsigned); our key doc's signature verified independently
+  (canonical JSON + Ed25519, node). After the fix 0upti.me still 401s once —
+  consistent with a negative key-cache on their side; expect self-healing.
+  Outbound requests to 0upti.me should recover without action; joins already
+  fall back to other residents.
+- **room_summary resolves remote aliases live** (`0a942ab`, prod `b50d2f3c`):
+  the MSC3266 summary endpoint used to only check the local alias table, so
+  preview cards fed an alias 404'd. Remote aliases now go through the same
+  federation /query/directory path the join flow uses. Verified live: the
+  alias summary for #users:nixos.org serves "Nix / NixOS" with the real
+  topic and member count.
+- **The room toggles its join rules constantly** (anti-spam automation):
+  public at 16:53, restricted by ~17:45, 13 join_rules events in the replay
+  window. TODAY it is often RESTRICTED with an EMPTY allow list — new joins
+  are refused by the residents themselves (M_FORBIDDEN from make_join), a
+  room-side lockdown, not a bug. Retry later; ask in
+  #moderation:nixos.org. Admin "Backfill State" anchors at the newest event
+  authored by the chosen server — pick the server that authored the newest
+  local event for the freshest state; anchor choice matters (a 16:42 anchor
+  served pre-flip state).
+- Live state refreshes ran twice (25 state events + ~9.6k members each,
+  stored as invisible snapshots); room_state now matches the residents.
