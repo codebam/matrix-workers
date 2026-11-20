@@ -14,10 +14,10 @@
 
 import { canonicalJson, sha256 } from './crypto';
 
-// Top-level keys retained by the redaction algorithm (v11 rules, unchanged
-// through v12). Everything else is stripped. `event_id` is retained here for
-// completeness of the redaction algorithm, though v4+ wire events do not
-// carry it.
+// Top-level keys retained by the redaction algorithm (v11+ rules; the
+// keep list drops `origin`/`prev_state` from this version on). Everything
+// else is stripped. `event_id` is retained here for completeness of the
+// redaction algorithm, though v4+ wire events do not carry it.
 const REDACTION_KEEP_TOP_LEVEL = [
   'event_id',
   'type',
@@ -31,6 +31,19 @@ const REDACTION_KEEP_TOP_LEVEL = [
   'prev_events',
   'auth_events',
   'origin_server_ts',
+];
+
+// Room versions 1-10 additionally retain `origin` and `prev_state` (spec:
+// "the server must strip off any keys not in the following list: ... depth,
+// prev_events, prev_state, auth_events, origin, origin_server_ts").
+// Pre-2023 Synapse events carry both, and the reference hash covers the
+// redacted event — dropping them derives PHANTOM IDs no resident resolves.
+// Live case: the GNU/Linux room's create (v9, 2022 halogen.city) hashes to
+// its real ID only with `origin`+`prev_state` kept.
+const REDACTION_KEEP_TOP_LEVEL_LEGACY = [
+  ...REDACTION_KEEP_TOP_LEVEL,
+  'origin',
+  'prev_state',
 ];
 
 // Per-event-type content keys retained by the redaction algorithm (v11+
@@ -82,7 +95,10 @@ export function redactEventForSigning(
   roomVersion?: string
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
-  for (const key of REDACTION_KEEP_TOP_LEVEL) {
+  const keepTopLevel = isLegacyRedaction(roomVersion)
+    ? REDACTION_KEEP_TOP_LEVEL_LEGACY
+    : REDACTION_KEEP_TOP_LEVEL;
+  for (const key of keepTopLevel) {
     if (key in event) {
       redacted[key] = event[key];
     }
