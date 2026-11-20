@@ -112,15 +112,29 @@ export async function deriveRoomWireEvents(
   // Current state, used to augment auth_events with the types the receiving
   // server's auth rules require (e.g. join_rules for member joins) when the
   // stored event predates that rule.
-  const stateRows = await env.DB.prepare(
-    `SELECT rs.event_id, e.event_type, e.state_key, e.depth FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ?`
-  ).bind(roomId).all<{ event_id: string; event_type: string; state_key: string | null; depth: number }>();
-  const stateTargets = new Map<string, { id: string; depth: number }>();
-  for (const r of stateRows.results ?? []) {
-    stateTargets.set(r.event_type + AUTH_SEP + (r.state_key ?? ''), { id: r.event_id, depth: r.depth });
+  // State-at-event-time from the DAG itself (latest event per state slot
+  // with smaller depth). Using CURRENT state here would change an event's
+  // derived ID whenever a later membership lands, dangling the auth refs of
+  // joins peers already stored.
+  const history = new Map<string, Array<{ id: string; depth: number }>>();
+  for (const r of all.results as any[]) {
+    if (r.state_key === null || r.state_key === undefined) continue;
+    const key = r.event_type + AUTH_SEP + r.state_key;
+    const list = history.get(key) ?? [];
+    list.push({ id: r.event_id, depth: r.depth });
+    history.set(key, list);
   }
+  for (const list of history.values()) list.sort((a, b) => a.depth - b.depth);
+  const stateAtDepth = (key: string, depth: number): string | undefined => {
+    const list = history.get(key);
+    if (!list) return undefined;
+    let found: string | undefined;
+    for (const entry of list) {
+      if (entry.depth >= depth) break;
+      found = entry.id;
+    }
+    return found;
+  };
 
   // Single pass in dependency order: auth/prev references always point at
   // earlier events, so each event's final wire form (and derived ID) is
@@ -189,9 +203,9 @@ export async function deriveRoomWireEvents(
       // a membership slot may be a *later* membership, which must never
       // become an auth ref of an earlier event.
       for (const key of expected) {
-        const st = stateTargets.get(key);
-        if (!st || st.id === row.event_id || st.depth >= row.depth) continue;
-        push(idMap.get(st.id) ?? st.id);
+        const priorId = stateAtDepth(key, row.depth);
+        if (!priorId || priorId === row.event_id) continue;
+        push(idMap.get(priorId) ?? priorId);
       }
       if (!msc4291 && createEventId) push(idMap.get(createEventId) ?? createEventId);
       reducedAuth = kept;
