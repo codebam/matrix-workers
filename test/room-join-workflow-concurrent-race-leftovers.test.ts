@@ -803,3 +803,85 @@ describe('room-join: version-aware wire-ID derivation (v10 phantom-ID bug)', () 
     expect(stored).toContain('$wire:reference-hash');
   });
 });
+
+describe('room-join: post-join timeline backfill (members but no history bug)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetMocks();
+    computeWireEventId.mockReset();
+    computeWireEventId.mockResolvedValue('$wire:reference-hash');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('backfill:true fetches federation /backfill and stores history OLDEST-FIRST', async () => {
+    const REMOTE_USER = '@bob:remote.example.com';
+    federationGet.mockImplementation(async (_server: string, path: string) => {
+      if (path.includes('/backfill')) {
+        // /backfill returns newest-first.
+        return new Response(
+          JSON.stringify({
+            origin: REMOTE,
+            origin_server_ts: NOW,
+            pdus: [
+              { room_id: ROOM, sender: REMOTE_USER, type: 'm.room.message', content: { body: 'newest' }, origin_server_ts: NOW + 2, depth: 9, auth_events: [], prev_events: [] },
+              { room_id: ROOM, sender: REMOTE_USER, type: 'm.room.message', content: { body: 'oldest' }, origin_server_ts: NOW, depth: 8, auth_events: [], prev_events: [] },
+            ],
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response(JSON.stringify(validRemoteTemplate()), { status: 200 });
+    });
+    federationPut.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
+
+    const env = createSyncEnv();
+    const result = await new RoomJoinWorkflow({} as never, env as never).run(
+      { payload: { roomId: ROOM, userId: USER, isRemote: true, remoteServer: REMOTE, backfill: true } } as never,
+      mockStep() as never
+    );
+    expect(result.success).toBe(true);
+
+    // The join + the two backfill messages were all stored, the backfill
+    // messages in oldest-first order (so stream positions ascend with time).
+    const bodies = storeEventIdempotent.mock.calls
+      .map((c) => (c[1] as { content?: { body?: string } }).content?.body)
+      .filter(Boolean);
+    expect(bodies).toEqual(['oldest', 'newest']);
+  });
+
+  it('a failing /backfill response never fails the join', async () => {
+    federationGet.mockImplementation(async (_server: string, path: string) => {
+      if (path.includes('/backfill')) return new Response('nope', { status: 500 });
+      return new Response(JSON.stringify(validRemoteTemplate()), { status: 200 });
+    });
+    federationPut.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
+    const env = createSyncEnv();
+    const result = await new RoomJoinWorkflow({} as never, env as never).run(
+      { payload: { roomId: ROOM, userId: USER, isRemote: true, remoteServer: REMOTE, backfill: true } } as never,
+      mockStep() as never
+    );
+    expect(result.success).toBe(true);
+    // Only the join event was stored; no timeline rows.
+    const bodies = storeEventIdempotent.mock.calls
+      .map((c) => (c[1] as { content?: { body?: string } }).content?.body)
+      .filter(Boolean);
+    expect(bodies).toEqual([]);
+  });
+
+  it('backfill:false does not call the federation /backfill endpoint', async () => {
+    federationGet.mockImplementation(async (_server: string, path: string) => {
+      if (path.includes('/backfill')) throw new Error('backfill must not be called');
+      return new Response(JSON.stringify(validRemoteTemplate()), { status: 200 });
+    });
+    federationPut.mockResolvedValue(new Response(JSON.stringify({}), { status: 200 }));
+    const env = createSyncEnv();
+    const result = await new RoomJoinWorkflow({} as never, env as never).run(
+      { payload: { roomId: ROOM, userId: USER, isRemote: true, remoteServer: REMOTE } } as never,
+      mockStep() as never
+    );
+    expect(result.success).toBe(true);
+  });
+});

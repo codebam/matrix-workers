@@ -176,11 +176,16 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           // Some residents return a partial snapshot (missing create/name), so
           // the room renders without a name. Backfill the full current state.
           if (backfill) {
-          const haveEssential = await this.env.DB.prepare(
-            `SELECT
-               (SELECT 1 FROM room_state WHERE room_id = ? AND event_type = 'm.room.create') AS c,
-               (SELECT 1 FROM room_state WHERE room_id = ? AND event_type = 'm.room.name') AS n`
-          ).bind(roomId, roomId).first<{ c: number | null; n: number | null }>();
+          let haveEssential: { c: number | null; n: number | null } | null = null;
+          try {
+            haveEssential = await this.env.DB.prepare(
+              `SELECT
+                 (SELECT 1 FROM room_state WHERE room_id = ? AND event_type = 'm.room.create') AS c,
+                 (SELECT 1 FROM room_state WHERE room_id = ? AND event_type = 'm.room.name') AS n`
+            ).bind(roomId, roomId).first<{ c: number | null; n: number | null }>();
+          } catch {
+            // Best-effort completeness check; on failure, fetch the state.
+          }
           if (!haveEssential?.c || !haveEssential?.n) {
             try {
               // Synapse's federation /state requires ?event_id=; use the join
@@ -206,6 +211,59 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
               });
             }
           }
+          }
+        });
+      }
+
+      // Step 4c: Backfill the room's recent TIMELINE. The join response only
+      // carries state (create/PL/join_rules/members) — without a history fetch
+      // the room renders with every member but an empty timeline, and the
+      // user sees none of the recent messages. Synapse backfills after
+      // joining via the federation /backfill endpoint; so do we. Best-effort:
+      // a failed history fetch never fails the join.
+      if (backfill && remoteServer) {
+        await step.do('backfill-timeline', async () => {
+          let roomVersion = remoteEventTemplate?.room_version;
+          try {
+            const localRoom = await this.env.DB.prepare(
+              `SELECT room_version FROM rooms WHERE room_id = ?`
+            ).bind(roomId).first<{ room_version: string }>();
+            roomVersion = roomVersion ?? localRoom?.room_version;
+          } catch {
+            // Best-effort fallback only; the template version is primary.
+          }
+          try {
+            const resp = await federationGet(
+              chosenServer ?? remoteServer,
+              `/_matrix/federation/v1/backfill/${encodeURIComponent(roomId)}?v=${encodeURIComponent(joinEventData.event_id)}&limit=50`,
+              this.env.SERVER_NAME,
+              this.env.DB,
+              this.env.CACHE
+            );
+            if (!resp.ok) {
+              console.warn('[RoomJoinWorkflow] timeline backfill non-OK', {
+                roomId, status: resp.status,
+              });
+              return;
+            }
+            const data = (await resp.json()) as { pdus?: any[] };
+            const pdus = Array.isArray(data.pdus) ? data.pdus : [];
+            // /backfill returns newest-first; store oldest-first so stream
+            // positions ascend with chronology and /sync renders history in
+            // order. storeRemoteStateEvent derives IDs with the room version
+            // (v1-10 redaction keeps origin/prev_state, so residents' IDs
+            // reproduce exactly) and keeps memberships/state in sync.
+            for (const ev of [...pdus].reverse()) {
+              await this.storeRemoteStateEvent(ev, roomId, roomVersion);
+            }
+            console.log('[RoomJoinWorkflow] timeline backfill stored', {
+              roomId, count: pdus.length,
+            });
+          } catch (e) {
+            console.warn('[RoomJoinWorkflow] timeline backfill failed', {
+              roomId,
+              error: e instanceof Error ? e.message : String(e),
+            });
           }
         });
       }
