@@ -253,3 +253,33 @@ directions; text relaying is unchanged.
 - 12 new tests in `test/bots-integrations.test.ts` (both directions,
   stickers, size caps, fallbacks, loop prevention); suite 345 files /
   45,451 tests.
+
+## Telegram formatting bridge (2026-11-20, session 6)
+Shipped in `8716976` (prod `1edb2e92`). Bold/italic/underline/strike/spoiler/
+code/pre/links now survive both directions. Pure converter module:
+`src/services/telegram-format.ts` (34 tests: `test/telegram-format.test.ts`
++ 6 integration cases in bots-integrations).
+
+- **Matrix → Telegram**: `formatted_body` (org.matrix.custom.html) converts
+  to Telegram's `parse_mode=HTML` subset via a strict tokenizer — only
+  b/i/u/s/code/pre/a survive; every text node and attribute value is
+  unescaped then re-escaped; unsupported tags and href schemes (only
+  http/https/tg) drop their tag but keep their text; unbalanced tags
+  auto-close; Matrix `<pre><code class="language-x">` flattens to `<pre>`.
+  If Telegram's strict parser still rejects the result, the message retries
+  once as plain text — formatting can never drop a relay. Plain text keeps
+  going out WITHOUT parse_mode (no injection surface).
+- **Telegram → Matrix**: message entities (offset/length in UTF-16 code
+  units — exactly how JS indexes strings, so emoji are safe) convert into a
+  freshly escaped `formatted_body` with the `[TG] name:` prefix escaped too.
+  Supported: bold, italic, underline, strikethrough, spoiler (→
+  `<span data-mx-spoiler>`), code, pre+language, text_link, text_mention,
+  mention, url. Nothing from the Telegram side passes through unescaped.
+- Literal markdown typed in the Telegram box is NOT parsed — Telegram
+  delivers it as plain text (that is Telegram behavior, not a bridge gap);
+  only its structured entities (BIU menu, link attachment, bots) convert.
+- Live-verified Matrix → Telegram: posted the user's exact case
+  (`**Bold [link](<https://google.com>)**` → `<strong>Bold
+  <a href="https://google.com">link</a></strong>`) into the ops room; tail
+  clean, no fallback needed. Test event
+  `$33X4OG_lZTB-AfM8IQ7Anggncqocp246B1BG5Cr2Hgo`.
