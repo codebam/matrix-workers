@@ -390,3 +390,31 @@ repaired in-place (real join event ids).
 Cleanup: the temp peek user @fedpeek5626 left the room and was
 deactivated; @codebam:codebam.ca is the (repaired) resident member keeping
 our server in Nix / NixOS.
+
+## Fresh-login breakage: missing lazy loading + per-member queries (2026-11-20, session 8)
+After "clear cache and reload", Element Web rendered all rooms but one as
+"Empty room / Join the discussion". Two latent bugs, both exposed by the
+user's first fresh initial sync in weeks:
+
+- **lazy_load_members (MSC2732) was unimplemented** (`e99b98b`, prod
+  `59e7c564`): Element Web requests it by default; we ignored it, so the
+  initial sync shipped every member of every room (~770KB / ~2,200
+  membership events for five rooms) — fresh logins on big-room accounts
+  choked and half-rendered. With the filter, state carries only the user's
+  own membership + timeline senders' (verified live: 74KB, names intact;
+  clients fetch the rest via /members on demand).
+- **/members ran one D1 query per member** (`b7583c5`, prod `4bc24e95`):
+  4,000 members = 4,000 subrequests in one invocation → 500 (verified live
+  on the nixos room). Lazy-loading clients hit this endpoint for every
+  rendered room. Now a single room_state join with membership /
+  not_membership filters applied in place (verified: 200, 1,320 joined
+  members, ~475KB, <1s).
+
+**Remedy for affected clients**: fresh login (or clear cache again) — the
+initial sync is now 10× smaller and the member fetch works. Element X was
+unaffected (sliding sync serves required_state efficiently).
+
+Server-state verification baseline for this account (useful for future
+debugging): initial /sync serves 5 joined rooms with own membership + names
+(GNU/Linux, codebam_live/linux_chat ops room, Nix / NixOS, Jovian
+Experiments, one small local room); sliding sync probe identical.
