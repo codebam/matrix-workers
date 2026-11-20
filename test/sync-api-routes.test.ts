@@ -435,6 +435,40 @@ describe('GET /_matrix/client/v3/sync — empty baseline', () => {
     expect(join.state.events.find((e) => e.type === 'm.room.name')!.content.name).toBe('The Room');
     expect(join.timeline.events).toHaveLength(1);
   });
+
+  it('lazy_load_members strips state members to the user + timeline senders', async () => {
+    getUserRooms.mockImplementation(async (_db: unknown, _userId: string, membership?: string) => {
+      if (membership === 'join') return [ROOM];
+      return [];
+    });
+    getEventsSince.mockResolvedValue([
+      {
+        event_id: '$m1', room_id: ROOM, sender: BOB, type: 'm.room.message',
+        content: { body: 'hi' }, origin_server_ts: 6,
+      } as PDU,
+    ]);
+    getRoomState.mockResolvedValue([
+      { event_id: '$me', room_id: ROOM, sender: USER, type: 'm.room.member', state_key: USER, content: { membership: 'join' }, origin_server_ts: 1 } as PDU,
+      { event_id: '$bobm', room_id: ROOM, sender: BOB, type: 'm.room.member', state_key: BOB, content: { membership: 'join' }, origin_server_ts: 2 } as PDU,
+      { event_id: '$carolm', room_id: ROOM, sender: '@carol:example.com', type: 'm.room.member', state_key: '@carol:example.com', content: { membership: 'join' }, origin_server_ts: 3 } as PDU,
+      { event_id: '$name1', room_id: ROOM, sender: BOB, type: 'm.room.name', state_key: '', content: { name: 'The Room' }, origin_server_ts: 4 } as PDU,
+    ]);
+    const env = createEnv();
+    const filter = encodeURIComponent(
+      JSON.stringify({ room: { state: { lazy_load_members: true }, timeline: { limit: 20 } } })
+    );
+    const { body } = await syncRequest(env, `filter=${filter}`);
+
+    const join = ((body.rooms as { join: Record<string, { state: { events: Array<{ type: string; state_key?: string }> } }> }).join)[ROOM];
+    expect(join).toBeTruthy();
+    const memberKeys = join.state.events.filter((e) => e.type === 'm.room.member').map((e) => e.state_key);
+    // MSC2732: own membership + timeline senders only — carol is stripped.
+    // Without this, big rooms ship thousands of member events and fresh
+    // logins choke on multi-hundred-KB initial syncs.
+    expect(memberKeys).toEqual([USER, BOB]);
+    // Non-member state is untouched.
+    expect(join.state.events.some((e) => e.type === 'm.room.name')).toBe(true);
+  });
 });
 
 // ---------------------------------------------------------------------------

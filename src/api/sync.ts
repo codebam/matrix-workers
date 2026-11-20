@@ -28,6 +28,9 @@ interface EventFilter {
   senders?: string[];
   not_senders?: string[];
   limit?: number;
+  /** MSC2732: only send the user's own + timeline senders' memberships. */
+  lazy_load_members?: boolean;
+  include_leave?: boolean;
 }
 
 interface RoomFilter {
@@ -544,6 +547,20 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     // Apply filters to state and timeline events
     stateEvents = applyEventFilter(stateEvents, filter?.room?.state);
     timelineEvents = applyEventFilter(timelineEvents, filter?.room?.timeline);
+
+    // MSC2732 lazy loading: clients (Element Web by default) ask for only
+    // their own membership plus the memberships of timeline senders, instead
+    // of every member of every room — a 4,000-member room would otherwise
+    // ship a multi-hundred-KB initial sync and choke fresh logins. The rest
+    // of the members are fetched on demand via the members API.
+    if (filter?.room?.state?.lazy_load_members) {
+      const timelineSenders = new Set(timelineEvents.map(e => e.sender));
+      timelineSenders.add(userId);
+      stateEvents = stateEvents.filter(e => {
+        if (e.type !== 'm.room.member') return true;
+        return e.state_key !== undefined && timelineSenders.has(e.state_key);
+      });
+    }
 
     // On initial sync return only a recent timeline window so clients show the
     // latest messages and backfill older history on demand, instead of walking
