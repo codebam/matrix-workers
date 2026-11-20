@@ -749,3 +749,57 @@ describe('room-join after #187: soft flood concurrent matrices', () => {
     });
   }
 });
+describe('room-join: version-aware wire-ID derivation (v10 phantom-ID bug)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    resetMocks();
+    computeWireEventId.mockReset();
+    computeWireEventId.mockResolvedValue('$wire:reference-hash');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('remote join derives the join event and stored remote state with the resident room version', async () => {
+    const REMOTE_USER = '@bob:remote.example.com';
+    federationGet.mockResolvedValue(
+      new Response(JSON.stringify(validRemoteTemplate()), { status: 200 })
+    );
+    // The resident's send_join response: state events WITHOUT event_id (wire
+    // form). The workflow must derive their IDs with the template's
+    // room_version, not the v11+ default.
+    const wireCreate = {
+      room_id: ROOM, sender: REMOTE_USER, type: 'm.room.create',
+      content: { creator: REMOTE_USER, room_version: '10' },
+      origin_server_ts: NOW, depth: 1, auth_events: [], prev_events: [],
+      hashes: { sha256: 'h' },
+      signatures: { 'remote.example.com': { 'ed25519:k': 's' } },
+    };
+    federationPut.mockResolvedValue(
+      new Response(JSON.stringify({ state: [wireCreate], auth_chain: [], event: null }), { status: 200 })
+    );
+
+    const env = createSyncEnv();
+    const result = await new RoomJoinWorkflow({} as never, env as never).run(
+      { payload: { roomId: ROOM, userId: USER, isRemote: true, remoteServer: REMOTE } } as never,
+      mockStep() as never
+    );
+    expect(result.success).toBe(true);
+
+    // Both the signed join event and the resident's create were derived with
+    // the negotiated room version ('10'), never version-blind.
+    const versionedCalls = computeWireEventId.mock.calls.filter(
+      (c) => (c as unknown[])[1] === '10'
+    );
+    expect(versionedCalls.length).toBeGreaterThanOrEqual(2);
+    const blindCalls = computeWireEventId.mock.calls.filter(
+      (c) => (c as unknown[])[1] === undefined
+    );
+    expect(blindCalls).toEqual([]);
+
+    // The remote create was stored under the version-derived ID.
+    const stored = storeEventIdempotent.mock.calls.map((c) => (c[1] as { event_id?: string }).event_id);
+    expect(stored).toContain('$wire:reference-hash');
+  });
+});

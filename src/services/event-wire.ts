@@ -202,7 +202,20 @@ export async function deriveRoomWireEvents(
       // Only state that predates the event (depth guard): current state for
       // a membership slot may be a *later* membership, which must never
       // become an auth ref of an earlier event.
+      // Slots the event already references are left alone: the sender chose
+      // them (typically its own previous membership). Re-deriving a slot
+      // from depth history can pick a STALE event — the depth cutoff
+      // (entry.depth >= depth) skips same-depth membership transitions, so a
+      // leave + re-join pair would get the pre-leave membership appended,
+      // changing the event's derived ID and dangling every reference peers
+      // already hold.
+      const keptSlots = new Set<string>();
+      for (const ref of kept) {
+        const target = refTargets.get(ref);
+        if (target) keptSlots.add(target.type + AUTH_SEP + target.stateKey);
+      }
       for (const key of expected) {
+        if (keptSlots.has(key)) continue;
         const priorId = stateAtDepth(key, row.depth);
         if (!priorId || priorId === row.event_id) continue;
         push(idMap.get(priorId) ?? priorId);

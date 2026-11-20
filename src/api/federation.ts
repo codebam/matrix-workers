@@ -556,15 +556,25 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   // Process incoming PDUs (Persistent Data Units - events)
   for (const pdu of pdus || []) {
     try {
-      // v4+ wire events (room versions 11 and up) omit `event_id`; the
+      // The room must be known before deriving the event ID: room versions
+      // 1-10 hash create/power_levels under different redaction rules than
+      // v11+, so a version-blind derivation stores the event under a
+      // phantom ID that neither the sender nor other residents use, and
+      // every later reference to it fails to resolve.
+      const roomId = pdu.room_id;
+      const room = roomId
+        ? await c.env.DB.prepare(
+            `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+          ).bind(roomId).first<{ room_id: string; room_version: string }>()
+        : null;
+      // v4+ wire events (room versions 3 and up) omit `event_id`; the
       // receiving server derives it as the event's reference hash. Derive
       // it once here so everything downstream (processed_pdus, storage,
       // sync) uses the same ID the sender's server uses.
       const eventId =
         typeof pdu.event_id === 'string' && pdu.event_id
           ? pdu.event_id
-          : await computeWireEventId(pdu as Record<string, unknown>);
-      const roomId = pdu.room_id;
+          : await computeWireEventId(pdu as Record<string, unknown>, room?.room_version);
 
       // Check if we've already processed this PDU
       const existingPdu = await c.env.DB.prepare(
@@ -608,11 +618,12 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           for (const keyId of keyIds) {
             try {
               // v4+ signatures cover the *redacted* wire form (no event_id,
-              // no unsigned); fall back to the legacy full-event form for
-              // older room versions.
+              // no unsigned), redacted with the ROOM VERSION's rules — v1-10
+              // differ from v11+ for create/power_levels; fall back to the
+              // legacy full-event form for older room versions.
               const isValid =
                 (await verifyRemoteSignature(
-                  redactEventForSigning(toWireEventObject(pdu as Record<string, unknown>)),
+                  redactEventForSigning(toWireEventObject(pdu as Record<string, unknown>), room?.room_version),
                   signatory,
                   keyId,
                   c.env.DB,
@@ -651,13 +662,6 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
-      // Check if the room exists locally — needed before the content-hash
-      // requirement check so we can pick the right enforcement level for
-      // the room version.
-      const room = await c.env.DB.prepare(
-        `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-      ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
       // Content hash enforcement.
       //   - Room versions 1-2: hashes optional (legacy clients may omit).
       //   - Room versions 3+: hashes.sha256 is REQUIRED — modern room versions
@@ -665,6 +669,8 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       //     entirely to skip integrity verification.
       // If the room is unknown locally, default to the strict (modern) rule —
       // we won't accept unverifiable events for rooms we know nothing about.
+      // (`room` was resolved at the top of the loop so the event ID could be
+      // derived with the room version's redaction rules.)
       const roomVersion = room?.room_version;
       const requiresHash = !roomVersion || isModernRoomVersion(roomVersion);
       const hasSha256 = typeof pdu.hashes?.sha256 === 'string' && pdu.hashes.sha256.length > 0;

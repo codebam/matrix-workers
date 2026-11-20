@@ -2689,12 +2689,20 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
   }
   if (!server) return Errors.invalidParam('server', 'Could not determine a remote server for this room').toResponse();
 
+  // Wire-ID derivation needs the room version (v1-10 redaction rules differ
+  // from v11+ for create/power_levels); a version-blind derivation stores
+  // phantom IDs nothing references.
+  const roomRow = await db.prepare(
+    `SELECT room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_version: string }>();
+  const roomVersion = roomRow?.room_version;
+
   const storeEv = async (ev: any): Promise<boolean> => {
     if (!ev || typeof ev !== 'object' || !ev.type) return false;
     try {
       const normalized: Record<string, unknown> = { ...ev };
       if (typeof ev.event_id !== 'string' || !ev.event_id) {
-        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>);
+        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>, roomVersion);
       }
       if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
         normalized.room_id = `!${String(normalized.event_id).slice(1)}`;

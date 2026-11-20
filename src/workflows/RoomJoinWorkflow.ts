@@ -151,13 +151,26 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       // idempotent store simply skips the duplicate.
       if (isRemote && remoteServer) {
         await step.do('store-remote-state', async () => {
+          // Derive wire IDs with the resident's room version (see
+          // storeRemoteStateEvent): the make_join template negotiated it, and
+          // the local rooms row is the fallback for rooms we already hold.
+          let localVersion: string | undefined;
+          try {
+            const localRoom = await this.env.DB.prepare(
+              `SELECT room_version FROM rooms WHERE room_id = ?`
+            ).bind(roomId).first<{ room_version: string }>();
+            localVersion = localRoom?.room_version ?? undefined;
+          } catch {
+            // Best-effort fallback only; the template version is primary.
+          }
+          const roomVersion = remoteEventTemplate?.room_version ?? localVersion;
           const remoteEvents = [
             ...(Array.isArray(sendJoinResponse?.auth_chain) ? sendJoinResponse.auth_chain : []),
             ...(Array.isArray(sendJoinResponse?.state) ? sendJoinResponse.state : []),
             ...(sendJoinResponse?.event ? [sendJoinResponse.event] : []),
           ];
           for (const ev of remoteEvents) {
-            await this.storeRemoteStateEvent(ev, roomId);
+            await this.storeRemoteStateEvent(ev, roomId, roomVersion);
           }
 
           // Some residents return a partial snapshot (missing create/name), so
@@ -183,7 +196,7 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
               if (resp.ok) {
                 const data = (await resp.json()) as { pdus?: any[]; auth_chain?: any[] };
                 for (const ev of [...(data.auth_chain ?? []), ...(data.pdus ?? [])]) {
-                  await this.storeRemoteStateEvent(ev, roomId);
+                  await this.storeRemoteStateEvent(ev, roomId, roomVersion);
                 }
               }
             } catch (e) {
@@ -375,15 +388,20 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     const wireFormat = !!remoteEventTemplate?.event;
 
     if (wireFormat) {
+      // Derive the ID and signature with the resident's room version: the
+      // redaction rules for v1-10 differ from v11+ (create/power_levels), so
+      // a version-blind derivation produces an ID the resident does not
+      // recognize.
+      const roomVersion = remoteEventTemplate?.room_version;
       const hashed = {
         ...baseEvent,
         hashes: {
           sha256: await calculateContentHash(baseEvent as unknown as Record<string, unknown>),
         },
       };
-      const eventId = await computeWireEventId(hashed as unknown as Record<string, unknown>);
+      const eventId = await computeWireEventId(hashed as unknown as Record<string, unknown>, roomVersion);
       const signed = await signJson(
-        redactEventForSigning(hashed as unknown as Record<string, unknown>),
+        redactEventForSigning(hashed as unknown as Record<string, unknown>, roomVersion),
         this.env.SERVER_NAME,
         signingKey.keyId,
         signingKey.privateKeyJwk
@@ -458,12 +476,18 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
 
   // Store one remote state/event PDU, deriving wire IDs where omitted and
   // keeping the memberships table in sync. Never throws on a malformed event.
-  private async storeRemoteStateEvent(ev: any, roomId: string): Promise<void> {
+  // The room version MUST be passed in: reference hashes (and therefore wire
+  // IDs) use the room version's redaction rules, and v1-10 redacts create and
+  // power_levels differently from v11+. A version-blind derivation stores
+  // those events under phantom IDs that no resident — or event we later
+  // receive — ever references, so every auth lookup against them fails
+  // ("missing auth event type m.room.power_levels").
+  private async storeRemoteStateEvent(ev: any, roomId: string, roomVersion?: string): Promise<void> {
     if (!ev || typeof ev !== 'object' || !ev.type) return;
     try {
       const normalized: Record<string, unknown> = { ...ev };
       if (typeof ev.event_id !== 'string' || !ev.event_id) {
-        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>);
+        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>, roomVersion);
       }
       if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
         normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
