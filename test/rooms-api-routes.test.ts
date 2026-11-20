@@ -1564,6 +1564,25 @@ describe('GET/PUT room state', () => {
     expect(body).toEqual({ name: 'Lobby' });
   });
 
+  it('GET specific state: trailing slash (js-sdk empty state key) is routed', async () => {
+    // matrix-js-sdk sends empty state keys as ".../state/<type>/" — without
+    // an explicit trailing-slash registration Element's state reads 404.
+    getMembership.mockResolvedValue(joinMembership());
+    getStateEvent.mockResolvedValue(
+      pdu({
+        type: 'm.room.canonical_alias',
+        event_id: '$c',
+        content: { alias: '#linux_group:codebam.ca' },
+        state_key: '',
+      })
+    );
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/state/m.room.canonical_alias/`
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ alias: '#linux_group:codebam.ca' });
+  });
+
   it('PUT state: bad JSON', async () => {
     getMembership.mockResolvedValue(joinMembership());
     const { status } = await request(
@@ -1679,6 +1698,28 @@ describe('GET/PUT room state', () => {
       ROOM,
       '$evt:example.com',
       'm.room.name'
+    );
+  });
+
+  it('PUT state: trailing slash (js-sdk empty state key) is routed', async () => {
+    // Element's "set as main address" sends ".../state/m.room.canonical_alias/"
+    // — without the trailing-slash route it dies with M_UNRECOGNIZED.
+    getMembership.mockResolvedValue(joinMembership());
+    getRoomEvents.mockResolvedValue({
+      events: [pdu({ type: 'm.room.message', event_id: '$p', depth: 4 })],
+      end: 4,
+    });
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/state/m.room.canonical_alias/`,
+      jsonInit('PUT', { alias: '#linux_group:codebam.ca' })
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ event_id: '$evt:example.com' });
+    expect(notifyUsersOfEvent).toHaveBeenCalledWith(
+      expect.anything(),
+      ROOM,
+      '$evt:example.com',
+      'm.room.canonical_alias'
     );
   });
 

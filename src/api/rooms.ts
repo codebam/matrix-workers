@@ -1157,7 +1157,11 @@ app.get('/_matrix/client/v3/rooms/:roomId/state', requireAuth(), async (c) => {
 });
 
 // GET /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey? - Get specific state
-app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
+// Registered twice: matrix-js-sdk sends empty state keys as a path ending in
+// "/state/<type>/" (trailing slash), which Hono's optional-param pattern
+// does not match — without the second registration Element's state reads
+// (and the whole Addresses panel) 404 with M_UNRECOGNIZED.
+async function getRoomStateHandler(c: any) {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
   const eventType = c.req.param('eventType');
@@ -1175,7 +1179,9 @@ app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   }
 
   return c.json(event.content);
-});
+}
+app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), getRoomStateHandler);
+app.get('/_matrix/client/v3/rooms/:roomId/state/:eventType/', requireAuth(), getRoomStateHandler);
 
 // PUT /_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey? - Set state
 //
@@ -1326,7 +1332,9 @@ export async function performStateEvent(
   return { eventId };
 }
 
-app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), async (c) => {
+// matrix-js-sdk sends empty state keys with a trailing slash (".../state/<type>/"),
+// which Hono's optional-param pattern does not match; register both shapes.
+async function putRoomStateHandler(c: any) {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
   const eventType = c.req.param('eventType');
@@ -1343,7 +1351,9 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireA
   if ('error' in result) return result.error.toResponse();
 
   return c.json({ event_id: result.eventId });
-});
+}
+app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/:stateKey?', requireAuth(), putRoomStateHandler);
+app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/', requireAuth(), putRoomStateHandler);
 
 // GET /_matrix/client/v3/rooms/:roomId/members - Get room members
 app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => {
