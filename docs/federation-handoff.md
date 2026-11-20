@@ -1,74 +1,99 @@
-# Federation delivery handoff (2026-11-19/20)
+# Federation delivery handoff (2026-11-19/20, session 2)
 
-Context: user's homeserver `codebam.ca` (Worker `matrix-worker-codebam`). Goal: fix
-"matrix.org accepts our PDUs (200) but never displays them" (GNU/Linux room
-`!iDwfRnmIeZCSTKVEim:halogen.city`) and make remote joins/delivery reliable.
-User also asked for a second instance at `dev.codebam.ca` to debug federation
-with both workers tailable, and for mock-Synapse tests (done).
+Context: continuing from `29a74df`. Goal unchanged: make codebam.ca↔matrix.org
+delivery reliable (GNU/Linux room `!iDwfRnmIeZCSTKVEim:halogen.city`, v10) and
+validate against the dev.codebam.ca instance. Both open items from the previous
+handoff are now root-caused; see "GNU/Linux live status" for the one user action
+still outstanding.
 
-## Commits / deploys (all pushed to origin/main)
-- `86d519a` omit explicit `event_id` on wire PDUs (room v3+; Synapse rejects it).
-- `875086b` room-version-aware redaction/signing (v1-10: create keeps only
-  `creator`, power_levels drops `invite`); derive-on-serve in `src/services/event-wire.ts`.
-- `25bee50` augment auth_events with types Synapse selects (join_rules for joins,
-  sender membership) at creation + serve; never self-reference.
-- `85b7628`/`63cfbcc` derived IDs must depend only on DAG history (state-at-depth),
-  not current state; alias pre-augmentation wire IDs.
-- `8d6e82a` /sync accepts `org.matrix.msc4222.use_state_after` (Element's param name).
-- `dfc2719` **prod deploy ca886c09**: /state auth_chain no longer spreads raw D1 rows
-  (leaked `event_type` + `unsigned:null` → content-hash mismatch → residents reject);
-  derivation extended to ALL v3-v10 rooms (cap 1000 events, best-effort fallback);
-  `src/services/federation-verify.ts` (Synapse receive-side rules port) gated by
-  `FEDERATION_STRICT_AUTH` (dev only); mock peer tests
-  `test/federation-synapse-peer.test.ts` + `test/helpers/synapse-peer.ts` (4 green).
-- `944b9ec` `wrangler.dev.jsonc` (dev instance config).
-Full suite green: 342 files / ~45.4k tests; `npm run typecheck` clean.
+## What this session found and fixed (all pushed to origin/main)
 
-## Dev instance (live)
-- Worker `matrix-worker-codebam-dev`, deploy `6c37fd8e`, routes `dev.codebam.ca/...`
-  (DNS: proxied CNAME dev → codebam.ca, zone e9425b9e15a26285f43260ab993914a3).
-- D1 `matrix-db-codebam-dev` fd00b766-e98a-4818-9b5b-d69fc7a1323f (schema.sql executed
-  directly + numbered migrations applied individually; `schema.sql` row inserted into
-  d1_migrations because it sorts last but must run first).
-- KV/R2 ids in wrangler.dev.jsonc. Vars: SERVER_NAME=dev.codebam.ca,
-  FEDERATION_STRICT_AUTH=true, compat flag `global_fetch_strictly_public`
-  (worker-internal fetch dispatch to same-zone codebam.ca returned HTTP 530).
-- Signing key bootstrapped by curling `/_matrix/key/v2/server` once (auto-generates).
-- Dev user: `@fedtest:dev.codebam.ca` / password `fed-test-password-123`
-  (registration token row in dev D1, uses_remaining 5).
-- Local DNS negative-caches dev.codebam.ca: use `curl --resolve dev.codebam.ca:443:172.64.80.1`
-  (or DoH-verified IP) until cache expires.
+### 1. prod→dev federation was dead: same-zone fetch 522 (fixed, live)
+Prod's key fetch of `dev.codebam.ca` returned **HTTP 522** (same-zone
+worker-internal routing), so every dev→prod make_join 401'd with "Cannot fetch
+signing keys from dev.codebam.ca". Mirror image of the dev-side 530 the previous
+session fixed with `global_fetch_strictly_public` — but no prod change needed:
+dev's well-known now delegates federation to its **workers.dev domain**
+(`FEDERATION_WELL_KNOWN_M_SERVER`, commit `e34f69c`, dev deploys `4b2e45f7` /
+`8c371499`). Off-zone hosts behave like ordinary origins; prod discovers dev
+via well-known and everything flows. Live-verified: join handshake completes,
+transactions deliver, dev accepts messages and /sync shows them.
 
-## OPEN: prod↔dev delivery still not working
-Repro script `/tmp/fed-repro2.py` (public_chat room v10, prod temp token minted via
-D1 insert into access_tokens with sha256-urlsafe-b64 hash, deleted at end; dev login;
-dev join; prod send; poison prod join auth_events via D1 UPDATE; delete dev's copy;
-prod send again; prod leave+rejoin heal; prod send). Latest run room
-`!5FwUGJC8NBX23JRtbMdtKIr9:codebam.ca`: dev join 200 but dev sync timeline empty and
-`processed_pdus` rejections empty → PDUs never reach dev / never accepted.
-Earlier causes fixed: missing dev signing key ("Server signing key not configured"),
-HTTP 530 key fetch (compat flag). Next: inspect tails (still running background shells
-`bg_533f4b39` prod → /tmp/tail-prod.jsonl, `bg_1f1e535a` dev → /tmp/tail-dev.jsonl;
-parse with json.JSONDecoder raw_decode loop, logs[].message is a list; URLs redacted —
-match on log messages). Check whether dev's RoomJoinWorkflow actually completes
-send_join to prod now, and whether prod's FederationDO alarm delivers /send to dev
-(getJoinedRemoteServers requires dev membership=join on PROD).
-Other /tmp artifacts: fed-repro.py (older variant), fedsign.ts (self-signed federation
-GET; middleware verifies uri = RAW pathname+search; node v26 runs .ts natively),
-synenv (pip venv with matrix-synapse; run with LD_LIBRARY_PATH=$(nix eval --raw
-nixpkgs#zlib.out)/lib) for offline Synapse verification of served PDUs.
+### 2. Phantom wire IDs: version-blind `computeWireEventId` (fixed, live)
+Reference hashes use the room version's redaction rules — **v1–10 redacts
+`m.room.create` (keep only `creator`) and `m.room.power_levels` (drop `invite`)
+differently from v11+**. Four call sites derived IDs without the version, so v10
+rooms' create/PL landed under v11-rule **phantom IDs** no peer ever references.
+This is very plausibly the ORIGINAL "matrix.org 200s but never displays" bug:
+prod's copy of the GNU/Linux room (joined via `storeRemoteStateEvent`) holds
+phantom create/PL, and any message auth-referencing them is rejected. Pinned by
+recomputing both hashes from the live /state response: v10-rule == prod's stored
+ID, v11-rule == the joining server's phantom ID, for exactly create+PL (member/
+message redaction coincides, which is why joins looked fine).
 
-## GNU/Linux live heal (not yet user-verified)
-Prod fixes are deployed. Heal path for already-poisoned rooms: user leaves and
-re-joins the room from codebam.ca (new join event carries correct auth selection),
-then sends; matrix.org should display. Ask user to test; alternatively dev repro above
-validates the same mechanism once prod↔dev delivery works.
+Fixed in `97d9422`: `RoomJoinWorkflow.storeRemoteStateEvent` + `createJoinEvent`
+(now take the negotiated room version), inbound /send (room lookup moved above
+ID derivation; signature redaction now version-aware), admin backfill. Plus a
+stability fix in `deriveRoomWireEvents`: auth augmentation no longer re-derives
+slots the event already references (the depth cutoff skipped same-depth
+membership transitions, so leave+rejoin got a stale pre-leave membership
+appended — different derived ID → dangling refs).
 
-## Gotchas
-- Client "NetworkError"/"Joining..." masks server-side federation rejection; diagnose
-  via tails + offline Synapse checks, not client text. Element web had a client-side
-  "Joining..." hang even after server accepted (FluffyChat accept worked).
-- Canonical JSON maps undefined→null: never emit absent keys as undefined in PDUs.
-- Reference-hash IDs need `$` prefix (computeWireEventId adds it; bare hash is wrong).
-- Commit trailer only `Assisted-by: Hy4 Flash`; git commit foreground ~600s timeout.
-- wrangler deploy: run from repo dir, confirm "Current Version ID", probe live.
+Live validation (prod old code → dev new code): clean-room join + send
+**DELIVERED** — dev accepted (`processed_pdus accepted=1`) and dev's timeline
+shows both messages. Repro: `/tmp/fed-repro3.py` (waits for the join to land on
+prod before sending — see "known minor gap" below).
+
+### 3. Local member/state events never federated (fixed, needs prod deploy)
+Only the message path queued federation PDUs. Join/leave/kick/ban/unban/state
+PUTs (incl. profile member updates) were stored but never delivered, so the
+"leave + re-join" heal cannot work: the resident never receives the rejoin and
+rejects post-heal messages ("missing auth event type m.room.member"). Fixed in
+`9ebd7f5` via `federateLocalStateEventToRemotes` (same wire translation as the
+message path, destinations captured before membership rows mutate, kick/ban
+include the target's server; member invites via the state path route through
+the dedicated invite flow). Peer-suite regression covers leave→rejoin→message.
+
+## GNU/Linux live status (probed directly against matrix.org)
+- matrix.org does **NOT hold** recent codebam.ca messages (signed /event probe
+  → M_NOT_FOUND for the 21:40 message).
+- Their resolved state for @codebam:codebam.ca is **`invite`** — the 16:55 join
+  (pre-dating the ca886c09 auth-chain fix deploy) was outliered, so everything
+  since is "sender not in room" → silent drop.
+- The user has NOT done the leave+rejoin yet (no member events after 16:55).
+
+**Heal procedure (user action, after the prod deploy below):** from Element on
+codebam.ca, leave the GNU/Linux room, re-join it, send a message. With
+`9ebd7f5` the leave and rejoin actually federate; with `97d9422` a fresh join
+stores state under correct IDs. Verify from here: signed
+`GET /_matrix/federation/v1/event/{id}` against matrix-federation.matrix.org
+should 200 for the new message, and their /state should show membership=join.
+
+## Deploy state
+- dev (`wrangler.dev.jsonc`): **fully current** — `8c371499` (all fixes).
+- prod: ca886c09 + previous session's commits only. **PENDING (HITL): deploy
+  `97d9422` + `9ebd7f5` to prod**, then run the heal procedure above. The dev
+  repro already validated the receiver-side fixes; the prod deploy additionally
+  fixes prod's own joins to remote v10 rooms and the heal's member fanout.
+- Optional cleanup after prod verification: prod's KV/edge caches
+  (`federation:keys:dev.codebam.ca`, discovery) already expired naturally;
+  no seeded keys were left behind (no D1 key seeding was needed).
+
+## Known minor gaps (documented, not blocking)
+- **Join/send race:** the client /join returns 200 while RoomJoinWorkflow
+  completes make_join/send_join (~3-4s later). Messages a resident sends in
+  that window never fan out (dev wasn't a destination yet). Synapse blocks
+  until the handshake completes. Repro scripts now wait; a product fix would
+  make /join await the workflow or re-sweep recent events on send_join.
+- Repro artifacts: several `fed repro`/`fed clean repro` rooms on prod, plus
+  dev test rooms with pre-fix phantom state — harmless; fresh repros mint new
+  rooms.
+- Stale tails from earlier sessions were killed; fresh tails ran during this
+  session into `/tmp/tail-prod2.jsonl` / `/tmp/tail-dev2.jsonl` (now stopped).
+- Scripts: `/tmp/fed-repro3.py` (clean-room delivery), `/tmp/fed-repro2.py`
+  (poison+heal — the poison's live meaning changed: serve-time derivation
+  re-derives poisoned stored auth, so the rejection now comes from ID churn
+  and the in-process mock tests are the true poison coverage),
+  `/tmp/fedsign3.ts` (self-signed federation GET to any destination),
+  `/tmp/refhash-check.mjs` (offline v10/v11 refhash comparison),
+  `/tmp/parse-tails.py` (wrangler JSON tail parser).
