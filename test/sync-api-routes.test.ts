@@ -469,6 +469,43 @@ describe('GET /_matrix/client/v3/sync — empty baseline', () => {
     // Non-member state is untouched.
     expect(join.state.events.some((e) => e.type === 'm.room.name')).toBe(true);
   });
+
+  it('org.matrix.msc4222.use_state_after puts state_after INSIDE the timeline and keeps state', async () => {
+    getUserRooms.mockImplementation(async (_db: unknown, _userId: string, membership?: string) => {
+      if (membership === 'join') return [ROOM];
+      return [];
+    });
+    getEventsSince.mockResolvedValue([]);
+    getRoomState.mockResolvedValue([
+      { event_id: '$me', room_id: ROOM, sender: USER, type: 'm.room.member', state_key: USER, content: { membership: 'join' }, origin_server_ts: 1 } as PDU,
+      { event_id: '$name1', room_id: ROOM, sender: BOB, type: 'm.room.name', state_key: '', content: { name: 'The Room' }, origin_server_ts: 4 } as PDU,
+    ]);
+    const env = createEnv();
+    const { body } = await syncRequest(
+      env,
+      'org.matrix.msc4222.use_state_after=true'
+    );
+
+    const join = ((body.rooms as {
+      join: Record<string, {
+        state?: { events: unknown[] };
+        state_after?: { events: unknown[] };
+        timeline?: { events: unknown[]; state_after?: { events: Array<{ type: string; state_key?: string }> } };
+      }>;
+    }).join)[ROOM];
+    expect(join).toBeTruthy();
+    // The classic state section MUST survive: the previous implementation
+    // deleted it, leaving flag-using clients (Element Web) with stateless
+    // rooms rendered as "Empty room".
+    expect(join.state?.events).toBeTruthy();
+    expect(join.state!.events.length).toBeGreaterThan(0);
+    // And state_after lives under timeline per MSC4222 — never at room level.
+    expect(join.state_after).toBeUndefined();
+    expect(join.timeline?.state_after?.events).toBeTruthy();
+    const afterTypes = join.timeline!.state_after!.events.map((e) => e.type);
+    expect(afterTypes).toContain('m.room.name');
+    expect(afterTypes).toContain('m.room.member');
+  });
 });
 
 // ---------------------------------------------------------------------------

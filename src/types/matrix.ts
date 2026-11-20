@@ -258,14 +258,15 @@ export interface JoinedRoom {
   state?: {
     events: MatrixEvent[];
   };
-  // MSC4222: room state after the timeline window (current state).
-  state_after?: {
-    events: MatrixEvent[];
-  };
   timeline?: {
     events: MatrixEvent[];
     limited?: boolean;
     prev_batch?: string;
+    // MSC4222: room state after the timeline window (current state). The
+    // spec places this INSIDE the timeline object.
+    state_after?: {
+      events: MatrixEvent[];
+    };
   };
   ephemeral?: {
     events: EphemeralEvent[];

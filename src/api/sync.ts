@@ -574,15 +574,27 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     joinedRoom.timeline!.events = timelineEvents;
     joinedRoom.timeline!.prev_batch = sincePosition.toString();
 
-    // MSC4222 (opt-in via ?use_state_after=true): state_after replaces state
-    // and carries the room state at the end of the timeline window (i.e. the
-    // current state), so clients can render the latest state without
-    // re-applying the timeline themselves. Without the flag the legacy
-    // `state` section is kept byte-for-byte as before.
+    // MSC4222 (opt-in via ?org.matrix.msc4222.use_state_after=true): the room
+    // state AFTER the timeline window rides INSIDE the timeline object
+    // (rooms.join.<id>.timeline.state_after). A previous implementation
+    // deleted the room's `state` section and emitted a room-level
+    // `state_after` key that is not in the sync schema — clients requesting
+    // the flag (Element Web by default) received stateless rooms and
+    // rendered them as "Empty room" with a join prompt. The classic `state`
+    // section (state at the START of the timeline) is kept: non-opted-in
+    // clients are unchanged, and opted-in clients that still read `state`
+    // keep working.
     if (useStateAfter) {
-      delete joinedRoom.state;
-      const afterState = await getRoomState(c.env.DB, roomId);
-      joinedRoom.state_after = {
+      let afterState = await getRoomState(c.env.DB, roomId);
+      if (filter?.room?.state?.lazy_load_members) {
+        const afterSenders = new Set(timelineEvents.map(e => e.sender));
+        afterSenders.add(userId);
+        afterState = afterState.filter(e => {
+          if (e.type !== 'm.room.member') return true;
+          return e.state_key !== undefined && afterSenders.has(e.state_key);
+        });
+      }
+      joinedRoom.timeline!.state_after = {
         events: afterState.map((e) => ({
           type: e.type,
           state_key: e.state_key,
@@ -593,9 +605,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
           room_id: e.room_id,
         })),
       };
-    } else {
-      joinedRoom.state!.events = stateEvents;
     }
+    joinedRoom.state!.events = stateEvents;
 
     // Get room-level account data
     let roomAccountData = await getRoomAccountData(
@@ -722,7 +733,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     const room = response.rooms!.join![roomId];
     return room.timeline!.events.length > 0
       || (room.state?.events.length ?? 0) > 0
-      || (room.state_after?.events.length ?? 0) > 0;
+      || (room.timeline?.state_after?.events.length ?? 0) > 0;
   });
   const hasInvites = Object.keys(response.rooms!.invite!).length > 0;
   const hasLeaves = Object.keys(response.rooms!.leave!).length > 0;

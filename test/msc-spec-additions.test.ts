@@ -317,7 +317,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('MSC4222 state_after in /sync', () => {
-  it('use_state_after=true replaces state with the current state in state_after', async () => {
+  it('use_state_after=true puts current state in timeline.state_after and keeps state', async () => {
     getUserRooms.mockImplementation(async (_db: unknown, _u: string, m?: string) =>
       m === 'join' ? [ROOM] : []
     );
@@ -332,9 +332,13 @@ describe('MSC4222 state_after in /sync', () => {
     );
     const body = await json(res);
     const joined = body.rooms.join[ROOM];
-    expect(joined.state).toBeUndefined();
-    expect(joined.state_after.events.map((e: any) => e.event_id)).toEqual(['$name-new']);
-    expect(joined.state_after.events[0].content).toEqual({ name: 'New' });
+    // MSC4222 places state_after INSIDE the timeline object. The classic
+    // `state` section must survive: deleting it left flag-using clients
+    // (Element Web) with stateless rooms rendered as "Empty room".
+    expect(joined.state.events.map((e: any) => e.event_id)).toContain('$name-new');
+    expect(joined.state_after).toBeUndefined();
+    expect(joined.timeline.state_after.events.map((e: any) => e.event_id)).toEqual(['$name-new']);
+    expect(joined.timeline.state_after.events[0].content).toEqual({ name: 'New' });
   });
 
   it('accepts the unstable org.matrix.msc4222.use_state_after param (Element web)', async () => {
@@ -352,8 +356,9 @@ describe('MSC4222 state_after in /sync', () => {
     );
     const body = await json(res);
     const joined = body.rooms.join[ROOM];
-    expect(joined.state).toBeUndefined();
-    expect(joined.state_after.events.map((e: any) => e.event_id)).toEqual(['$name-new']);
+    expect(joined.state.events.map((e: any) => e.event_id)).toContain('$name-new');
+    expect(joined.state_after).toBeUndefined();
+    expect(joined.timeline.state_after.events.map((e: any) => e.event_id)).toEqual(['$name-new']);
   });
 
   it('without the flag the legacy state section is kept and no extra state load happens', async () => {
