@@ -418,3 +418,34 @@ Server-state verification baseline for this account (useful for future
 debugging): initial /sync serves 5 joined rooms with own membership + names
 (GNU/Linux, codebam_live/linux_chat ops room, Nix / NixOS, Jovian
 Experiments, one small local room); sliding sync probe identical.
+
+## Element Web "Empty room" + hung verification — full chain (2026-11-20, session 8 cont.)
+Three stacked bugs, all found by replaying the client's EXACT requests:
+- **MSC4222 state_after was misplaced** (2168d5b/932171b, prod 8f4fd5b8): our
+  sync deleted the room's `state` section and emitted a room-LEVEL
+  `state_after` key that is not in the schema. Element Web sends
+  org.matrix.msc4222.use_state_after=true on EVERY sync, so it received
+  stateless rooms and rendered them as "Empty room / Join the discussion"
+  on every fresh login. Probes WITHOUT the flag looked perfect — the
+  debugging trap that hid this for a whole session. state_after now rides
+  under timeline.state_after (spec placement), lazy-filtered, and the
+  classic state section survives. Verified live with the exact client
+  request shape: all 5 rooms with own membership + names + state_after
+  correctly placed.
+- **Device/presence EDU fanout stalled key uploads** (79ba2fa, prod
+  12552084): every POST /keys/upload queued m.device_list_update to every
+  server sharing ANY room with the user, one sequential DO call each —
+  joining a 4,000-member public channel added ~1,000 destinations, so
+  uploads ran for minutes, clients aborted at 30s and retried forever, and
+  the OTK branch (after the fanout) never executed. Live-observed: 8
+  uploads, zero OTKs, SAS request/ready/accept then cancel with zero
+  /keys/claim (no device could open an Olm session to the new login).
+  Device-list EDUs now go ONLY to servers sharing an ENCRYPTED room (new
+  getServersInEncryptedRoomsWithUser), parallel, capped at 100; presence
+  fanout (all shared-room servers is spec-correct) is parallel + capped
+  with per-destination warn. After deploy: the user's web device
+  spontaneously completed its upload — 51 OTKs stored.
+- Sequence for debugging E2EE/SAS hangs: check D1 one_time_keys for the
+  device (sync counts read D1; claim reads KV otk:<user>:<device>), then
+  tail for keys/upload completions ("--> ... 200" lines) — requests that
+  arrive but never complete are client-canceled long-running invocations.
