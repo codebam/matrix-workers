@@ -153,8 +153,9 @@ applied to both, additive-only).
   static import cycles).
 - Live-validated on dev: create+join, !admin status/token mint, webhook
   403/200, TG→Matrix in-room relay, Matrix→TG attempt.
-- Setup on prod: login as @codebam for an admin token; create a local
-  management room; `POST /admin/api/bots {localpart:"adminbot", room_id}`;
-  type `!admin help`. Telegram: BotFather /newbot, message the bot once,
-  chat id via @userinfobot (private chats) or the group's id, then
-  `POST /admin/api/telegram/bridges`.
+- Setup on prod (DONE 2026-11-20): management room
+  `!K8i7iW7ofA1apMUCfUnuBGyh:codebam.ca` (alias **#linux_chat:codebam.ca**,
+  moved from the GNU/Linux room at the user's request), `@adminbot:codebam.ca`
+  created and joined via invite auto-accept, `!admin help` verified live.
+  Remaining: run `scripts/telegram-bridge-setup.sh` (local, gitignored by the
+  *.sh policy) with a BotFather token + chat id to light up the Telegram side.
