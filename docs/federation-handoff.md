@@ -449,3 +449,39 @@ Three stacked bugs, all found by replaying the client's EXACT requests:
   device (sync counts read D1; claim reads KV otk:<user>:<device>), then
   tail for keys/upload completions ("--> ... 200" lines) — requests that
   arrive but never complete are client-canceled long-running invocations.
+
+## FluffyChat Web sign-in crash (2026-11-20, session 9)
+"TypeError: null: type 'minified:W6' is not a subtype of type String" at
+fluffychat.im/web sign-in. Reproduced by driving the app in a browser with
+HAR capture; console showed "Starting Matrix Native OIDC Flow..." then the
+crash, right after POST /oauth/register returned 201.
+
+Root cause (read from matrix-dart-sdk's msc_2966 registration parser):
+OidcClientInformation.fromJson hard-casts json['client_uri'] to String. Our
+registration response dropped the metadata URIs the client sent
+(client_uri, logo_uri, tos_uri, policy_uri) — RFC 7591 §3.2.1 says the
+response echoes registered metadata. Fixed in ee1e1b0 (prod d5e94d7d);
+the response now echoes every metadata field we accept.
+
+Adjacent OIDC completeness fixes shipped in the same session
+(45092fd + ee1e1b0):
+- auth_metadata now carries the full OIDC discovery field set
+  (jwks_uri, subject_types_supported, id_token_signing_alg_values_supported
+  = ES256, userinfo/introspection endpoints, claims).
+- /oauth/token mints signed id_tokens (ES256, ECDSA P-256) for
+  authorization_code exchanges with openid scope: iss/sub/aud/exp/iat/nonce
+  + profile claims per granted scopes. Key is generated on first use and
+  stored in server_keys as key_version 3 (a prod key was pre-seeded so the
+  JWKS is live before the first token exchange).
+- /.well-known/jwks.json served an EMPTY key set (self-described
+  placeholder); it now publishes the ES256 public key (kty EC, P-256).
+- Discovery/auth metadata advertise ONLY ES256 (previously claimed RS256 we
+  cannot sign — strict clients could pick an algorithm we can't produce).
+- id_token minting is best-effort: key failures log and the token exchange
+  proceeds without the id_token.
+
+Verification: browser-driven FluffyChat flow now reaches our
+/oauth/authorize login form (username/password page). The remaining step —
+submitting credentials and completing the code+PKCE exchange — needs the
+user's password; if the dart SDK rejects the id_token at the final step,
+check kid against the JWKS and the nonce pass-through first.
