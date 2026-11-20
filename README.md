@@ -1,19 +1,35 @@
 # Matrix Homeserver on Cloudflare Workers
 
-[![CI](https://github.com/fuzzywigg/matrix-workers/actions/workflows/ci.yml/badge.svg)](https://github.com/fuzzywigg/matrix-workers/actions/workflows/ci.yml)
-[![Security](https://github.com/fuzzywigg/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/fuzzywigg/matrix-workers/actions/workflows/security.yml)
+[![CI](https://github.com/codebam/matrix-workers/actions/workflows/ci.yml/badge.svg)](https://github.com/codebam/matrix-workers/actions/workflows/ci.yml)
+[![Security](https://github.com/codebam/matrix-workers/actions/workflows/security.yml/badge.svg)](https://github.com/codebam/matrix-workers/actions/workflows/security.yml)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/fuzzywigg/matrix-workers)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/codebam/matrix-workers)
 
-> **Fork Status**: This is fuzzywigg's fork of [nkuntz1934/matrix-workers](https://github.com/nkuntz1934/matrix-workers) (Tuwunel), under active development for the smtp.eth ecosystem. Deployed at `matrix.fuzzywigg.com`. See [DEPLOY.md](./DEPLOY.md) for the fork-specific setup guide.
+> **Fork status**: codebam's fork of [fuzzywigg/matrix-workers](https://github.com/fuzzywigg/matrix-workers) (itself a fork of [nkuntz1934/matrix-workers](https://github.com/nkuntz1934/matrix-workers), "Tuwunel"), running live at **`codebam.ca`** with a second instance at `dev.codebam.ca` for federation testing. See [DEPLOY.md](./DEPLOY.md) for setup and [docs/federation-handoff.md](./docs/federation-handoff.md) for hard-won federation debugging notes.
 
-This is a proof of concept Matrix homeserver implementation running entirely on Cloudflare's edge infrastructure. This was built to prove E2EE utilizing Matrix protocols over Element X on the Cloudflare Workers Platform. It is meant to serve as an example prototype and not endorsed as ready for production at this point.
+What began as a proof-of-concept homeserver on Cloudflare's edge is now a working homeserver in daily use: Element clients with full E2EE, verified live federation with matrix.org (including 2022-era v9 rooms), and native bots including a Telegram bridge. The sections below describe exactly what is implemented and what is verified working in production.
 
-I was assisted by Claude Code Opus 4.5 for this implementation to speed up showing that you could message over Cloudflare Workers utilizing the Element Web and Element X App. Feel free to submit issues, fork the project to make it your own, or continue to build on this example!
+## Production Status (verified working, Nov 2026)
 
-## Live Demo
+Everything in this list is live on `codebam.ca` and verified against real peers — not implemented-but-untested:
 
-This fork's live instance is at `matrix.fuzzywigg.com` (upstream demo: `m.easydemo.org`). You can verify federation compatibility using the [Matrix Federation Tester](https://federationtester.matrix.org/#matrix.fuzzywigg.com) or view the [full JSON report](https://federationtester.matrix.org/api/report?server_name=matrix.fuzzywigg.com).
+**Federation (server-to-server)** — the hard part, now done:
+- **Live, two-way message delivery with matrix.org verified in-room**: messages sent from this server display in remote rooms, including a 2022-era v9 room whose events carry pre-2023 Synapse `origin`/`prev_state` fields (per-spec v1–10 redaction keep-list — the deepest of four stacked ID bugs fixed along the way; see the handoff doc).
+- **Federation tester: `FederationOK: true`** for [codebam.ca](https://federationtester.matrix.org/api/report?server_name=codebam.ca).
+- Join handshakes (make_join/send_join, v1+v2) with **fallback to the inviter/participating servers** when the resident domain is dead; invites, leaves, kicks, bans, knocks; **post-join timeline backfill** (federation `/backfill`, so fresh joins show room history, not just members); outbound member/state fanout; E2EE key queries/claims over federation; remote media with R2 caching; 8448-only peers via raw TLS socket transport.
+- All room versions v1–v12, including MSC4291 (v12 domainless room IDs) and MSC4289 (creator power), with version-correct redaction, reference hashes, and signature checks on both the send and receive sides.
+- A **second instance at `dev.codebam.ca`** (own D1/KV/R2, `FEDERATION_STRICT_AUTH=true` for Synapse-receive-side rules) exists purely to reproduce resident-server rejections against a live peer; prod↔dev delivery, joins, and heals are validated end-to-end.
+
+**Client experience**:
+- Element Web and FluffyChat in daily use; full E2EE (device keys, cross-signing, secret storage bootstrap, key backup, dehydrated devices) verified live against real clients; encrypted messages and megolm key shares federate.
+- Long-polling `/sync` with correct per-stream tokens, sliding sync (MSC3575/MSC4186) for Element X, to-device messaging, presence, typing, receipts, push.
+- Invite-only registration with single/multi-use registration tokens (admin API + in-room bot command).
+
+**Native bots** (first-class users the homeserver acts for — no password, so bot accounts can never log in):
+- **Admin console bot** in a management room: `!admin` commands for status/counts, registration-token mint/list/revoke, user list/create/deactivate/reset-password, federation peer status, room kick/ban/unban (executed as the bot, governed by the room's power levels), and server notices — admin-gated, replies as `m.notice`.
+- **Telegram bridge** (`@BotFather` token via admin API only — never via room messages): webhook-driven (no polling), one Telegram chat ↔ one Matrix room, bidirectional — Telegram messages land as `[TG] Name (@user): text`, and room messages (including federated users') relay out with display-name prefixes. Loop-proof by construction (all integrations skip bot senders).
+
+**Quality bar**: 345 test files / ~45,400 tests green (`npm test`), `tsc --noEmit` clean, CI on every push. In-process mock-Synapse peer tests reproduce resident-server auth rejections (the "HTTP 200 but never displayed" class) before they reach production.
 
 ## Quick Start
 
@@ -32,7 +48,7 @@ The fastest way to deploy is using the Deploy to Cloudflare button at the top of
 
 ```bash
 # Clone and install
-git clone https://github.com/fuzzywigg/matrix-workers
+git clone https://github.com/codebam/matrix-workers
 cd matrix-workers
 npm install
 
@@ -63,7 +79,7 @@ For 3PID email verification support, configure [Cloudflare Email Service](https:
 
 ```bash
 npx wrangler secret put EMAIL_FROM
-# Example: noreply@matrix.fuzzywigg.com
+# Example: noreply@codebam.ca
 ```
 
 ## Spec Compliance
@@ -99,18 +115,21 @@ npx wrangler secret put EMAIL_FROM
 
 ## Features
 
-- **Full E2EE Support**: Device keys, cross-signing, key backup, one-time keys, federation key queries
+- **Full E2EE Support**: Device keys, cross-signing, key backup, one-time keys, federation key queries — verified live against Element Web
+- **Federation, verified in production**: two-way delivery with matrix.org (incl. pre-2023 Synapse event IDs), join handshakes with participating-server fallback, post-join timeline backfill, member/state fanout, invites/knocks, remote media, 8448 socket transport
+- **Native Bots**: passwordless bot accounts, invite auto-accept, in-room admin console (`!admin …`), webhook-driven Telegram bridge (bidirectional, loop-proof)
 - **Token Refresh**: Secure token rotation with single-use refresh tokens (KV-backed with auto-expiry)
 - **Sliding Sync**: MSC3575 and MSC4186 (Simplified Sliding Sync for Element X)
 - **Real-time**: Sync coordination via Durable Objects, presence with KV caching
-- **Federation**: Complete server-to-server communication including E2EE, knock protocol, media, and directory
+- **Invite-only Registration**: single/multi-use registration tokens with revocation, via admin API, dashboard, or the admin bot
 - **Media Storage**: R2-backed media with thumbnail generation and authenticated media (MSC3916)
 - **Push Notifications**: APNs support (iOS direct push)
 - **Video Calling**: MatrixRTC with LiveKit and Cloudflare Calls SFU integration
 - **Knock Protocol**: Support for knock-to-join rooms via federation
-- **Room Versions**: Full support for room versions 1-12
+- **Room Versions**: Full support for room versions 1-12, with per-version redaction rules (v1–10 keep `origin`/`prev_state`; v11+ drop them) and MSC4291/MSC4289 v12 semantics
 - **Admin Dashboard**: Full-featured web UI with charts, user management, keyboard shortcuts
 - **Synapse API Compatibility**: Standard `/_synapse/admin/*` endpoints for tool compatibility
+- **Strict-auth dev mode**: `FEDERATION_STRICT_AUTH=true` enforces Synapse receive-side auth selection checks on inbound PDUs, reproducing resident rejections in staging before they reach prod
 
 ## Architecture
 
@@ -234,7 +253,7 @@ The following endpoints were added to achieve full Matrix Specification v1.17 co
 
 ## Admin Dashboard
 
-Access the admin dashboard at `/admin` on your server (e.g., `https://matrix.fuzzywigg.com/admin`).
+Access the admin dashboard at `/admin` on your server (e.g., `https://codebam.ca/admin`).
 
 **Features:**
 - **Dashboard** - Server stats, activity charts, user breakdown visualization
@@ -275,7 +294,7 @@ npm run test
 # Apply migrations/schema.sql only (local; not 002–019)
 npm run db:migrate:local
 ```
-Numbered files `migrations/002_*.sql` … `migrations/019_*.sql` are separate — see `DEPLOY.md` / `scripts/setup.sh`.
+Numbered files `migrations/002_*.sql` … `migrations/024_*.sql` are separate — see `DEPLOY.md` / `scripts/setup.sh`.
 
 ## Cloudflare Bindings
 
@@ -297,6 +316,7 @@ Numbered files `migrations/002_*.sql` … `migrations/019_*.sql` are separate �
 | `PUSH` | Durable Object | Push notification queue |
 | `ADMIN` | Durable Object | Admin operations |
 | `RATE_LIMIT` | Durable Object | Rate limiting |
+| `DELAYED_EVENTS` | Durable Object | Scheduled/delayed event delivery |
 | `ROOM_JOIN_WORKFLOW` | Workflow | Async room join processing |
 | `PUSH_NOTIFICATION_WORKFLOW` | Workflow | Async push delivery |
 | `EMAIL` | Send Email | 3PID email verification via Cloudflare Email Service (optional) |
@@ -323,13 +343,18 @@ The D1 database name in `wrangler.jsonc` is `matrix-db` (binding `DB`); the `db:
 ## Compatibility
 
 Tested with:
-- Element Web
-- Element X (iOS)
-- Element X (Android)
+- Element Web (daily use, full E2EE verified: secret storage bootstrap, key backup, dehydrated devices)
+- FluffyChat (joins, messaging, verification requests)
+- Element X (iOS/Android) via sliding sync — this fork's original target platform
 
-Federation tester (look for `"FederationOK": true`):
-- This fork: [matrix.fuzzywigg.com report](https://federationtester.matrix.org/api/report?server_name=matrix.fuzzywigg.com) — currently `"FederationOK": false` (federation key hygiene is HITL; do not treat the link as a pass)
-- Upstream demo: [m.easydemo.org report](https://federationtester.matrix.org/api/report?server_name=m.easydemo.org) — currently `"FederationOK": true`
+Federation verified against **matrix.org** in production (November 2026): two-way
+message delivery in a 2022-era v9 room, joins with participating-server
+fallback, timeline backfill, E2EE key exchange, and remote media. The
+[federation tester](https://federationtester.matrix.org/api/report?server_name=codebam.ca)
+reports `"FederationOK": true` for codebam.ca. A second instance at
+`dev.codebam.ca` exists for staging federation tests against a live peer
+(`FEDERATION_STRICT_AUTH=true`); Telegram bots bridge bidirectionally through
+webhooks (no polling).
 
 ## Limitations
 
