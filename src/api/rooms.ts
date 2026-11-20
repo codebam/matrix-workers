@@ -26,7 +26,6 @@ import {
   tryInsertJoinMembership,
   getMembership,
   getUserRooms,
-  getRoomMembers,
   createRoomAlias,
   getRoomByAlias,
   deleteRoomAlias,
@@ -1359,6 +1358,8 @@ app.put('/_matrix/client/v3/rooms/:roomId/state/:eventType/', requireAuth(), put
 app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
+  const membershipFilter = c.req.query('membership');
+  const notMembershipFilter = c.req.query('not_membership');
 
   // Check membership
   const membership = await getMembership(c.env.DB, roomId, userId);
@@ -1366,26 +1367,47 @@ app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => 
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  const members = await getRoomMembers(c.env.DB, roomId);
+  // One round trip for all current member events. A per-member getStateEvent
+  // loop broke on big rooms (a 4,000-member room = 4,000 D1 subrequests in
+  // one invocation → 500s), and lazy_load_members clients (Element Web
+  // default) call this endpoint on demand for every room they render.
+  const rows = await c.env.DB.prepare(
+    `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, e.origin_server_ts, e.unsigned
+     FROM room_state rs JOIN events e ON rs.event_id = e.event_id
+     WHERE rs.room_id = ? AND rs.event_type = 'm.room.member'`
+  ).bind(roomId).all<{
+    event_id: string;
+    room_id: string;
+    sender: string;
+    event_type: string;
+    state_key: string | null;
+    content: string;
+    origin_server_ts: number;
+    unsigned: string | null;
+  }>();
 
-  // Get full member events - OPTIMIZED: fetch in parallel instead of sequential
-  const events = await Promise.all(
-    members.map(member =>
-      getStateEvent(c.env.DB, roomId, 'm.room.member', member.userId)
-    )
-  );
-
-  const memberEvents = events
-    .filter((event): event is NonNullable<typeof event> => event !== null && event !== undefined)
-    .map(event => ({
-      type: event.type,
-      state_key: event.state_key,
-      content: event.content,
-      sender: event.sender,
-      origin_server_ts: event.origin_server_ts,
-      event_id: event.event_id,
-      room_id: event.room_id,
-    }));
+  const memberEvents = [];
+  for (const row of rows.results ?? []) {
+    let content: unknown;
+    try {
+      content = JSON.parse(row.content);
+    } catch {
+      continue;
+    }
+    const m = (content as { membership?: string }).membership;
+    if (membershipFilter && m !== membershipFilter) continue;
+    if (notMembershipFilter && m === notMembershipFilter) continue;
+    memberEvents.push({
+      type: row.event_type,
+      state_key: row.state_key ?? undefined,
+      content,
+      sender: row.sender,
+      origin_server_ts: row.origin_server_ts,
+      event_id: row.event_id,
+      room_id: row.room_id,
+      unsigned: row.unsigned ? JSON.parse(row.unsigned) : undefined,
+    });
+  }
 
   return c.json({ chunk: memberEvents });
 });

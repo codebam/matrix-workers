@@ -125,6 +125,16 @@ type DbOpts = {
   contextBefore?: Array<Record<string, unknown>>;
   contextAfter?: Array<Record<string, unknown>>;
   tsEvents?: Array<{ event_id: string; origin_server_ts: number; room_id: string }>;
+  memberStateRows?: Array<{
+    event_id: string;
+    room_id: string;
+    sender: string;
+    event_type: string;
+    state_key: string | null;
+    content: string;
+    origin_server_ts: number;
+    unsigned: string | null;
+  }>;
   lastEvent?: { event_id: string; depth: number } | null;
 };
 
@@ -135,6 +145,7 @@ function createSqlDb(opts: DbOpts = {}) {
   const aliasRows = opts.aliasRows ?? [];
   const roomRows = opts.roomRows ?? [];
   const summaryState = opts.summaryState ?? [];
+  const memberStateRows = opts.memberStateRows ?? [];
   const memberCount = opts.memberCount ?? 0;
   const accessTokens = opts.accessTokens ?? [];
   const tokenMembership = opts.tokenMembership ?? null;
@@ -248,6 +259,12 @@ function createSqlDb(opts: DbOpts = {}) {
 
             async all<T>() {
               selects.push({ sql, args });
+
+              if (
+                sql.includes("rs.event_type = 'm.room.member'")
+              ) {
+                return { results: memberStateRows as T[] };
+              }
 
               if (
                 sql.includes('SELECT e.event_type, e.content FROM room_state') ||
@@ -1098,30 +1115,23 @@ describe('state / members / messages / send leftovers', () => {
     expect(bumpRoomCacheGeneration).not.toHaveBeenCalled();
   });
 
-  it('members filters out null state events from parallel fetch', async () => {
+  it('members serves current member state in one query and skips broken rows', async () => {
     getMembership.mockResolvedValue(joinMembership());
-    getRoomMembers.mockResolvedValue([
-      { userId: USER, membership: 'join' },
-      { userId: BOB, membership: 'join' },
-      { userId: CAROL, membership: 'leave' },
-    ]);
-    getStateEvent.mockImplementation(async (_db, _room, type: string, stateKey = '') => {
-      if (type === 'm.room.member' && stateKey === BOB) return null;
-      if (type === 'm.room.member') {
-        return pdu({
-          type: 'm.room.member',
-          event_id: `$m-${stateKey}`,
-          state_key: stateKey,
-          content: { membership: 'join' },
-          sender: stateKey,
-        });
-      }
-      return null;
+    const db = createSqlDb({
+      memberStateRows: [
+        { event_id: '$m-alice', room_id: ROOM, sender: USER, event_type: 'm.room.member', state_key: USER, content: JSON.stringify({ membership: 'join' }), origin_server_ts: 1, unsigned: null },
+        { event_id: '$m-broken', room_id: ROOM, sender: CAROL, event_type: 'm.room.member', state_key: CAROL, content: '{"membership":', origin_server_ts: 2, unsigned: null },
+      ],
     });
-    const { status, body } = await request(`/_matrix/client/v3/rooms/${ROOM_ENC}/members`);
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/members`,
+      {},
+      db
+    );
     expect(status).toBe(200);
     const chunk = (body as { chunk: Array<{ state_key: string }> }).chunk;
-    expect(chunk.map((e) => e.state_key).sort()).toEqual([CAROL, USER].sort());
+    // Unparseable member rows are skipped; the rest serve from one query.
+    expect(chunk.map((e) => e.state_key)).toEqual([USER]);
   });
 
   it('messages defaults dir=b and limit=10; NaN limit becomes NaN-capped path', async () => {

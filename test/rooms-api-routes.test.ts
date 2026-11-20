@@ -143,7 +143,16 @@ type DbOpts = {
   lastEvent?: { event_id: string; depth: number } | null;
   remoteJoinedUserIds?: Array<string>;
   remoteTip?: { event_id: string; depth: number } | null;
-  stateRows?: Array<{ event_id: string; event_type: string; state_key: string | null }>;
+  stateRows?: Array<{
+    event_id: string;
+    event_type: string;
+    state_key: string | null;
+    room_id?: string;
+    sender?: string;
+    content?: string;
+    origin_server_ts?: number;
+    unsigned?: string | null;
+  }>;
 };
 
 function createSqlDb(opts: DbOpts = {}) {
@@ -1753,32 +1762,39 @@ describe('GET members / messages / event / send', () => {
     expect(status).toBe(403);
   });
 
-  it('members: returns member event chunk', async () => {
+  it('members: returns member event chunk from one room_state query', async () => {
     getMembership.mockResolvedValue(joinMembership());
-    getRoomMembers.mockResolvedValue([
-      { userId: USER, displayName: 'A', avatarUrl: null },
-      { userId: BOB, displayName: null, avatarUrl: null },
-    ]);
-    getStateEvent.mockImplementation(async (_db, _room, type, stateKey = '') => {
-      if (type !== 'm.room.member') return null;
-      return pdu({
-        type: 'm.room.member',
-        event_id: `$m-${stateKey}`,
-        state_key: stateKey,
-        sender: stateKey,
-        content: { membership: 'join' },
-      });
+    const db = createSqlDb({
+      stateRows: [
+        { event_id: '$m-alice', event_type: 'm.room.member', state_key: USER, room_id: ROOM, sender: USER, content: JSON.stringify({ membership: 'join' }), origin_server_ts: 1 },
+        { event_id: '$m-bob', event_type: 'm.room.member', state_key: BOB, room_id: ROOM, sender: BOB, content: JSON.stringify({ membership: 'join' }), origin_server_ts: 2 },
+        { event_id: '$m-carol', event_type: 'm.room.member', state_key: '@carol:example.com', room_id: ROOM, sender: '@carol:example.com', content: JSON.stringify({ membership: 'leave' }), origin_server_ts: 3 },
+      ],
     });
     const { status, body } = await request(
-      `/_matrix/client/v3/rooms/${ROOM_ENC}/members`
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/members`,
+      {},
+      db
     );
     expect(status).toBe(200);
     expect(body).toMatchObject({
       chunk: expect.arrayContaining([
         expect.objectContaining({ state_key: USER }),
         expect.objectContaining({ state_key: BOB }),
+        expect.objectContaining({ state_key: '@carol:example.com' }),
       ]),
     });
+
+    // Lazy-loading clients (Element Web default) filter to current joins.
+    const { body: filtered } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/members?membership=join&not_membership=leave`,
+      {},
+      db
+    );
+    const keys = ((filtered as { chunk: Array<{ state_key: string }> }).chunk).map((e) => e.state_key);
+    expect(keys).toContain(USER);
+    expect(keys).toContain(BOB);
+    expect(keys).not.toContain('@carol:example.com');
   });
 
   it('messages: forbids non-members', async () => {
