@@ -696,6 +696,40 @@ async function resolveRemoteAlias(
 }
 
 // POST /_matrix/client/v3/rooms/:roomId/join - Join a room
+// Fallback join candidates: the room-ID domain may be dead or serving a
+// broken federation endpoint while other residents are fine. Synapse tries
+// the inviter's server and other participating servers; so do we. Sources:
+// the invite event's sender (invite-accepts) and currently-joined remote
+// members. Never includes the local server; deduplicated.
+export async function joinFallbackServers(
+  db: D1Database,
+  roomId: string,
+  localServerName: string,
+  inviteEventId?: string
+): Promise<string[]> {
+  const out: string[] = [];
+  const seen = new Set<string>([localServerName]);
+  const add = (s?: string): void => {
+    if (!s || seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+  try {
+    if (inviteEventId) {
+      const inv = await db
+        .prepare(`SELECT sender FROM events WHERE event_id = ?`)
+        .bind(inviteEventId)
+        .first<{ sender: string }>();
+      const sender = inv?.sender;
+      if (sender && sender.includes(':')) add(sender.slice(sender.indexOf(':') + 1));
+    }
+  } catch {
+    // Best-effort candidate only.
+  }
+  for (const s of await getJoinedRemoteServers(db, roomId, localServerName)) add(s);
+  return out;
+}
+
 app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
@@ -724,7 +758,13 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
 
     if (!room) await ensureRemoteRoomRow(c.env.DB, roomId, userId);
 
-    // Trigger the RoomJoinWorkflow for durable federation handling
+    // Trigger the RoomJoinWorkflow for durable federation handling. The
+    // room-ID domain is tried first, with the inviter's server and other
+    // participating servers as fallbacks (the resident domain can be dead
+    // while the inviter happily serves make_join).
+    const fallbackServers = await joinFallbackServers(
+      c.env.DB, roomId, c.env.SERVER_NAME, localMembership?.eventId
+    );
     const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
       params: {
         roomId,
@@ -732,6 +772,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
         isRemote: true,
         remoteServer: roomServer,
         backfill: true,
+        servers: fallbackServers,
       },
     });
 
@@ -2670,8 +2711,14 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
     const mem = room ? await getMembership(db, roomId, userId) : null;
     if (!mem || mem.membership === 'invite' || mem.membership === 'leave') {
       if (!room) await ensureRemoteRoomRow(db, roomId, userId);
+      // Fallback join candidates beyond the resident/alias servers: the
+      // inviter's server and other participating servers (the resident domain
+      // can be dead while they serve make_join fine).
+      const fallbackServers = await joinFallbackServers(
+        db, roomId, c.env.SERVER_NAME, mem?.eventId
+      );
       const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
-        params: { roomId, userId, isRemote: true, remoteServer: residentServer, servers: aliasServers ?? undefined, backfill: true },
+        params: { roomId, userId, isRemote: true, remoteServer: residentServer, servers: [...(aliasServers ?? []), ...fallbackServers], backfill: true },
       });
       try {
         const status = await instance.status();
