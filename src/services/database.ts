@@ -973,6 +973,36 @@ export async function getServersInRoomsWithUser(db: D1Database, userId: string):
     .filter((s): s is string => s !== null);
 }
 
+/**
+ * Servers that actually NEED this user's device list: those sharing an
+ * ENCRYPTED room with them (m.room.encryption in current state). Device-list
+ * EDUs only matter where Olm/Megolm sessions exist; fanning them to every
+ * server of every plaintext room turns one key upload into thousands of
+ * sequential Durable-Object round trips (a single 4,000-member public
+ * channel contributes ~1,000 destinations), so clients abort the upload and
+ * retry forever and one-time keys never reach the server.
+ */
+export async function getServersInEncryptedRoomsWithUser(db: D1Database, userId: string): Promise<string[]> {
+  const result = await db.prepare(`
+    SELECT DISTINCT
+      CASE
+        WHEN INSTR(rm2.user_id, ':') > 0 THEN SUBSTR(rm2.user_id, INSTR(rm2.user_id, ':') + 1)
+        ELSE NULL
+      END as server_name
+    FROM room_memberships rm1
+    JOIN room_state rs ON rs.room_id = rm1.room_id AND rs.event_type = 'm.room.encryption'
+    JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
+    WHERE rm1.user_id = ?
+      AND rm1.membership = 'join'
+      AND rm2.membership = 'join'
+      AND rm2.user_id != ?
+  `).bind(userId, userId).all<{ server_name: string | null }>();
+
+  return result.results
+    .map(r => r.server_name)
+    .filter((s): s is string => s !== null);
+}
+
 // Notify all room members' SyncDurableObjects when a new event is stored
 // This wakes up any long-polling sync requests waiting for events
 export async function notifyUsersOfEvent(

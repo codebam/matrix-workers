@@ -144,29 +144,39 @@ export async function queueDeviceListUpdateEdus(
   opts: { deleted: boolean; keys?: unknown; displayName?: string | null }
 ): Promise<void> {
   try {
-    const { getServersInRoomsWithUser } = await import('../services/database');
-    const remoteServers = await getServersInRoomsWithUser(env.DB, userId);
-    const uniqueServers = [...new Set(remoteServers)].filter((s) => s !== env.SERVER_NAME);
+    // Only servers sharing an ENCRYPTED room need this user's device list —
+    // see getServersInEncryptedRoomsWithUser. Dispatching in parallel with a
+    // hard cap keeps a key upload bounded no matter how big the account's
+    // plaintext rooms are (previously: sequential DO calls to every server
+    // in every room, so a fresh login on a big-room account timed out and
+    // its one-time keys were never stored).
+    const { getServersInEncryptedRoomsWithUser } = await import('../services/database');
+    const remoteServers = await getServersInEncryptedRoomsWithUser(env.DB, userId);
+    const uniqueServers = [...new Set(remoteServers)]
+      .filter((s) => s !== env.SERVER_NAME)
+      .slice(0, 100);
 
-    for (const server of uniqueServers) {
-      const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(server));
-      await fedDO.fetch(new Request('http://internal/send-edu', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          destination: server,
-          edu_type: 'm.device_list_update',
-          content: {
-            user_id: userId,
-            device_id: deviceId,
-            device_display_name: opts.displayName,
-            stream_id: Date.now(),
-            keys: opts.keys,
-            deleted: opts.deleted,
-          },
-        }),
-      }));
-    }
+    await Promise.allSettled(
+      uniqueServers.map((server) => {
+        const fedDO = env.FEDERATION.get(env.FEDERATION.idFromName(server));
+        return fedDO.fetch(new Request('http://internal/send-edu', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            destination: server,
+            edu_type: 'm.device_list_update',
+            content: {
+              user_id: userId,
+              device_id: deviceId,
+              device_display_name: opts.displayName,
+              stream_id: Date.now(),
+              keys: opts.keys,
+              deleted: opts.deleted,
+            },
+          }),
+        }));
+      })
+    );
   } catch (fedErr) {
     console.warn('[keys] Failed to queue device list EDUs:', fedErr);
   }

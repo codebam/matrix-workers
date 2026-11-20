@@ -591,8 +591,10 @@ describe('presence leftovers federation membership filter', () => {
     expect(env._db.inserts).toHaveLength(1);
     expect(env._cache.puts).toHaveLength(1);
     expect(console.warn).toHaveBeenCalled();
-    // Only first destination attempted before throw aborts the loop
-    expect(failStub.fetches.length + okStub.fetches.length).toBe(1);
+    // Parallel dispatch: the failing destination no longer aborts the rest
+    // — both servers get their EDU attempt, one is contained with a warn.
+    expect(failStub.fetches.length + okStub.fetches.length).toBe(2);
+    expect(okStub.fetches.length).toBe(1);
   });
 
   it('EDU currently_active true only for online', async () => {

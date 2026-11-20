@@ -74,31 +74,45 @@ app.put('/_matrix/client/v3/presence/:userId/status', requireAuth(), async (c) =
     { expirationTtl: 5 * 60 } // 5 minutes
   );
 
-  // Queue outbound m.presence EDUs to federated servers
+  // Queue outbound m.presence EDUs to federated servers. Parallel dispatch
+  // with a hard cap: a big public room contributes thousands of server
+  // destinations, and sequential DO round trips made each presence PUT run
+  // for minutes (clients time out and retry).
   try {
     const remoteServers = await getServersInRoomsWithUser(db, requestingUserId);
     const localServer = c.env.SERVER_NAME;
-    const uniqueServers = [...new Set(remoteServers)].filter(s => s !== localServer);
+    const uniqueServers = [...new Set(remoteServers)]
+      .filter(s => s !== localServer)
+      .slice(0, 100);
 
-    for (const server of uniqueServers) {
-      const fedDO = c.env.FEDERATION.get(c.env.FEDERATION.idFromName(server));
-      await fedDO.fetch(new Request('http://internal/send-edu', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          destination: server,
-          edu_type: 'm.presence',
-          content: {
-            push: [{
-              user_id: requestingUserId,
-              presence,
-              status_msg: status_msg || undefined,
-              last_active_ago: 0,
-              currently_active: presence === 'online',
-            }],
-          },
-        }),
-      }));
+    const results = await Promise.allSettled(
+      uniqueServers.map((server) => {
+        const fedDO = c.env.FEDERATION.get(c.env.FEDERATION.idFromName(server));
+        return fedDO.fetch(new Request('http://internal/send-edu', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            destination: server,
+            edu_type: 'm.presence',
+            content: {
+              push: [{
+                user_id: requestingUserId,
+                presence,
+                status_msg: status_msg || undefined,
+                last_active_ago: 0,
+                currently_active: presence === 'online',
+              }],
+            },
+          }),
+        }));
+      })
+    );
+    // allSettled never rejects: surface dead destinations without failing
+    // the request, and never let one bad server block the rest.
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        console.warn('[presence] Failed to queue federation EDU:', r.reason);
+      }
     }
   } catch (err) {
     console.warn('[presence] Failed to queue federation EDUs:', err);
