@@ -1748,6 +1748,41 @@ async function persistLegacyInboundJoin(
   return eventId;
 }
 
+// Authorize an inbound join against our copy of the room state before
+// countersigning and persisting it. The joining server runs the same rules,
+// but we must not trust it: without this check send_join accepted joins into
+// invite-only rooms (and handed the caller the room's state).
+async function authorizeInboundJoin(
+  env: Env,
+  roomId: string,
+  roomVersion: string,
+  joinEvent: Record<string, unknown>,
+  origin?: string
+): Promise<string | null> {
+  const sender = typeof joinEvent['sender'] === 'string' ? joinEvent['sender'] : '';
+  const stateKey = typeof joinEvent['state_key'] === 'string' ? joinEvent['state_key'] : '';
+  if (!sender || sender !== stateKey) {
+    return 'Join event must be sent by the joining user';
+  }
+  if (origin) {
+    const senderServer = sender.includes(':') ? sender.slice(sender.indexOf(':') + 1) : '';
+    if (senderServer !== origin) {
+      return 'Join event sender does not belong to the authenticated server';
+    }
+  }
+  const roomState = await getRoomState(env.DB, roomId);
+  // No synced state: cannot authorize, keep the previous permissive behavior
+  // rather than refusing joins into rooms whose state we have not received.
+  if (roomState.length === 0) return null;
+  try {
+    const result = checkEventAuth(joinEvent as unknown as PDU, roomState, roomVersion);
+    return result.allowed ? null : (result.error ?? 'Join is not authorized');
+  } catch (err) {
+    console.warn('[federation] Inbound join auth check failed:', err);
+    return 'Join is not authorized';
+  }
+}
+
 // POST /_matrix/federation/v1/make_join/:roomId/:userId - Prepare join request
 app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
   const roomId = c.req.param('roomId');
@@ -1760,6 +1795,17 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  // A server may only ask for join templates for its own users. Without
+  // this, any federated server could probe room state on behalf of users
+  // it does not host.
+  const origin = c.get('federationOrigin' as any) as string | undefined;
+  if (origin) {
+    const userServer = userId.includes(':') ? userId.slice(userId.indexOf(':') + 1) : '';
+    if (userServer !== origin) {
+      return Errors.forbidden('Cannot request a join for a user on another server').toResponse();
+    }
   }
 
   // Get current room state for auth events
@@ -1783,11 +1829,38 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
 
   // The joining user's current membership (their invite, if any): the
   // receiving server's auth checks require it in the join's auth_events.
-  const inviteeMembership = await c.env.DB.prepare(
-    `SELECT e.event_id FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.member' AND rs.state_key = ?`
-  ).bind(roomId, userId).first<{ event_id: string }>();
+  // The same state lookup tells us whether the user may join at all.
+  const roomState = await getRoomState(c.env.DB, roomId);
+  const membershipEvent = roomState.find(
+    (e) => e.type === 'm.room.member' && e.state_key === userId
+  );
+  const inviteeMembership = membershipEvent ? { event_id: membershipEvent.event_id } : null;
+  const membership = (membershipEvent?.content as { membership?: string } | undefined)?.membership;
+  const joinRulesState = roomState.find((e) => e.type === 'm.room.join_rules');
+  const joinRule = (joinRulesState?.content as { join_rule?: string } | undefined)?.join_rule;
+
+  // Join-rule gate: refuse uninvited users of invite-only rooms here, with
+  // M_FORBIDDEN, rather than serving a template the client then fails to use
+  // (which surfaces as Element's vague "Something went wrong"). Only refuse
+  // when the join_rules event is actually held -- a room whose state has not
+  // synced keeps the previous behavior.
+  if (membership === 'ban') {
+    return Errors.forbidden('You are banned from this room').toResponse();
+  }
+  if (
+    joinRule &&
+    joinRule !== 'public' &&
+    joinRule !== 'restricted' &&
+    joinRule !== 'knock_restricted' &&
+    membership !== 'invite' &&
+    membership !== 'join'
+  ) {
+    return Errors.forbidden(
+      joinRule === 'knock'
+        ? 'This room requires a knock before joining'
+        : 'You are not invited to this room'
+    ).toResponse();
+  }
 
   // MSC4291 (room version 12): the template must reference the derived wire
   // IDs that federation exchanges, and the create event is implicit so it is
@@ -1859,6 +1932,18 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
+  const joinOrigin = c.get('federationOrigin' as any) as string | undefined;
+  const joinAuthError = await authorizeInboundJoin(
+    c.env,
+    roomId,
+    room.room_version,
+    body as Record<string, unknown>,
+    joinOrigin
+  );
+  if (joinAuthError) {
+    return Errors.forbidden(joinAuthError).toResponse();
+  }
+
   // Room versions 11+ (derived event IDs): countersign and store the join,
   // then serve the room's state in wire form -- peers only exchange derived
   // IDs, so locally stored events must be translated before they leave.
@@ -1866,24 +1951,28 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   if (!wire) {
     // send_join carries the event ID in the URL; the PDU body may omit it.
     if (!body.event_id) body.event_id = eventId;
-    await persistLegacyInboundJoin(
+    const storedJoinId = await persistLegacyInboundJoin(
       c.env,
       roomId,
       body as Record<string, unknown>,
-      c.get('federationOrigin' as any) as string | undefined
+      joinOrigin
     );
+    if (!storedJoinId) {
+      return Errors.forbidden('Join event was rejected').toResponse();
+    }
   }
   if (wire) {
     const storedJoinId = await persistInboundJoin(
       c.env,
       roomId,
       body as Record<string, unknown>,
-      c.get('federationOrigin' as any) as string | undefined,
+      joinOrigin,
       room.room_version
     );
-    if (storedJoinId) {
-      console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
+    if (!storedJoinId) {
+      return Errors.forbidden('Join event was rejected').toResponse();
     }
+    console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
     // Re-derive after persisting so the join itself is in the served state.
     wire = (await wireForRoom(c.env, roomId, room.room_version)) ?? wire;
     {
@@ -1997,6 +2086,18 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
+  const joinOrigin = c.get('federationOrigin' as any) as string | undefined;
+  const joinAuthError = await authorizeInboundJoin(
+    c.env,
+    roomId,
+    room.room_version,
+    body as Record<string, unknown>,
+    joinOrigin
+  );
+  if (joinAuthError) {
+    return Errors.forbidden(joinAuthError).toResponse();
+  }
+
   // Room versions 11+ (derived event IDs): countersign and store the join,
   // then serve the room's state in wire form -- peers only exchange derived
   // IDs, so locally stored events must be translated before they leave.
@@ -2004,24 +2105,28 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
   if (!wire) {
     // send_join carries the event ID in the URL; the PDU body may omit it.
     if (!body.event_id) body.event_id = eventId;
-    await persistLegacyInboundJoin(
+    const storedJoinId = await persistLegacyInboundJoin(
       c.env,
       roomId,
       body as Record<string, unknown>,
-      c.get('federationOrigin' as any) as string | undefined
+      joinOrigin
     );
+    if (!storedJoinId) {
+      return Errors.forbidden('Join event was rejected').toResponse();
+    }
   }
   if (wire) {
     const storedJoinId = await persistInboundJoin(
       c.env,
       roomId,
       body as Record<string, unknown>,
-      c.get('federationOrigin' as any) as string | undefined,
+      joinOrigin,
       room.room_version
     );
-    if (storedJoinId) {
-      console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
+    if (!storedJoinId) {
+      return Errors.forbidden('Join event was rejected').toResponse();
     }
+    console.log(`[federation] Stored inbound join ${storedJoinId} in ${roomId}`);
     // Re-derive after persisting so the join itself is in the served state.
     wire = (await wireForRoom(c.env, roomId, room.room_version)) ?? wire;
     {

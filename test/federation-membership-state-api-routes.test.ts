@@ -379,6 +379,12 @@ function createMembershipDb(opts: {
             return { position: 1 } as T;
           }
 
+          // Signing keys are not modeled in this fake; inbound joins are
+          // stored unsigned (persist* skips signing when no key is present).
+          if (sql.includes('FROM server_keys')) {
+            return null;
+          }
+
           throw new Error(`Unhandled first() SQL: ${sql.slice(0, 180)}`);
         },
 
@@ -502,6 +508,7 @@ function createMembershipDb(opts: {
               stateKey,
               content,
               originServerTs,
+              ,
               depth,
               authEvents,
               prevEvents,
@@ -515,11 +522,13 @@ function createMembershipDb(opts: {
               string | null,
               string,
               number,
+              string | null,
               number,
               string,
               string,
               string | null,
               string | null,
+              number,
             ];
             if (!events.some((e) => e.event_id === eventId)) {
               events.push({
@@ -1300,13 +1309,21 @@ describe('federation make_join / send_join', () => {
       `/_matrix/federation/v1/send_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`,
       jsonInit('PUT', {
         event_id: EVENT,
+        room_id: ROOM,
         type: 'm.room.member',
+        sender: REMOTE_USER,
+        state_key: REMOTE_USER,
         content: { membership: 'join' },
+        auth_events: [CREATE, JOIN_RULES, POWER],
+        prev_events: [],
+        origin_server_ts: Date.now(),
+        depth: 5,
       })
     );
     expect(res.status).toBe(200);
     expect(res.body.origin).toBe(SERVER);
-    expect(res.body.state.length).toBe(4);
+    // Baseline state plus the joining user's newly persisted membership.
+    expect(res.body.state.length).toBe(5);
     expect(res.body.auth_chain.length).toBeGreaterThan(0);
   });
 
@@ -1316,7 +1333,18 @@ describe('federation make_join / send_join', () => {
     const res = await request(
       env,
       `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`,
-      jsonInit('PUT', { type: 'm.room.member', content: { membership: 'join' } })
+      jsonInit('PUT', {
+        event_id: EVENT,
+        room_id: ROOM,
+        type: 'm.room.member',
+        sender: REMOTE_USER,
+        state_key: REMOTE_USER,
+        content: { membership: 'join' },
+        auth_events: [CREATE, JOIN_RULES, POWER],
+        prev_events: [],
+        origin_server_ts: Date.now(),
+        depth: 5,
+      })
     );
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(false);

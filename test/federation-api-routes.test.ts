@@ -46,7 +46,7 @@ vi.mock('../src/services/federation-keys', () => ({
   verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
 }));
 
-const getRoomState = vi.fn(async () => ({}));
+const getRoomState = vi.fn(async () => []);
 vi.mock('../src/services/database', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/services/database')>();
   return {
@@ -896,6 +896,56 @@ function seedBasicRoom(extra: Partial<FedDbOptions> = {}) {
   });
 }
 
+/** PDU-shaped room state for the mocked getRoomState, with a variable join
+ *  rule and (optionally) the joining user's membership. */
+function joinRuleState(joinRule: string, memberMembership?: string) {
+  const state = [
+    {
+      event_id: '$create:example.com',
+      room_id: ROOM,
+      sender: LOCAL_USER,
+      type: 'm.room.create',
+      state_key: '',
+      content: { creator: LOCAL_USER, room_version: '10' },
+    },
+    {
+      event_id: '$jr2:example.com',
+      room_id: ROOM,
+      sender: LOCAL_USER,
+      type: 'm.room.join_rules',
+      state_key: '',
+      content: { join_rule: joinRule },
+    },
+    {
+      event_id: '$pl2:example.com',
+      room_id: ROOM,
+      sender: LOCAL_USER,
+      type: 'm.room.power_levels',
+      state_key: '',
+      content: { users: { [LOCAL_USER]: 100 } },
+    },
+    {
+      event_id: '$member2:example.com',
+      room_id: ROOM,
+      sender: LOCAL_USER,
+      type: 'm.room.member',
+      state_key: LOCAL_USER,
+      content: { membership: 'join' },
+    },
+  ];
+  if (memberMembership) {
+    state.push({
+      event_id: '$target:example.com',
+      room_id: ROOM,
+      sender: REMOTE_USER,
+      type: 'm.room.member',
+      state_key: REMOTE_USER,
+      content: { membership: memberMembership },
+    });
+  }
+  return state;
+}
+
 describe('exported federation helpers', () => {
   it('isModernRoomVersion treats v1-2 as legacy and v3+ / custom as modern', () => {
     expect(isModernRoomVersion('1')).toBe(false);
@@ -1103,7 +1153,7 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
     checkEventAuth.mockReset();
     checkEventAuth.mockReturnValue({ allowed: true });
     getRoomState.mockReset();
-    getRoomState.mockResolvedValue({});
+    getRoomState.mockResolvedValue([]);
   });
 
   it('rejects when federationOrigin missing', async () => {
@@ -1579,10 +1629,15 @@ describe('make_join / send_join / make_leave / send_leave', () => {
       makeEnv(db),
       {
         event_id: '$jok',
+        room_id: ROOM,
         type: 'm.room.member',
         sender: REMOTE_USER,
         state_key: REMOTE_USER,
         content: { membership: 'join' },
+        auth_events: [],
+        prev_events: [],
+        origin_server_ts: 1_700_000_000_000,
+        depth: 6,
       }
     );
     expect(status).toBe(200);
@@ -1626,9 +1681,15 @@ describe('make_join / send_join / make_leave / send_leave', () => {
       makeEnv(db),
       {
         event_id: '$j2',
+        room_id: ROOM,
         type: 'm.room.member',
         sender: REMOTE_USER,
+        state_key: REMOTE_USER,
         content: { membership: 'join' },
+        auth_events: [],
+        prev_events: [],
+        origin_server_ts: 1_700_000_000_000,
+        depth: 6,
       }
     );
     expect(ok.status).toBe(200);
@@ -1760,6 +1821,124 @@ describe('make_join / send_join / make_leave / send_leave', () => {
       { event_id: '$l2', type: 'm.room.member', content: { membership: 'leave' } }
     );
     expect(v2ok.status).toBe(200);
+  });
+});
+
+describe('join authorization (join rules enforced on make_join and send_join)', () => {
+  const joinBody = {
+    room_id: ROOM,
+    type: 'm.room.member',
+    sender: REMOTE_USER,
+    state_key: REMOTE_USER,
+    content: { membership: 'join' },
+    auth_events: [],
+    prev_events: [],
+    origin_server_ts: 1_700_000_000_000,
+    depth: 6,
+  };
+
+  beforeEach(() => {
+    checkEventAuth.mockReset();
+    checkEventAuth.mockReturnValue({ allowed: true });
+    getRoomState.mockReset();
+    getRoomState.mockResolvedValue([]);
+  });
+
+  it('make_join refuses an uninvited user in an invite-only room', async () => {
+    getRoomState.mockResolvedValue(joinRuleState('invite'));
+    const res = await req(
+      'GET',
+      `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+      makeEnv(seedBasicRoom())
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('make_join serves a template to an invited user in an invite-only room', async () => {
+    getRoomState.mockResolvedValue(joinRuleState('invite', 'invite'));
+    const res = await req(
+      'GET',
+      `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+      makeEnv(seedBasicRoom())
+    );
+    expect(res.status).toBe(200);
+    const b = res.body as { event: { auth_events: string[] } };
+    expect(b.event.auth_events).toContain('$target:example.com');
+  });
+
+  it('make_join refuses a banned user', async () => {
+    getRoomState.mockResolvedValue(joinRuleState('public', 'ban'));
+    const res = await req(
+      'GET',
+      `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+      makeEnv(seedBasicRoom())
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+
+  it('make_join refuses to act for a user of another server', async () => {
+    getRoomState.mockResolvedValue(joinRuleState('public'));
+    const prevOrigin = federationOrigin;
+    federationOrigin = 'attacker.example.com';
+    try {
+      const res = await req(
+        'GET',
+        `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+        makeEnv(seedBasicRoom())
+      );
+      expect(res.status).toBe(403);
+      expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    } finally {
+      federationOrigin = prevOrigin;
+    }
+  });
+
+  it('send_join refuses an uninvited join into an invite-only room', async () => {
+    getRoomState.mockResolvedValue(joinRuleState('invite'));
+    checkEventAuth.mockReturnValue({ allowed: false, error: 'Not authorized to join' });
+    const db = seedBasicRoom();
+    const res = await req(
+      'PUT',
+      `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/%24jinv`,
+      makeEnv(db),
+      { ...joinBody, event_id: '$jinv' }
+    );
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    expect(
+      db.inserts.some(
+        (i) => i.sql.includes('room_memberships') && i.args[1] === REMOTE_USER
+      )
+    ).toBe(false);
+  });
+
+  it('send_join accepts an invited join into an invite-only room', async () => {
+    getRoomState.mockResolvedValue(joinRuleState('invite', 'invite'));
+    const db = seedBasicRoom();
+    const res = await req(
+      'PUT',
+      `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/%24jinv2`,
+      makeEnv(db),
+      { ...joinBody, event_id: '$jinv2' }
+    );
+    expect(res.status).toBe(200);
+    expect(
+      db.inserts.some(
+        (i) => i.sql.includes('room_memberships') && i.args[1] === REMOTE_USER
+      )
+    ).toBe(true);
+  });
+
+  it('send_join refuses a malformed body instead of serving room state', async () => {
+    const res = await req(
+      'PUT',
+      `/_matrix/federation/v2/send_join/${encodeURIComponent(ROOM)}/%24jbad`,
+      makeEnv(seedBasicRoom()),
+      { type: 'm.room.member', content: { membership: 'join' } }
+    );
+    expect(res.status).toBe(403);
   });
 });
 
@@ -2673,7 +2852,7 @@ describe('additional send / query / claim edges', () => {
     verifyRemoteSignature.mockReset();
     checkEventAuth.mockReset();
     checkEventAuth.mockReturnValue({ allowed: true });
-    getRoomState.mockResolvedValue({});
+    getRoomState.mockResolvedValue([]);
   });
 
   it('send rejects third-party PDU signature failures with distinct reason', async () => {
@@ -3194,6 +3373,16 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
       });
       db.events.set(invite.event_id, invite);
       db.roomState.set(stateKey(ROOM, 'm.room.member', REMOTE_USER), invite.event_id);
+      getRoomState.mockResolvedValue([
+        {
+          event_id: invite.event_id,
+          room_id: ROOM,
+          sender: LOCAL_USER,
+          type: 'm.room.member',
+          state_key: REMOTE_USER,
+          content: { membership: 'invite' },
+        },
+      ]);
 
       const env = makeEnv(db);
       const { status, body } = await req(
@@ -3325,7 +3514,7 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
         env,
         joinEvent
       );
-      expect(status).toBe(200);
+      expect(status).toBe(403);
 
       // Nothing was persisted: no membership update and no event row for the
       // forged sender.
