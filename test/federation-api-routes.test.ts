@@ -312,6 +312,11 @@ function createFedDb(opts: FedDbOptions = {}) {
             prev_events: prevEvents,
             hashes: null,
             signatures,
+            // The 13-column /send insert carries stream_ordering last; the
+            // 14-column storeEvent insert carries 'unsigned' instead.
+            ...(sql.includes('unsigned')
+              ? {}
+              : { stream_ordering: args[12] as number }),
           });
         }
         if (sql.includes('INSERT OR REPLACE INTO room_state')) {
@@ -403,6 +408,19 @@ function createFedDb(opts: FedDbOptions = {}) {
         if (sql.includes('SELECT user_id FROM users WHERE user_id')) {
           const [userId] = args as [string];
           return (users.has(userId) ? { user_id: userId } : null) as T;
+        }
+        if (
+          sql.includes('FROM events') &&
+          sql.includes('stream_ordering > 0') &&
+          sql.includes('ORDER BY stream_ordering DESC LIMIT 1')
+        ) {
+          const [roomId] = args as [string];
+          const order = (e: { stream_ordering?: number }) =>
+            e.stream_ordering ?? Number.MAX_SAFE_INTEGER;
+          const list = [...events.values()]
+            .filter((e) => e.room_id === roomId && order(e) > 0)
+            .sort((a, b) => order(b) - order(a));
+          return (list[0] ? { origin_server_ts: list[0].origin_server_ts } : null) as T;
         }
         if (sql.includes('ORDER BY depth DESC LIMIT 1') && sql.includes('FROM events') && !sql.includes('depth <')) {
           const [roomId] = args as [string];
@@ -1200,6 +1218,56 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
     const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
     expect(pdus['$bad1'].error).toMatch(/Invalid PDU/);
     expect(pdus['$bad2'].error).toMatch(/Invalid sender/);
+  });
+
+  it('replayed old member events store outside the live timeline', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    // No signatures field: signature verification is skipped; the content
+    // hash must be genuine (verifyContentHash is the real implementation).
+    const pduWith = async (base: Record<string, unknown>) => {
+      const hashes = { sha256: await calculateContentHash(base) };
+      return { ...base, hashes };
+    };
+    const oldPdu = await pduWith({
+      event_id: '$replay-old',
+      room_id: ROOM,
+      sender: REMOTE_USER,
+      type: 'm.room.member',
+      state_key: REMOTE_USER,
+      content: { membership: 'join' },
+      // Older than everything seedBasicRoom holds (1_700_000_000_000).
+      origin_server_ts: 1_600_000_000_000,
+      depth: 6,
+      auth_events: [],
+      prev_events: [],
+    });
+    const freshPdu = await pduWith({
+      event_id: '$fresh-msg',
+      room_id: ROOM,
+      sender: REMOTE_USER,
+      type: 'm.room.message',
+      content: { body: 'live traffic' },
+      origin_server_ts: 1_710_000_000_000,
+      depth: 7,
+      auth_events: [],
+      prev_events: [],
+    });
+    const { status } = await req('PUT', '/_matrix/federation/v1/send/txn-replay', env, {
+      pdus: [oldPdu, freshPdu],
+    });
+    expect(status).toBe(200);
+
+    const inserted = (id: string) =>
+      db.inserts.find((i) => i.sql.includes('INTO events') && i.args[0] === id);
+    const oldArgs = inserted('$replay-old')?.args as unknown[];
+    const freshArgs = inserted('$fresh-msg')?.args as unknown[];
+    // Replay guard: the out-of-chronology member event stored at a NEGATIVE
+    // position (invisible to timeline queries), the live message positive.
+    expect(typeof oldArgs?.[12]).toBe('number');
+    expect((oldArgs?.[12] as number)).toBeLessThan(0);
+    expect(typeof freshArgs?.[12]).toBe('number');
+    expect((freshArgs?.[12] as number)).toBeGreaterThan(0);
   });
 
   it('reuses previously processed PDU accept/reject', async () => {

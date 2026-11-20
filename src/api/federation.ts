@@ -788,13 +788,31 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       // If room exists, store the event
       if (room) {
         try {
+          // Replay guard: Conduwuit-family servers replay historical events
+          // to newly joined servers through ordinary transactions. A
+          // membership event arriving out of chronology (older than
+          // everything we already hold) is stored outside the live timeline
+          // (negated stream ordering) so a replay burst cannot bury fresh
+          // conversation under hundreds of old joins. room_state and
+          // room_memberships still update; only timeline visibility changes.
+          let replayedOldMember = false;
+          if (pdu.type === 'm.room.member') {
+            const newest = await c.env.DB.prepare(
+              `SELECT origin_server_ts FROM events WHERE room_id = ? AND stream_ordering > 0 ORDER BY stream_ordering DESC LIMIT 1`
+            ).bind(roomId).first<{ origin_server_ts: number }>();
+            if (newest && pdu.origin_server_ts < newest.origin_server_ts) {
+              replayedOldMember = true;
+            }
+          }
           // Allocate a stream position first: /sync delivers events by
           // stream_ordering, and a NULL ordering makes an event invisible to
           // every client even though it is stored.
           const positionResult = await c.env.DB.prepare(
             `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
           ).first<{ position: number }>();
-          const streamOrdering = positionResult?.position ?? 1;
+          const streamOrdering = replayedOldMember
+            ? -(positionResult?.position ?? 1)
+            : positionResult?.position ?? 1;
 
           const insertResult = await c.env.DB.prepare(
             `INSERT OR IGNORE INTO events
