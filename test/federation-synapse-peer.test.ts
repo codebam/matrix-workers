@@ -99,6 +99,12 @@ function makeDb() {
             // Raw row: getStateEvent parses the columns itself.
             return (id ? events.get(id) : null) as T;
           }
+          if (sql.includes('SELECT e.sender FROM room_state rs')) {
+            // legacyWireForRoom's local-authorship check.
+            const cid = state.get(slot(args[0], 'm.room.create', ''));
+            const cev = cid ? events.get(cid) : null;
+            return (cev ? { sender: cev.sender } : null) as T;
+          }
           if (sql.includes('SELECT e.event_id FROM room_state rs')) {
             const id = state.get(slot(args[0], 'm.room.create', ''));
             return (id ? { event_id: id } : null) as T;
@@ -378,14 +384,14 @@ describe('GNU/Linux-class delivery against a Synapse-rules peer', () => {
     expect(peer.rooms.get(ROOM)!.timeline).toHaveLength(1);
   });
 
-  it('served /event for the old membership includes the auth types Synapse requires (re-fetch heals)', async () => {
-    const create = await seedStateEvent(ROOM, PEER_USER, 'm.room.create', '', { creator: PEER_USER, room_version: '10' }, [], 1);
-    const creatorJoin = await seedStateEvent(ROOM, PEER_USER, 'm.room.member', PEER_USER, { membership: 'join' }, [create], 2);
-    const pl = await seedStateEvent(ROOM, PEER_USER, 'm.room.power_levels', '', { users: { [PEER_USER]: 100 }, state_default: 50, events_default: 0 }, [create, creatorJoin], 3);
-    const jr = await seedStateEvent(ROOM, PEER_USER, 'm.room.join_rules', '', { join_rule: 'public' }, [create, pl, creatorJoin], 4);
-    const oldJoin = await seedStateEvent(ROOM, USER, 'm.room.member', USER, { membership: 'join' }, [create, pl], 5);
-    db.memberships.set(`${ROOM}\0${USER}`, { membership: 'join', event_id: oldJoin });
-    await seedPoisonedResident(ROOM, oldJoin);
+  it('locally-created room: served /event for the old membership includes the auth types Synapse requires (re-fetch heals)', async () => {
+    const create = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.create', '', { creator: USER, room_version: '10' }, [], 1);
+    const creatorJoin = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.member', USER, { membership: 'join' }, [create], 2);
+    const pl = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.power_levels', '', { users: { [USER]: 100 }, state_default: 50, events_default: 0 }, [create, creatorJoin], 3);
+    const jr = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.join_rules', '', { join_rule: 'public' }, [create, pl, creatorJoin], 4);
+    const oldJoin = await seedStateEvent(LOCAL_ROOM, USER, 'm.room.member', USER, { membership: 'join' }, [create, pl], 5);
+    db.memberships.set(`${LOCAL_ROOM}\0${USER}`, { membership: 'join', event_id: oldJoin });
+    await seedPoisonedResident(LOCAL_ROOM, oldJoin);
 
     const res = await federationApp.request(
       `http://localhost/_matrix/federation/v1/event/${encodeURIComponent(oldJoin)}`, {}, env
@@ -394,7 +400,34 @@ describe('GNU/Linux-class delivery against a Synapse-rules peer', () => {
     const served = body.pdus[0];
     expect(await peer.verifyPdu(served, SERVER, '10')).toBeNull();
     // A resident re-fetching this event must be able to auth-check it.
-    expect(peer.checkAuth(served, peer.rooms.get(ROOM)!)).toBeNull();
+    expect(peer.checkAuth(served, peer.rooms.get(LOCAL_ROOM)!)).toBeNull();
+  });
+
+  it('remote-created room: served /event is as-stored and identity-preserving (the resident can resolve it)', async () => {
+    // Re-deriving remote-created rooms cannot reproduce the residents' IDs
+    // (their events can carry fields we do not store, e.g. pre-2023 Synapse
+    // `origin`, which the content hash covers). The serve must therefore be
+    // verbatim: the reference hash of the served bytes equals the event's
+    // stored ID, so a resident fetching /event/{id} gets bytes that hash back
+    // to the ID it asked for.
+    const create = await seedStateEvent(ROOM, PEER_USER, 'm.room.create', '', { creator: PEER_USER, room_version: '10' }, [], 1);
+    const creatorJoin = await seedStateEvent(ROOM, PEER_USER, 'm.room.member', PEER_USER, { membership: 'join' }, [create], 2);
+    const pl = await seedStateEvent(ROOM, PEER_USER, 'm.room.power_levels', '', { users: { [PEER_USER]: 100 }, state_default: 50, events_default: 0 }, [create, creatorJoin], 3);
+    const jr = await seedStateEvent(ROOM, PEER_USER, 'm.room.join_rules', '', { join_rule: 'public' }, [create, pl, creatorJoin], 4);
+    const oldJoin = await seedStateEvent(ROOM, USER, 'm.room.member', USER, { membership: 'join' }, [create, pl, jr], 5);
+    db.memberships.set(`${ROOM}\0${USER}`, { membership: 'join', event_id: oldJoin });
+
+    const res = await federationApp.request(
+      `http://localhost/_matrix/federation/v1/event/${encodeURIComponent(oldJoin)}`, {}, env
+    );
+    const body = await res.json() as any;
+    const served = body.pdus[0];
+    // Identity preserved: the resident's derived ID for the served bytes is
+    // the ID it requested.
+    const derivedId = await computeWireEventId(served, '10');
+    expect(derivedId).toBe(oldJoin);
+    // And the bytes verify as stored.
+    expect(await peer.verifyPdu(served, SERVER, '10')).toBeNull();
   });
 
   it('locally-created room: state and messages pass the peer end to end', async () => {

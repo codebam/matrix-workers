@@ -294,7 +294,10 @@ export function buildWireJoinState(
 // v3-v10 rooms whose create we authored: pre-fix stored events used v11
 // redaction rules, so their hashes/IDs/signatures must be re-derived and
 // references translated. Remote-created legacy rooms keep the fast
-// as-stored path.
+// as-stored path: their events can carry fields we do not store (pre-2023
+// Synapse `origin`/`prev_state`, covered by the content hash), so hashes
+// recomputed from rows never match the residents' originals — every
+// re-derived reference would be a phantom ID no peer can resolve.
 export async function legacyWireForRoom(
   env: Env,
   roomId: string,
@@ -304,6 +307,17 @@ export async function legacyWireForRoom(
   const num = parseInt(roomVersion, 10);
   if (!Number.isFinite(num) || num < 3 || num > 10) return null;
   try {
+    // Only re-derive rooms WE created: every byte of a locally-authored event
+    // is reproducible from our own creation path. If we cannot prove local
+    // authorship (create row missing or created by a remote user), serve
+    // as-stored.
+    const createRow = await env.DB.prepare(
+      `SELECT e.sender FROM room_state rs
+       JOIN events e ON rs.event_id = e.event_id
+       WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`
+    ).bind(roomId).first<{ sender: string }>();
+    const createSender = createRow?.sender;
+    if (!createSender || !createSender.endsWith(`:${env.SERVER_NAME}`)) return null;
     // Derivation re-signs every event; cap it so huge rooms keep the fast
     // as-stored path (their state is resident-authored and already correct).
     const count = await env.DB.prepare(
