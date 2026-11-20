@@ -1,0 +1,117 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	// Second instance at dev.codebam.ca for federation debugging: real
+	// worker-to-worker federation with prod, both sides tailable.
+	// FEDERATION_STRICT_AUTH enables Synapse-style auth_events selection
+	// checks on inbound PDUs so dev reproduces resident-server rejections.
+	"name": "matrix-worker-codebam-dev",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-01-01",
+	"compatibility_flags": [
+		"nodejs_compat",
+		// Fetch same-zone hostnames (codebam.ca) via the public edge instead
+		// of worker-internal dispatch, which returned HTTP 530 for key fetches.
+		"global_fetch_strictly_public"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "matrix-db-codebam-dev",
+			"database_id": "fd00b766-e98a-4818-9b5b-d69fc7a1323f"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "SESSIONS",
+			"id": "c89d13a183d34e44b16ca6f313b9bb62"
+		},
+		{
+			"binding": "DEVICE_KEYS",
+			"id": "8abcad8104e94c0eae77122fd9936bd2"
+		},
+		{
+			"binding": "CACHE",
+			"id": "20372de4bbe443ee8309f77754d12317"
+		},
+		{
+			"binding": "CROSS_SIGNING_KEYS",
+			"id": "7791f34b04a144ce9752daf09c15f586"
+		},
+		{
+			"binding": "ACCOUNT_DATA",
+			"id": "f1bed21396a4474aaa49fde7770c524a"
+		},
+		{
+			"binding": "ONE_TIME_KEYS",
+			"id": "43d32ae0a5e0489cbf464b057651d5e5"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "MEDIA",
+			"bucket_name": "matrix-media-codebam-ca-dev"
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{ "name": "ROOMS", "class_name": "RoomDurableObject" },
+			{ "name": "SYNC", "class_name": "SyncDurableObject" },
+			{ "name": "FEDERATION", "class_name": "FederationDurableObject" },
+			{ "name": "CALL_ROOMS", "class_name": "CallRoomDurableObject" },
+			{ "name": "ADMIN", "class_name": "AdminDurableObject" },
+			{ "name": "USER_KEYS", "class_name": "UserKeysDurableObject" },
+			{ "name": "PUSH", "class_name": "PushDurableObject" },
+			{ "name": "RATE_LIMIT", "class_name": "RateLimitDurableObject" },
+			{ "name": "DELAYED_EVENTS", "class_name": "DelayedEventsDurableObject" }
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"RoomDurableObject",
+				"SyncDurableObject",
+				"FederationDurableObject",
+				"CallRoomDurableObject",
+				"AdminDurableObject",
+				"UserKeysDurableObject",
+				"PushDurableObject",
+				"RateLimitDurableObject",
+				"DelayedEventsDurableObject"
+			]
+		}
+	],
+	"vars": {
+		"SERVER_NAME": "dev.codebam.ca",
+		"SERVER_VERSION": "0.1.0-dev",
+		"REGISTRATION_REQUIRE_TOKEN": "true",
+		"FEDERATION_STRICT_AUTH": "true"
+	},
+	"routes": [
+		"dev.codebam.ca/_matrix/*",
+		"dev.codebam.ca/oauth/*",
+		"dev.codebam.ca/.well-known/matrix/*",
+		"dev.codebam.ca/.well-known/openid-configuration*",
+		"dev.codebam.ca/.well-known/jwks.json*",
+		"dev.codebam.ca/admin*",
+		"dev.codebam.ca/_synapse/*",
+		"dev.codebam.ca/auth/oidc/*",
+		"dev.codebam.ca/calls/*",
+		"dev.codebam.ca/health*"
+	],
+	"workflows": [
+		{
+			"name": "room-join-workflow-codebam-dev",
+			"binding": "ROOM_JOIN_WORKFLOW",
+			"class_name": "RoomJoinWorkflow"
+		},
+		{
+			"name": "push-notification-workflow-codebam-dev",
+			"binding": "PUSH_NOTIFICATION_WORKFLOW",
+			"class_name": "PushNotificationWorkflow"
+		}
+	]
+}
