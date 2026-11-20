@@ -71,6 +71,7 @@ import federation, {
 import { generateSigningKeyPair, calculateContentHash } from '../src/utils/crypto';
 import { computeWireEventId } from '../src/utils/event-signing';
 import { prepareOutboundPdu } from '../src/api/rooms';
+import { deriveRoomWireEvents } from '../src/services/event-wire';
 
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
@@ -2962,21 +2963,11 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
       expect(b.event.auth_events).not.toContain('$jr:example.com');
       expect(b.event.auth_events).toHaveLength(2);
 
-      // They match the derivation that federation actually exchanges.
-      const preparedPl = await prepareOutboundPdu(env, {
-        event_id: '$pl:example.com',
-        room_id: ROOM,
-        sender: LOCAL_USER,
-        type: 'm.room.power_levels',
-        state_key: '',
-        content: { users: { [LOCAL_USER]: 100 } },
-        origin_server_ts: 1_700_000_000_000,
-        depth: 3,
-        auth_events: [],
-        prev_events: [],
-      });
-      expect(preparedPl).not.toBeNull();
-      expect(b.event.auth_events).toContain(preparedPl!.wireId);
+      // They match the derivation that federation actually exchanges
+      // (including its auth-event augmentation).
+      const wire = await deriveRoomWireEvents(env, ROOM, '12');
+      expect(wire).not.toBeNull();
+      expect(b.event.auth_events).toContain(wire!.idMap.get('$pl:example.com'));
 
       // prev_events points at the newest event's derived ID (the member row).
       expect(b.event.prev_events).toHaveLength(1);
@@ -3172,7 +3163,9 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
         prev_events: [preparedMember!.wireId],
       };
       const hashes = { sha256: await calculateContentHash(baseForm) };
-      const correct = await computeWireEventId({ ...baseForm, hashes });
+      const wire2 = await deriveRoomWireEvents(env, ROOM, '12');
+      expect(wire2).not.toBeNull();
+      const correct = wire2!.idMap.get('$msg:example.com')!;
       const phantom = await computeWireEventId({ ...baseForm, state_key: undefined, hashes });
       expect(correct).not.toBe(phantom);
       expect(b.event.prev_events[0]).toBe(correct);
@@ -3217,25 +3210,11 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
       // derived wire ID (the receiving server's auth checks require it).
       expect(b.event.auth_events).toHaveLength(3);
       expect(b.event.auth_events).not.toContain('$rmember-invite:example.com');
-      // Mirror the derivation's input shape (parsed content, no row fields).
-      const preparedInvite = await prepareOutboundPdu(
-        env,
-        {
-          event_id: invite.event_id,
-          room_id: ROOM,
-          sender: invite.sender,
-          type: 'm.room.member',
-          state_key: REMOTE_USER,
-          content: { membership: 'invite' },
-          origin_server_ts: invite.origin_server_ts,
-          depth: invite.depth,
-          auth_events: [],
-          prev_events: [],
-        },
-        '12'
-      );
-      expect(preparedInvite).not.toBeNull();
-      expect(b.event.auth_events).toContain(preparedInvite!.wireId);
+      // The invitee membership is referenced by its derived wire ID, as
+      // produced by the serve-time derivation (with auth augmentation).
+      const wire3 = await deriveRoomWireEvents(env, ROOM, '12');
+      expect(wire3).not.toBeNull();
+      expect(b.event.auth_events).toContain(wire3!.idMap.get(invite.event_id));
     } finally {
       restore();
     }

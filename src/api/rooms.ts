@@ -12,7 +12,7 @@ import { calculateContentHash, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId } from '../utils/event-signing';
 import { federationGet } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
-import { legacyWireForRoom, prepareOutboundPdu } from '../services/event-wire';
+import { augmentAuthEvents, legacyWireForRoom, prepareOutboundPdu } from '../services/event-wire';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import {
   createRoom,
@@ -137,6 +137,29 @@ async function createInitialRoomEvents(
   // selection — or the stored room and the served room diverge into two ID
   // spaces and remote servers cannot resolve references into either.
   const plannedRefTargets = new Map<string, { type: string; stateKey: string }>();
+  let createPlannedId: string | undefined;
+  const AUTH_SEP = String.fromCharCode(0);
+
+  // Add auth types the receiver requires (join_rules for joins, sender
+  // membership, ...) from the state planned so far.
+  const augmentRefs = (
+    refs: string[],
+    type: string,
+    stateKey: string | undefined,
+    content: any
+  ): string[] => {
+    const expected = expectedAuthTypes(type, creatorId, stateKey, content);
+    const have = new Set(refs);
+    const out = [...refs];
+    for (const [id, t] of plannedRefTargets) {
+      if (expected.has(t.type + AUTH_SEP + t.stateKey) && !have.has(id)) {
+        have.add(id);
+        out.push(id);
+      }
+    }
+    if (!createIsImplicit && createPlannedId && !have.has(createPlannedId)) out.push(createPlannedId);
+    return out;
+  };
 
   const reduceAuthRefs = (
     refs: string[],
@@ -186,7 +209,7 @@ async function createInitialRoomEvents(
         content,
         origin_server_ts: now,
         depth: depth++,
-        auth_events: reduceAuthRefs([...authEvents], type, stateKey, content),
+        auth_events: reduceAuthRefs(augmentRefs([...authEvents], type, stateKey, content), type, stateKey, content),
         prev_events: [...prevEvents],
       };
       const prepared = await prepareOutboundPdu(env, pdu, roomVersion);
@@ -196,6 +219,7 @@ async function createInitialRoomEvents(
       pdu.event_id = prepared.wireId;
       pdu.hashes = prepared.hashes as PDU['hashes'];
       pdu.signatures = prepared.signatures as PDU['signatures'];
+      if (type === 'm.room.create') createPlannedId = prepared.wireId;
       validateEventSize(pdu);
       planned.push({ pdu, membership });
       if (stateKey !== undefined && type !== 'm.room.create') {
@@ -216,7 +240,7 @@ async function createInitialRoomEvents(
       content,
       origin_server_ts: now,
       depth: depth++,
-      auth_events: [...authEvents],
+      auth_events: augmentRefs([...authEvents], type, stateKey, content),
       prev_events: [...prevEvents],
     };
     // Room v3+ event IDs are reference hashes and peers verify our server
@@ -234,6 +258,7 @@ async function createInitialRoomEvents(
       pdu.hashes = { sha256: await calculateContentHash(pdu as unknown as Record<string, unknown>) };
     }
     pdu.event_id = eventId;
+    if (type === 'm.room.create') createPlannedId = eventId;
 
     // Validate row size up front; fail fast before submitting the batch.
     validateEventSize(pdu);
@@ -1426,6 +1451,9 @@ async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): 
       }
     }
     event.auth_events = kept;
+    const stateTargets = new Map<string, string>();
+    for (const [id, t] of targets) stateTargets.set(t.type + String.fromCharCode(0) + t.stateKey, id);
+    augmentAuthEvents(event, stateTargets, true, createId);
     const prepared = await prepareOutboundPdu(env, event, roomVersion);
     if (!prepared) {
       throw new Error('[rooms] cannot derive v12 event ID without a signing key');
@@ -1434,6 +1462,18 @@ async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): 
     event.hashes = prepared.hashes as PDU['hashes'];
     event.signatures = prepared.signatures as PDU['signatures'];
   } else {
+    const legacyState = await env.DB.prepare(
+      `SELECT rs.event_id, e.event_type, e.state_key FROM room_state rs
+       JOIN events e ON rs.event_id = e.event_id
+       WHERE rs.room_id = ?`
+    ).bind(roomId).all<{ event_id: string; event_type: string; state_key: string | null }>();
+    const legacyTargets = new Map<string, string>();
+    let legacyCreateId: string | undefined;
+    for (const r of legacyState.results ?? []) {
+      legacyTargets.set(r.event_type + String.fromCharCode(0) + (r.state_key ?? ''), r.event_id);
+      if (r.event_type === 'm.room.create') legacyCreateId = r.event_id;
+    }
+    augmentAuthEvents(event, legacyTargets, false, legacyCreateId);
     const prepared = await prepareOutboundPdu(env, event, roomVersion);
     if (prepared) {
       event.event_id = prepared.wireId;
