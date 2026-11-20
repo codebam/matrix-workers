@@ -113,19 +113,20 @@ export async function deriveRoomWireEvents(
   // server's auth rules require (e.g. join_rules for member joins) when the
   // stored event predates that rule.
   const stateRows = await env.DB.prepare(
-    `SELECT rs.event_id, e.event_type, e.state_key FROM room_state rs
+    `SELECT rs.event_id, e.event_type, e.state_key, e.depth FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
      WHERE rs.room_id = ?`
-  ).bind(roomId).all<{ event_id: string; event_type: string; state_key: string | null }>();
-  const stateTargets = new Map<string, string>();
+  ).bind(roomId).all<{ event_id: string; event_type: string; state_key: string | null; depth: number }>();
+  const stateTargets = new Map<string, { id: string; depth: number }>();
   for (const r of stateRows.results ?? []) {
-    stateTargets.set(r.event_type + AUTH_SEP + (r.state_key ?? ''), r.event_id);
+    stateTargets.set(r.event_type + AUTH_SEP + (r.state_key ?? ''), { id: r.event_id, depth: r.depth });
   }
 
   // Single pass in dependency order: auth/prev references always point at
   // earlier events, so each event's final wire form (and derived ID) is
   // settled before any event that references it.
   for (const row of all.results as any[]) {
+    let reducedAuth: string[] = [];
     const event: PDU = {
       event_id: row.event_id,
       room_id: row.room_id,
@@ -183,18 +184,17 @@ export async function deriveRoomWireEvents(
         }
         if (expected.has(target.type + AUTH_SEP + target.stateKey)) push(ref);
       }
-      // Augment with required auth types missing from the stored event
-      // (state events precede their dependents in depth order).
+      // Augment with required auth types missing from the stored event.
+      // Only state that predates the event (depth guard): current state for
+      // a membership slot may be a *later* membership, which must never
+      // become an auth ref of an earlier event.
       for (const key of expected) {
-        const storedId = stateTargets.get(key);
-        // Never self-reference: current state for a membership event is the
-        // event itself; its auth needs the *previous* membership, which the
-        // stored references already carry.
-        if (!storedId || storedId === row.event_id) continue;
-        const wireId = idMap.get(storedId) ?? storedId;
-        push(wireId);
+        const st = stateTargets.get(key);
+        if (!st || st.id === row.event_id || st.depth >= row.depth) continue;
+        push(idMap.get(st.id) ?? st.id);
       }
       if (!msc4291 && createEventId) push(idMap.get(createEventId) ?? createEventId);
+      reducedAuth = kept;
       event.auth_events = kept;
     }
 
@@ -209,6 +209,18 @@ export async function deriveRoomWireEvents(
     const info = { type: row.event_type as string, stateKey: (row.state_key ?? '') as string };
     refTargets.set(row.event_id, info);
     refTargets.set(prepared.wireId, info);
+    // Peers' stored events reference the pre-augmentation derived form;
+    // map that older wire ID onto the current one so their refs resolve.
+    const oldPrepared = await prepareOutboundPdu(
+      env,
+      { ...event, auth_events: reducedAuth } as PDU,
+      roomVersion
+    );
+    if (oldPrepared && oldPrepared.wireId !== prepared.wireId) {
+      idMap.set(oldPrepared.wireId, prepared.wireId);
+      wireById.set(oldPrepared.wireId, prepared.wire);
+      refTargets.set(oldPrepared.wireId, info);
+    }
   }
 
   return { idMap, wireById };
