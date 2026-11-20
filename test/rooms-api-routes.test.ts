@@ -2890,6 +2890,19 @@ describe('GET room_summary (MSC3266)', () => {
     expect(roomMissing.status).toBe(404);
   });
 
+  it('404 for a remote alias whose server cannot resolve (no live answer)', async () => {
+    // Remote aliases now resolve live via the federation directory; when
+    // that fails (signing key unavailable here, so federationGet throws and
+    // resolveRemoteAlias swallows it) the summary must 404 cleanly.
+    const remoteAlias = encodeURIComponent('#moved:unreachable.example');
+    const { status } = await request(
+      `/_matrix/client/v1/room_summary/${remoteAlias}`,
+      {},
+      createSqlDb({ aliasRows: [], roomRows: [{ room_id: ROOM, room_version: '10', is_public: 1 }] })
+    );
+    expect(status).toBe(404);
+  });
+
   it('hides private invite-only rooms from anonymous callers', async () => {
     const db = createSqlDb({
       roomRows: [{ room_id: ROOM, room_version: '10', is_public: 0 }],

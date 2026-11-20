@@ -3002,10 +3002,18 @@ app.get('/_matrix/client/v1/room_summary/:roomIdOrAlias', async (c) => {
     const aliasResult = await db.prepare(
       `SELECT room_id FROM room_aliases WHERE alias = ?`
     ).bind(roomIdOrAlias).first<{ room_id: string }>();
-    if (!aliasResult) {
-      return Errors.notFound('Room alias not found').toResponse();
+    if (aliasResult) {
+      roomId = aliasResult.room_id;
+    } else {
+      // Remote alias: resolve live via the alias server's federation
+      // directory, exactly like the join path, so previews of moved
+      // aliases (room IDs change) resolve to the current room.
+      const remote = await resolveRemoteAlias(c.env, roomIdOrAlias);
+      if (!remote) {
+        return Errors.notFound('Room alias not found').toResponse();
+      }
+      roomId = remote.roomId;
     }
-    roomId = aliasResult.room_id;
   }
 
   // Get room info
