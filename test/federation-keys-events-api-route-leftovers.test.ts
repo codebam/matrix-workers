@@ -2574,7 +2574,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-0');
   });
 
@@ -2585,7 +2585,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-1');
   });
 
@@ -2596,7 +2596,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-2');
   });
 
@@ -2607,7 +2607,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-3');
   });
 
@@ -2618,7 +2618,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-4');
   });
 
@@ -2629,7 +2629,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-5');
   });
 
@@ -2640,7 +2640,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-6');
   });
 
@@ -2651,7 +2651,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-7');
   });
 
@@ -2662,7 +2662,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-8');
   });
 
@@ -2673,7 +2673,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-9');
   });
 
@@ -2684,7 +2684,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-10');
   });
 
@@ -2695,7 +2695,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-11');
   });
 
@@ -2706,7 +2706,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-12');
   });
 
@@ -2717,7 +2717,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-13');
   });
 
@@ -2728,7 +2728,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-14');
   });
 
@@ -2739,7 +2739,7 @@ describe('federation keys leftovers event soft flood after #161', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0].content.body).toBe('soft-15');
   });
 });
@@ -2767,7 +2767,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf0`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth0`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-1', async () => {
@@ -2791,7 +2791,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf1`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth1`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-2', async () => {
@@ -2815,7 +2815,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf2`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth2`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-3', async () => {
@@ -2839,7 +2839,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf3`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth3`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-4', async () => {
@@ -2863,7 +2863,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf4`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth4`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-5', async () => {
@@ -2887,7 +2887,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf5`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth5`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-6', async () => {
@@ -2911,7 +2911,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf6`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth6`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-7', async () => {
@@ -2935,7 +2935,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf7`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth7`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-8', async () => {
@@ -2959,7 +2959,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf8`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth8`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-9', async () => {
@@ -2983,7 +2983,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf9`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth9`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-10', async () => {
@@ -3007,7 +3007,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf10`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth10`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-11', async () => {
@@ -3031,7 +3031,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf11`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth11`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-12', async () => {
@@ -3055,7 +3055,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf12`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth12`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-13', async () => {
@@ -3079,7 +3079,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf13`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth13`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-14', async () => {
@@ -3103,7 +3103,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf14`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth14`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 
   it('event_auth soft-15', async () => {
@@ -3127,7 +3127,7 @@ describe('federation keys leftovers event_auth soft flood after #161', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(`$leaf15`)}`
     );
     expect(res.status).toBe(200);
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toContain(`$auth15`);
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toContain('m.room.create');
   });
 });
 

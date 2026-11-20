@@ -737,8 +737,9 @@ describe('federation GET /state/:roomId', () => {
       ['m.room.create', 'm.room.join_rules', 'm.room.member', 'm.room.power_levels'].sort()
     );
     // auth chain includes CREATE referenced by join_rules/power/member
-    const authIds = res.body.auth_chain.map((e: { event_id: string }) => e.event_id);
-    expect(authIds).toContain(CREATE);
+    // (wire PDUs carry no explicit event_id for room v3+; identify by type)
+    const authTypes = res.body.auth_chain.map((e: { type: string }) => e.type);
+    expect(authTypes).toContain('m.room.create');
   });
 
   it('returns empty pdus/auth_chain when room has no state', async () => {
@@ -800,8 +801,8 @@ describe('federation GET /state/:roomId', () => {
       env,
       `/_matrix/federation/v1/state/${encodeURIComponent(ROOM)}`
     );
-    expect(res.body.auth_chain.map((e: { event_id: string }) => e.event_id)).toEqual([
-      CREATE,
+    expect(res.body.auth_chain.map((e: { type: string }) => e.type)).toEqual([
+      'm.room.create',
     ]);
   });
 
@@ -971,11 +972,8 @@ describe('federation GET /backfill/:roomId', () => {
       env,
       `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?v=${encodeURIComponent('$c')},${encodeURIComponent('$d')}&limit=10`
     );
-    // min depth of $c,$d is 3 → depth < 3 → $a,$b
-    expect(res.body.pdus.map((p: { event_id: string }) => p.event_id).sort()).toEqual([
-      '$a',
-      '$b',
-    ]);
+    // min depth of $c,$d is 3 → depth < 3 → $a,$b (wire PDUs have no event_id)
+    expect(res.body.pdus.map((p: { depth: number }) => p.depth).sort()).toEqual([1, 2]);
   });
 
   it('caps v= list at 20 ids', async () => {
@@ -993,10 +991,8 @@ describe('federation GET /backfill/:roomId', () => {
       `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?v=${ids.map(encodeURIComponent).join(',')}`
     );
     expect(res.status).toBe(200);
-    // first 20 of ids have min depth 10 → includes $early
-    expect(res.body.pdus.some((p: { event_id: string }) => p.event_id === '$early')).toBe(
-      true
-    );
+    // first 20 of ids have min depth 10 → includes $early (depth 1)
+    expect(res.body.pdus.some((p: { depth: number }) => p.depth === 1)).toBe(true);
   });
 
   it('forbids when federationOrigin set and no remote member in room', async () => {
@@ -1126,11 +1122,12 @@ describe('federation POST /get_missing_events/:roomId', () => {
       })
     );
     expect(res.status).toBe(200);
-    const ids = res.body.events.map((e: { event_id: string }) => e.event_id);
-    expect(ids).toContain('$e3'); // latest is visited/emitted
-    expect(ids).toContain('$e2');
-    expect(ids).toContain('$e1');
-    expect(ids).not.toContain('$e0'); // earliest excluded via visited seed
+    // Wire events carry no event_id (room v3+); identify by depth.
+    const depths = res.body.events.map((e: { depth: number }) => e.depth);
+    expect(depths).toContain(4); // latest is visited/emitted
+    expect(depths).toContain(3);
+    expect(depths).toContain(2);
+    expect(depths).not.toContain(1); // earliest excluded via visited seed
   });
 
   it('defaults limit to 10 and caps at 100', async () => {

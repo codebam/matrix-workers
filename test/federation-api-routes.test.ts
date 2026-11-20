@@ -1585,10 +1585,12 @@ describe('make_join / send_join / make_leave / send_leave', () => {
       }
     );
     expect(status).toBe(200);
-    const b = body as { origin: string; state: unknown[]; auth_chain: unknown[]; event: { event_id: string } };
+    const b = body as { origin: string; state: Array<{ event_id?: string }>; auth_chain: unknown[]; event: { event_id?: string } };
     expect(b.origin).toBe(SERVER);
     expect(b.state.length).toBeGreaterThan(0);
-    expect(b.event.event_id).toBe('$jok');
+    // Room v3+ wire format: no explicit event_id anywhere in the response.
+    expect(b.event.event_id).toBeUndefined();
+    expect(b.state.every((p) => p.event_id === undefined)).toBe(true);
   });
 
   it('send_join v2 404s missing room and returns servers_in_room', async () => {

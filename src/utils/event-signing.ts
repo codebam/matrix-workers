@@ -140,6 +140,26 @@ export function toWireEventObject(event: Record<string, unknown>): Record<string
 }
 
 /**
+ * Room versions 1-2 carry an explicit `event_id` on the wire; from room
+ * version 3 onwards the receiver derives the ID from the reference hash and
+ * rejects PDUs that carry one (Synapse: "v2/v3 events must not have an
+ * explicit event_id"). Stored events keep their ID locally, so every
+ * federation serialization must drop it for modern room versions.
+ */
+export function omitWireEventId<T extends object>(
+  pdu: T,
+  roomVersion: string | undefined
+): T {
+  const num = parseInt(roomVersion ?? '', 10);
+  if (roomVersion === '1' || roomVersion === '2' || (Number.isFinite(num) && num <= 2)) {
+    return pdu;
+  }
+  const wire = { ...pdu } as Record<string, unknown>;
+  delete wire['event_id'];
+  return wire as T;
+}
+
+/**
  * True when the room version uses MSC4291 "room IDs as hashes" plus the
  * event_id-less wire format: the create event's ID is derived from its
  * reference hash ("$" + refhash), the room ID is "!" + refhash + ":" + server,

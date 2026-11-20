@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
-import { computeWireEventId, isMsc4291RoomVersion, redactEventForSigning, toWireEventObject } from '../utils/event-signing';
+import { computeWireEventId, isMsc4291RoomVersion, redactEventForSigning, toWireEventObject, omitWireEventId } from '../utils/event-signing';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import {
   getRemoteKeysWithNotarySignature,
@@ -1041,6 +1041,8 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
     return Errors.notFound('Event not found').toResponse();
   }
 
+  const eventRoom = await getRoom(c.env.DB, event.room_id);
+
   const pdu: PDU = {
     event_id: event.event_id,
     room_id: event.room_id,
@@ -1059,7 +1061,7 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
   return c.json({
     origin: c.env.SERVER_NAME,
     origin_server_ts: Date.now(),
-    pdus: [pdu],
+    pdus: [omitWireEventId(pdu, eventRoom?.room_version)],
   });
 });
 
@@ -1068,6 +1070,8 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
   // Note: eventId could be used to get state at a specific point in time
   void c.req.query('event_id');
+
+  const stateRoom = await getRoom(c.env.DB, roomId);
 
   // Get current room state
   const stateEvents = await c.env.DB.prepare(
@@ -1138,8 +1142,8 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   return c.json({
     origin: c.env.SERVER_NAME,
     origin_server_ts: Date.now(),
-    pdus,
-    auth_chain: authChain,
+    pdus: pdus.map((p) => omitWireEventId(p, stateRoom?.room_version)),
+    auth_chain: authChain.map((p) => omitWireEventId(p, stateRoom?.room_version)),
   });
 });
 
@@ -1217,8 +1221,8 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
 
   // Verify room exists
   const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
@@ -1291,7 +1295,7 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
   }
 
   return c.json({
-    auth_chain: authChain,
+    auth_chain: authChain.map((p) => omitWireEventId(p, room.room_version)),
   });
 });
 
@@ -1304,8 +1308,8 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
 
   // Verify room exists
   const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
@@ -1372,7 +1376,7 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
   return c.json({
     origin: c.env.SERVER_NAME,
     origin_server_ts: Date.now(),
-    pdus,
+    pdus: pdus.map((p) => omitWireEventId(p, room.room_version)),
   });
 });
 
@@ -1400,8 +1404,8 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
 
   // Verify room exists
   const room = await c.env.DB.prepare(
-    `SELECT room_id FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string }>();
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
@@ -1475,7 +1479,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
   }
 
   return c.json({
-    events,
+    events: events.map((p) => omitWireEventId(p, room.room_version)),
   });
 });
 
@@ -1975,8 +1979,8 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
 
   return c.json({
     origin: c.env.SERVER_NAME,
-    auth_chain: authChain,
-    state: stateEvents.results.map((e: any) => ({
+    auth_chain: authChain.map((p) => omitWireEventId(p, room.room_version)),
+    state: stateEvents.results.map((e: any) => omitWireEventId({
       event_id: e.event_id,
       room_id: e.room_id,
       sender: e.sender,
@@ -1989,8 +1993,8 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
       prev_events: JSON.parse(e.prev_events),
       hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
       signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-    })),
-    event: body,
+    }, room.room_version)),
+    event: omitWireEventId(body, room.room_version),
   });
 });
 
@@ -2138,8 +2142,8 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
 
   return c.json({
     origin: c.env.SERVER_NAME,
-    auth_chain: authChain,
-    state: stateEvents.results.map((e: any) => ({
+    auth_chain: authChain.map((p) => omitWireEventId(p, room.room_version)),
+    state: stateEvents.results.map((e: any) => omitWireEventId({
       event_id: e.event_id,
       room_id: e.room_id,
       sender: e.sender,
@@ -2152,8 +2156,8 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
       prev_events: JSON.parse(e.prev_events),
       hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
       signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
-    })),
-    event: body,
+    }, room.room_version)),
+    event: omitWireEventId(body, room.room_version),
     members_omitted: false,
     servers_in_room: Array.from(serversInRoom),
   });

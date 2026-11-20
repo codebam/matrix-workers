@@ -1850,8 +1850,10 @@ describe('federation GET /event/:eventId', () => {
     expect(res.body.origin).toBe(SERVER);
     expect(res.body.origin_server_ts).toBe(NOW);
     expect(res.body.pdus).toHaveLength(1);
+    // Room versions 3+ derive the ID from the reference hash; the wire PDU
+    // must not carry an explicit event_id.
+    expect(res.body.pdus[0].event_id).toBeUndefined();
     expect(res.body.pdus[0]).toMatchObject({
-      event_id: EVENT,
       room_id: ROOM,
       sender: USER,
       type: 'm.room.message',
@@ -1889,7 +1891,8 @@ describe('federation GET /event/:eventId', () => {
     });
     const res = await request(env, `/_matrix/federation/v1/event/${encodeURIComponent(id)}`);
     expect(res.status).toBe(200);
-    expect(res.body.pdus[0].event_id).toBe(id);
+    expect(res.body.pdus).toHaveLength(1);
+    expect(res.body.pdus[0].event_id).toBeUndefined();
   });
 
   it('parses nested JSON content objects', async () => {
@@ -1984,13 +1987,13 @@ describe('federation GET /event_auth/:roomId/:eventId', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`
     );
     expect(res.status).toBe(200);
-    const ids = res.body.auth_chain.map((e: { event_id: string }) => e.event_id);
-    expect(ids).toContain('$power');
-    expect(ids).toContain('$create');
-    expect(ids.filter((id: string) => id === '$create')).toHaveLength(1);
-    expect(ids).not.toContain('$missing');
-    const powerPdu = res.body.auth_chain.find((e: { event_id: string }) => e.event_id === '$power');
-    expect(powerPdu.type).toBe('m.room.power_levels');
+    // Wire PDUs carry no explicit event_id (room v3+); identify by type.
+    const types = res.body.auth_chain.map((e: { type: string }) => e.type);
+    expect(types).toContain('m.room.power_levels');
+    expect(types).toContain('m.room.create');
+    expect(types.filter((t: string) => t === 'm.room.create')).toHaveLength(1);
+    expect(res.body.auth_chain).toHaveLength(2); // '$missing' skipped
+    const powerPdu = res.body.auth_chain.find((e: { type: string }) => e.type === 'm.room.power_levels');
     expect(powerPdu.auth_events).toEqual(['$create', '$missing', '$create']);
   });
 
@@ -2043,8 +2046,9 @@ describe('federation GET /event_auth/:roomId/:eventId', () => {
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`
     );
     expect(res.body.auth_chain).toHaveLength(500);
-    expect(res.body.auth_chain[0].event_id).toBe('$a0');
-    expect(res.body.auth_chain[499].event_id).toBe('$a499');
+    expect(res.body.auth_chain[0].depth).toBe(1);
+    expect(res.body.auth_chain[499].depth).toBe(500);
+    expect(res.body.auth_chain[0].event_id).toBeUndefined();
   });
 
   it('percent-decodes room and event path params', async () => {
@@ -2306,10 +2310,9 @@ describe('federation keys/events TOKENMAXX leftovers after #119', () => {
       env,
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`
     );
-    const ids = res.body.auth_chain.map((e: { event_id: string }) => e.event_id);
-    expect(ids.indexOf('$a')).toBeLessThan(ids.indexOf('$c'));
-    expect(ids.indexOf('$b')).toBeLessThan(ids.indexOf('$c'));
-    expect(ids.filter((id: string) => id === '$c')).toHaveLength(1);
+    // Siblings (depth 2) before the shared ancestor (depth 1), deduped.
+    const depths = res.body.auth_chain.map((e: { depth: number }) => e.depth);
+    expect(depths).toEqual([2, 2, 1]);
   });
 
   it('devices endpoint ignores devices belonging to other users', async () => {
@@ -2464,10 +2467,9 @@ describe('federation keys/events TOKENMAXX leftovers after #119', () => {
       env,
       `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`
     );
-    expect(res.body.auth_chain.filter((e: { event_id: string }) => e.event_id === '$root')).toHaveLength(
-      1
-    );
+    // left + right + root once (deduped); wire PDUs carry no event_id.
     expect(res.body.auth_chain).toHaveLength(3);
+    expect(res.body.auth_chain.every((e: { event_id?: string }) => e.event_id === undefined)).toBe(true);
   });
 
   it('forbids devices lookup when userId has no colon domain part matching', async () => {
