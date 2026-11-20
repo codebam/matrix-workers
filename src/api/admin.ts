@@ -2806,6 +2806,13 @@ app.post('/admin/api/bots', requireAuth(), requireAdmin, async (c) => {
 
   let joined = false;
   if (roomId) {
+    // Private rooms need an invite before the bot can join. Invite as the
+    // requesting admin (the state path auto-accepts for bots); failures are
+    // ignored — public rooms join directly either way.
+    try {
+      const { performStateEvent } = await import('./rooms');
+      await performStateEvent(c.env, roomId, c.get('userId'), 'm.room.member', userId, { membership: 'invite' });
+    } catch { /* best-effort */ }
     const { joinBotUserToRoom } = await import('./rooms');
     joined = (await joinBotUserToRoom(c.env, roomId, userId)) !== null;
   }
@@ -2882,6 +2889,13 @@ app.post('/admin/api/telegram/bridges', requireAuth(), requireAdmin, async (c) =
   }
 
   const { joinBotUserToRoom } = await import('./rooms');
+  // Private rooms need an invite first; invite as the requesting admin (the
+  // state path auto-accepts for bots). Failures are ignored: public rooms
+  // join directly, and the membership check below still guards.
+  try {
+    const { performStateEvent } = await import('./rooms');
+    await performStateEvent(c.env, roomId, c.get('userId'), 'm.room.member', botUserId, { membership: 'invite' });
+  } catch { /* best-effort */ }
   const joined = (await joinBotUserToRoom(c.env, roomId, botUserId)) !== null;
   const membership = await db
     .prepare(`SELECT membership FROM room_memberships WHERE room_id = ? AND user_id = ?`)

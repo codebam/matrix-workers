@@ -1451,6 +1451,9 @@ export const adminDashboardHtml = (serverName: string) => `
       <symbol id="icon-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>
       </symbol>
+      <symbol id="icon-bot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 8V4"/><path d="M8 4h8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M9 14h.01"/><path d="M15 14h.01"/><path d="M2 14v-2"/><path d="M22 14v-2"/>
+      </symbol>
       <symbol id="icon-info" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>
       </symbol>
@@ -1562,6 +1565,7 @@ export const adminDashboardHtml = (serverName: string) => `
         <a class="nav-item" data-page="media"><svg class="icon"><use href="#icon-folder"/></svg><span>Media</span></a>
         <a class="nav-item" data-page="reports"><svg class="icon"><use href="#icon-alert-triangle"/></svg><span>Reports</span><span class="badge-count hidden" id="reportsBadge">0</span></a>
         <a class="nav-item" data-page="federation"><svg class="icon"><use href="#icon-globe"/></svg><span>Federation</span></a>
+        <a class="nav-item" data-page="bots"><svg class="icon"><use href="#icon-bot"/></svg><span>Bots &amp; Bridges</span></a>
         <a class="nav-item" data-page="idp"><svg class="icon"><use href="#icon-key"/></svg><span>Identity Providers</span></a>
         <a class="nav-item" data-page="config"><svg class="icon"><use href="#icon-settings"/></svg><span>Settings</span></a>
       </nav>
@@ -1865,6 +1869,82 @@ export const adminDashboardHtml = (serverName: string) => `
         </div>
       </section>
 
+      <!-- Bots & Bridges Page -->
+      <section id="page-bots" class="page hidden">
+        <div class="header">
+          <h2>Bots &amp; Bridges</h2>
+        </div>
+
+        <!-- Native Bots -->
+        <div class="card" style="margin-bottom: 20px;">
+          <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3>Native Bots</h3>
+            <button class="btn btn-primary" onclick="openModal('createBotModal')">Create Bot</button>
+          </div>
+          <div class="card-body" style="font-size: 13px; color: var(--text-secondary); margin-bottom: 10px;">
+            Bot accounts have no password and can never log in; the homeserver acts for them.
+            Admin bots answer <code>!admin</code> commands from server admins in rooms they occupy; invites are auto-accepted.
+          </div>
+          <div class="card-body">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>User</th>
+                  <th>Kind</th>
+                  <th>Command Prefix</th>
+                  <th>Status</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="botsTable">
+                <tr><td colspan="5" style="text-align: center; color: var(--text-secondary);">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Telegram Bridges -->
+        <div class="card" style="margin-bottom: 20px;">
+          <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+            <h3>Telegram Bridges</h3>
+            <button class="btn btn-primary" onclick="openModal('createBridgeModal')">Register Bridge</button>
+          </div>
+          <div class="card-body" style="font-size: 13px; color: var(--text-secondary); margin-bottom: 10px;">
+            One Telegram bot chat ↔ one Matrix room, both directions, webhook-driven (no polling).
+            The BotFather token is stored server-side and shown here only as a fingerprint.
+          </div>
+          <div class="card-body">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Bridge Bot</th>
+                  <th>Room</th>
+                  <th>Telegram Chat</th>
+                  <th>Token</th>
+                  <th>Webhook</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="bridgesTable">
+                <tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">Loading…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- Telegram gotchas -->
+        <div class="card">
+          <div class="card-header"><h3>Telegram Setup Notes</h3></div>
+          <div class="card-body" style="font-size: 13px; line-height: 1.7; color: var(--text-secondary);">
+            <strong>1.</strong> Create the bot with <code>@BotFather</code> (<code>/newbot</code>) and paste its token into Register Bridge. Bot localpart defaults to <code>tgbot</code> (becomes <code>@tgbot:SERVER_NAME</code>).<br>
+            <strong>2.</strong> Group bots ship with <strong>privacy mode</strong> ON — they only see commands and mentions. Disable it via <code>@BotFather → /setprivacy → Disable</code>.<br>
+            <strong>3.</strong> If Telegram→Matrix stops after changing privacy, toggle the bot's <strong>group admin status</strong> off/on (or remove &amp; re-add it) — Telegram only refreshes message routing when the membership is renewed.<br>
+            <strong>4.</strong> The room must be public, or invite the bridge bot first — it auto-accepts.<br>
+            <strong>5.</strong> Message the bot once on Telegram before expecting replies (chats start with the user).
+          </div>
+        </div>
+      </section>
+
       <!-- Identity Providers Page -->
       <section id="page-idp" class="page hidden">
         <div class="header">
@@ -2129,6 +2209,73 @@ export const adminDashboardHtml = (serverName: string) => `
       <div class="modal-footer">
         <button class="btn btn-secondary" onclick="closeModal('createUserModal')">Cancel</button>
         <button class="btn btn-primary" onclick="createUser()">Create User</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Bot Modal -->
+  <div class="modal-overlay" id="createBotModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Create Bot</h3>
+        <button class="modal-close" onclick="closeModal('createBotModal')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Localpart (becomes @localpart:SERVER_NAME)</label>
+          <input type="text" class="form-control" id="botLocalpart" placeholder="adminbot">
+        </div>
+        <div class="form-group">
+          <label>Display Name (optional)</label>
+          <input type="text" class="form-control" id="botDisplayName" placeholder="Admin Bot">
+        </div>
+        <div class="form-group">
+          <label>Kind</label>
+          <select class="form-control" id="botKind">
+            <option value="admin">admin (in-room !admin console)</option>
+            <option value="telegram">telegram (relay account)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Join room (optional — public room ID, or invite the bot and it auto-accepts)</label>
+          <input type="text" class="form-control" id="botRoomId" placeholder="!room:SERVER_NAME">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('createBotModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="createBot()">Create Bot</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Create Telegram Bridge Modal -->
+  <div class="modal-overlay" id="createBridgeModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Register Telegram Bridge</h3>
+        <button class="modal-close" onclick="closeModal('createBridgeModal')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Bridge bot localpart (created if missing, joined to the room)</label>
+          <input type="text" class="form-control" id="bridgeBotLocalpart" placeholder="tgbot">
+        </div>
+        <div class="form-group">
+          <label>Room ID (private rooms: the bot is invited automatically)</label>
+          <input type="text" class="form-control" id="bridgeRoomId" placeholder="!room:SERVER_NAME">
+        </div>
+        <div class="form-group">
+          <label>Telegram chat id (numeric; @userinfobot shows yours, groups are -100…)</label>
+          <input type="text" class="form-control" id="bridgeChatId" placeholder="-1001234567890">
+        </div>
+        <div class="form-group">
+          <label>BotFather token (server-side secret; never shown again)</label>
+          <input type="password" class="form-control" id="bridgeTgToken" placeholder="123456:ABC-DEF…">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('createBridgeModal')">Cancel</button>
+        <button class="btn btn-primary" onclick="createBridge()">Register Bridge</button>
       </div>
     </div>
   </div>
@@ -2436,6 +2583,7 @@ export const adminDashboardHtml = (serverName: string) => `
         case 'media': loadMedia(); break;
         case 'reports': loadReports(); break;
         case 'federation': loadFederation(); break;
+        case 'bots': loadBots(); break;
         case 'idp': loadIdpProviders(); break;
         case 'config': loadConfig(); loadRegistrationStatus(); break;
       }
@@ -3415,6 +3563,133 @@ export const adminDashboardHtml = (serverName: string) => `
       document.getElementById('resolveReportId').value = reportId;
       document.getElementById('resolutionNote').value = '';
       openModal('resolveReportModal');
+    }
+
+    // Bots & Bridges
+    async function loadBots() {
+      loadBotsTable();
+      loadBridgesTable();
+    }
+
+    async function loadBotsTable() {
+      const tbody = document.getElementById('botsTable');
+      try {
+        const data = await api('/admin/api/bots');
+        if (!data.bots || data.bots.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--text-secondary);">No bots yet</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.bots.map(b => \`
+          <tr>
+            <td>\${escapeHtml(b.user_id)}</td>
+            <td><span class="badge \${b.kind === 'admin' ? 'badge-success' : 'badge-warning'}">\${escapeHtml(b.kind)}</span></td>
+            <td><code>\${escapeHtml(b.command_prefix)}</code></td>
+            <td><span class="badge \${b.enabled ? 'badge-success' : 'badge-danger'}">\${b.enabled ? 'Enabled' : 'Disabled'}</span></td>
+            <td><button class="btn btn-sm \${b.enabled ? 'btn-secondary' : 'btn-primary'}" onclick="toggleBot('\${b.id}', \${b.enabled})">\${b.enabled ? 'Disable' : 'Enable'}</button></td>
+          </tr>
+        \`).join('');
+      } catch (err) {
+        console.error('Failed to load bots:', err);
+        tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: var(--danger);">Failed to load bots</td></tr>';
+      }
+    }
+
+    async function loadBridgesTable() {
+      const tbody = document.getElementById('bridgesTable');
+      try {
+        const data = await api('/admin/api/telegram/bridges');
+        if (!data.bridges || data.bridges.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-secondary);">No telegram bridges yet</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.bridges.map(b => \`
+          <tr>
+            <td>\${escapeHtml(b.bot_user_id)}</td>
+            <td style="font-family: monospace; font-size: 12px;">\${escapeHtml(b.room_id)}</td>
+            <td>\${escapeHtml(b.chat_id)}</td>
+            <td><code>\${escapeHtml(b.token_fingerprint || '')}</code></td>
+            <td><span class="badge \${b.enabled ? 'badge-success' : 'badge-danger'}">\${b.enabled ? 'Armed' : 'Disabled'}</span><div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">update #\${b.last_update_id}</div></td>
+            <td><button class="btn btn-sm btn-danger" onclick="deleteBridge('\${b.id}')">Remove</button></td>
+          </tr>
+        \`).join('');
+      } catch (err) {
+        console.error('Failed to load bridges:', err);
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--danger);">Failed to load bridges</td></tr>';
+      }
+    }
+
+    async function createBot() {
+      const localpart = document.getElementById('botLocalpart').value.trim();
+      const displayName = document.getElementById('botDisplayName').value.trim();
+      const kind = document.getElementById('botKind').value;
+      const roomId = document.getElementById('botRoomId').value.trim();
+      if (!localpart) { showToast('Localpart is required', 'error'); return; }
+      try {
+        await api('/admin/api/bots', {
+          method: 'POST',
+          body: JSON.stringify({
+            localpart,
+            display_name: displayName || undefined,
+            kind,
+            room_id: roomId || undefined
+          })
+        });
+        closeModal('createBotModal');
+        showToast('Bot created', 'success');
+        if (kind === 'admin') {
+          showToast('Type !admin help in its room to see commands', 'info');
+        }
+        loadBotsTable();
+      } catch (err) {
+        showToast(\`Failed to create bot: \${err.message}\`, 'error');
+      }
+    }
+
+    async function toggleBot(botId, currentlyEnabled) {
+      try {
+        await api(\`/admin/api/bots/\${botId}/toggle\`, { method: 'POST' });
+        showToast(currentlyEnabled ? 'Bot disabled' : 'Bot enabled', 'success');
+        loadBotsTable();
+      } catch (err) {
+        showToast(\`Failed: \${err.message}\`, 'error');
+      }
+    }
+
+    async function createBridge() {
+      const botLocalpart = document.getElementById('bridgeBotLocalpart').value.trim() || 'tgbot';
+      const roomId = document.getElementById('bridgeRoomId').value.trim();
+      const chatId = document.getElementById('bridgeChatId').value.trim();
+      const tgToken = document.getElementById('bridgeTgToken').value.trim();
+      if (!roomId || !chatId || !tgToken) {
+        showToast('Room, chat id and token are required', 'error');
+        return;
+      }
+      try {
+        const data = await api('/admin/api/telegram/bridges', {
+          method: 'POST',
+          body: JSON.stringify({ bot_localpart: botLocalpart, room_id: roomId, chat_id: chatId, tg_token: tgToken })
+        });
+        document.getElementById('bridgeTgToken').value = '';
+        closeModal('createBridgeModal');
+        showToast('Bridge registered — Telegram webhook armed', 'success');
+        if (data.webhook_url) {
+          showToast(\`Webhook: \${data.webhook_url}\`, 'info');
+        }
+        loadBridgesTable();
+      } catch (err) {
+        showToast(\`Failed to register: \${err.message}\`, 'error');
+      }
+    }
+
+    async function deleteBridge(bridgeId) {
+      if (!confirm('Remove this Telegram bridge? The webhook is deleted on the Telegram side; the bot user stays.')) return;
+      try {
+        await api(\`/admin/api/telegram/bridges/\${bridgeId}\`, { method: 'DELETE' });
+        showToast('Bridge removed', 'success');
+        loadBridgesTable();
+      } catch (err) {
+        showToast(\`Failed to remove: \${err.message}\`, 'error');
+      }
     }
 
     async function confirmResolveReport() {
