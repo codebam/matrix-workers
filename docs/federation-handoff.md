@@ -53,20 +53,20 @@ message path, destinations captured before membership rows mutate, kick/ban
 include the target's server; member invites via the state path route through
 the dedicated invite flow). Peer-suite regression covers leave→rejoin→message.
 
-## GNU/Linux live status (probed directly against matrix.org)
-- matrix.org does **NOT hold** recent codebam.ca messages (signed /event probe
-  → M_NOT_FOUND for the 21:40 message).
-- Their resolved state for @codebam:codebam.ca is **`invite`** — the 16:55 join
-  (pre-dating the ca886c09 auth-chain fix deploy) was outliered, so everything
-  since is "sender not in room" → silent drop.
-- The user has NOT done the leave+rejoin yet (no member events after 16:55).
+## GNU/Linux live status (CLOSED, user-verified 2026-11-20)
+"yay I fixed it" (23:58:44, `$nB3HRvWq…`) **displayed in the room**, and a
+signed /event probe confirms matrix.org holds it with auth refs exactly
+matching the re-synced real IDs. The original "200 but never displays" bug —
+the four stacked root causes (auth_chain raw-row leak, version-blind wire
+IDs incl. the v1-10 origin/prev_state redaction, remote-room re-derivation
+phantom IDs, missing member/state fanout) — is closed.
 
-**Heal procedure (user action, after the prod deploy below):** from Element on
-codebam.ca, leave the GNU/Linux room, re-join it, send a message. With
-`9ebd7f5` the leave and rejoin actually federate; with `97d9422` a fresh join
-stores state under correct IDs. Verify from here: signed
-`GET /_matrix/federation/v1/event/{id}` against matrix-federation.matrix.org
-should 200 for the new message, and their /state should show membership=join.
+## Post-join timeline backfill (VALIDATED live, 2026-11-20)
+fed-repro5 on the prod<->dev pair: dev joined a room whose messages
+predated the join and its /sync timeline showed both — deliverable only via
+the new `/backfill` workflow step. The fetch is READ-ONLY: rejoining a room
+costs one visible member event and nothing else; there is no spam risk from
+the history fetch. (User deferred rejoining #gaming:nixos.org.)
 
 ## Deploy state
 - dev (`wrangler.dev.jsonc`): **fully current** — `81480314` (all fixes).
