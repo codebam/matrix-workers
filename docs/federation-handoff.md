@@ -1,9 +1,9 @@
 # Federation delivery handoff (2026-11-19/20, session 2)
 
-Context: continuing from `29a74df`. Goal unchanged: make codebam.ca↔matrix.org
-delivery reliable (GNU/Linux room `!iDwfRnmIeZCSTKVEim:halogen.city`, v9) and
-validate against the dev.codebam.ca instance. Four root causes found and
-fixed across sessions 2-4; see "GNU/Linux live status" for the state of play.
+Context: continuing from `29a74df`. Federation delivery is FIXED and
+user-verified (see "GNU/Linux live status"); sessions 2-4 closed four stacked
+root causes. Session 5 (2026-11-20) shipped the next feature set: native bots
+(see docs below).
 
 ## What this session found and fixed (all pushed to origin/main)
 
@@ -128,3 +128,33 @@ the history fetch. (User deferred rejoining #gaming:nixos.org.)
   `/tmp/fedsign3.ts` (self-signed federation GET to any destination),
   `/tmp/refhash-check.mjs` (offline v10/v11 refhash comparison),
   `/tmp/parse-tails.py` (wrangler JSON tail parser).
+
+## Native bots + Telegram bridge (2026-11-20, session 5)
+Shipped in `02c99ce` (prod `c715c6a4`, dev `3da7aa2e`, migrations 023/024
+applied to both, additive-only).
+
+- **Bots**: users with NO password (cannot log in). Admin API
+  `POST /admin/api/bots {localpart, kind, room_id?}` creates + server-side
+  joins; invites auto-accept.
+- **Admin console** (`!admin`, server-admin senders only, replies m.notice):
+  help/status, token mint/list/revoke, user list/create/deactivate
+  CONFIRM/reset-password, federation status, room kick/ban/unban (performed AS
+  THE BOT — the room's power levels govern), notice, telegram list.
+- **Telegram bridge** (webhook-only, no polling): BotFather token supplied
+  ONLY via `POST /admin/api/telegram/bridges {bot_localpart, room_id,
+  chat_id, tg_token}` (auto-creates the bot user, joins it, calls setWebhook
+  with a secret; rolls back on Telegram rejection). Updates land as
+  `[TG] Name (@user): text`; Matrix→TG relays local AND federated sends with
+  display-name prefixes; loop prevention is structural (all integrations
+  skip bot senders; consumed commands are never relayed).
+- Loop-prevention/hook architecture: single hook
+  `src/services/room-integrations.ts` from `performSendEvent` ('local') and
+  inbound /send ('federated'); all cross-module room imports are dynamic (no
+  static import cycles).
+- Live-validated on dev: create+join, !admin status/token mint, webhook
+  403/200, TG→Matrix in-room relay, Matrix→TG attempt.
+- Setup on prod: login as @codebam for an admin token; create a local
+  management room; `POST /admin/api/bots {localpart:"adminbot", room_id}`;
+  type `!admin help`. Telegram: BotFather /newbot, message the bot once,
+  chat id via @userinfobot (private chats) or the group's id, then
+  `POST /admin/api/telegram/bridges`.
