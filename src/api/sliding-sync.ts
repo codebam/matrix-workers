@@ -651,7 +651,7 @@ async function getRoomData(
       `;
       timelineParams = [roomId, config.sinceStreamOrdering!, fetchLimit];
     } else {
-      // Initial: get the most recent events. stream_ordering = 0 marks
+      // Initial: get the most recent events. Negative stream_ordering marks
       // state-snapshot rows — never timeline material.
       timelineQuery = `
         SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering

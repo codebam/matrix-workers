@@ -401,15 +401,20 @@ export async function storeEventIdempotent(
   opts: { stateOnly?: boolean } = {}
 ): Promise<{ inserted: boolean; streamOrdering: number | null }> {
   // State-snapshot events (the backfilled CURRENT STATE of a remote room —
-  // thousands of member joins for a big room) are stored with stream_ordering
-  // 0: they remain fully usable for auth checks, room_state serving and
-  // federation responses, but every timeline-serving query filters
-  // `stream_ordering > 0`, so paginated history shows the actual conversation
-  // instead of a wall of join messages. Real history (live /send, timeline
-  // backfill, locally created events) keeps ascending stream positions.
+  // thousands of member joins for a big room) are stored at NEGATIVE stream
+  // positions: still unique (events.stream_ordering carries a UNIQUE index,
+  // so a shared sentinel value would fail the second insert), fully usable
+  // for auth checks, room_state serving and federation responses, but
+  // excluded by every timeline query's `stream_ordering > 0` filter — so
+  // paginated history shows the actual conversation instead of a wall of
+  // join messages. Real history (live /send, timeline backfill, locally
+  // created events) keeps ascending positive positions.
   let streamOrdering: number;
   if (opts.stateOnly) {
-    streamOrdering = 0;
+    const posResult = await db.prepare(
+      `UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'events' RETURNING position`
+    ).first<{ position: number }>();
+    streamOrdering = -(posResult?.position ?? 1);
   } else {
     // Allocate stream ordering optimistically. If the event already exists
     // we simply waste one stream id; this is preferable to
@@ -505,7 +510,7 @@ export async function getRoomEvents(
   const params: (string | number)[] = [roomId];
 
   if (direction === 'b') {
-    // Backwards (newest first). stream_ordering = 0 marks state-snapshot
+    // Backwards (newest first). Negative stream_ordering marks state-snapshot
     // rows (backfilled current state) — never part of paginated history.
     if (fromToken) {
       query = `SELECT * FROM events WHERE room_id = ? AND stream_ordering > 0 AND stream_ordering < ? ORDER BY stream_ordering DESC LIMIT ?`;

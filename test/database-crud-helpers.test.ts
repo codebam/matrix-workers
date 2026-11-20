@@ -1371,7 +1371,7 @@ describe('database storeEvent / getEvent', () => {
     expect(db._state.roomState.size).toBe(0);
   });
 
-  it('storeEventIdempotent stateOnly stores at stream_ordering 0 without allocating', async () => {
+  it('storeEventIdempotent stateOnly stores at a negative ordering outside the timeline', async () => {
     const db = createCrudDb({ streamPosition: 5 });
     const event = pdu({
       event_id: '$snap1',
@@ -1381,14 +1381,15 @@ describe('database storeEvent / getEvent', () => {
     });
     await expect(storeEventIdempotent(db, event, { stateOnly: true })).resolves.toEqual({
       inserted: true,
-      streamOrdering: 0,
+      streamOrdering: -6,
     });
-    // No stream id consumed: the snapshot row sits outside the timeline.
-    expect(db._state.streamPosition).toBe(5);
+    // Snapshot orderings are unique (UNIQUE index on stream_ordering): each
+    // snapshot negates its own allocation instead of sharing a sentinel.
+    expect(db._state.streamPosition).toBe(6);
     // Current state still points at the stored event.
     expect(db._state.roomState.get(`${ROOM}\0m.room.member\0@someone:remote.example`)).toBe('$snap1');
     const stored = db._state.events.find((e) => e.event_id === '$snap1');
-    expect(stored?.stream_ordering).toBe(0);
+    expect(stored?.stream_ordering).toBe(-6);
   });
 
   it('storeEventIdempotent stateOnly collision keeps the original row untouched', async () => {
@@ -1522,9 +1523,9 @@ describe('database getRoomEvents / getRoomState / getStateEvent', () => {
     });
   });
 
-  it('getRoomEvents never serves state-snapshot rows (stream_ordering = 0)', async () => {
+  it('getRoomEvents never serves state-snapshot rows (negative orderings)', async () => {
     // A big remote room: thousands of backfilled member joins (snapshot,
-    // ordering 0) plus a real recent timeline (orderings 1..3).
+    // negative orderings) plus a real recent timeline (orderings 1..3).
     const snapshot = ['a', 'b', 'c'].map((k, i) =>
       eventRowFromPdu(
         pdu({
@@ -1533,7 +1534,7 @@ describe('database getRoomEvents / getRoomState / getStateEvent', () => {
           state_key: `@u${i}:remote.example`,
           content: { membership: 'join' },
         }),
-        0
+        -(i + 1)
       )
     );
     const db = createCrudDb({ events: [...snapshot, ...seededEvents().slice(0, 3)] });
