@@ -283,3 +283,6 @@ code/pre/links now survive both directions. Pure converter module:
   <a href="https://google.com">link</a></strong>`) into the ops room; tail
   clean, no fallback needed. Test event
   `$33X4OG_lZTB-AfM8IQ7Anggncqocp246B1BG5Cr2Hgo`.
+- Live-verified Telegram → Matrix (both directions USER-VERIFIED
+  2026-11-20): Telegram-formatted text (entities) arrived in the room with
+  real bold/links rendered by Element.
