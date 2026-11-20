@@ -15,12 +15,26 @@
 //   back. Telegram -> Matrix image updates are downloaded via getFile and
 //   stored in our media repo, so the room references a mxc:// URI we serve.
 //
+//   Formatting: Matrix formatted_body converts to Telegram's HTML
+//   parse_mode — only whitelisted tags survive and everything else is
+//   re-escaped (services/telegram-format), with a plain-text retry if
+//   Telegram's parser rejects the result. Telegram entities convert into a
+//   freshly escaped Matrix formatted_body. Markdown typed literally in the
+//   Telegram box is NOT parsed: Telegram delivers it as plain text, and only
+//   its formatting entities (BIU menu, links) are structured.
+//
 // The bot token is a server-side credential stored in D1 (like hs_token in
 // appservice_registrations) and is only ever supplied via the admin HTTP
 // API — never via room messages, whose history is permanent.
 
 import type { Env } from '../types';
 import { generateOpaqueId } from '../utils/ids';
+import {
+  escapeHtml,
+  matrixHtmlToTelegramHtml,
+  telegramEntitiesToFormattedBody,
+  type TgMessageEntity,
+} from './telegram-format';
 
 export interface TelegramBridgeRow {
   id: string;
@@ -290,11 +304,34 @@ export async function relayMatrixToTelegram(
       return;
     }
 
-    const payload = `${name}: ${body}`;
-    // Plain text only: never parse_mode, so relayed content cannot inject
-    // Telegram formatting.
+    // Rich text: Matrix formatted_body converts to Telegram's HTML subset
+    // (matrixHtmlToTelegramHtml re-escapes everything — input HTML is
+    // untrusted). Plain text never uses parse_mode. If Telegram's strict
+    // parser rejects the converted result, the message retries once as
+    // plain text so formatting can never drop a relay.
+    const formattedBody =
+      content.format === 'org.matrix.custom.html' &&
+      typeof content.formatted_body === 'string' &&
+      content.formatted_body.trim()
+        ? content.formatted_body
+        : null;
+    const html = formattedBody ? matrixHtmlToTelegramHtml(formattedBody) : null;
+    const plain = `${name}: ${body}`;
+    const rich = html ? `${escapeHtml(name)}: ${html}` : null;
+
     const results = await Promise.allSettled(
-      bridges.map((b) => tgCall(b.tg_token, 'sendMessage', { chat_id: b.chat_id, text: payload }))
+      bridges.map(async (b) => {
+        if (rich) {
+          const r = await tgCall(b.tg_token, 'sendMessage', {
+            chat_id: b.chat_id,
+            text: rich,
+            parse_mode: 'HTML',
+          });
+          if (r.ok) return r;
+          console.warn('[telegram-bridge] HTML relay rejected, retrying plain:', r.description);
+        }
+        return tgCall(b.tg_token, 'sendMessage', { chat_id: b.chat_id, text: plain });
+      })
     );
     for (const r of results) {
       if (r.status === 'rejected') {
@@ -343,6 +380,10 @@ interface TelegramUpdate {
     chat: { id: number; type: string; title?: string };
     text?: string;
     caption?: string;
+    /** Formatting ranges over text (UTF-16 code unit offsets). */
+    entities?: unknown;
+    /** Formatting ranges over caption (UTF-16 code unit offsets). */
+    caption_entities?: unknown;
     photo?: unknown;
     document?: unknown;
     sticker?: unknown;
@@ -535,8 +576,21 @@ export async function processTelegramUpdate(
     }
 
     let body: string;
+    let content: Record<string, unknown>;
     if (typeof msg.text === 'string' && msg.text.length > 0) {
-      body = msg.text;
+      body = `[TG] ${senderName}: ${msg.text}`;
+      content = { msgtype: 'm.text', body };
+      // Telegram's formatting menu (and bots) produce entities — offset/
+      // length ranges over the text. Convert them into a freshly escaped
+      // Matrix formatted_body so bold/italic/links survive the trip.
+      const html = telegramEntitiesToFormattedBody(
+        msg.text,
+        Array.isArray(msg.entities) ? (msg.entities as TgMessageEntity[]) : null
+      );
+      if (html) {
+        content.format = 'org.matrix.custom.html';
+        content.formatted_body = `${escapeHtml(`[TG] ${senderName}: `)}${html}`;
+      }
     } else if (msg.photo || msg.document || msg.sticker || msg.voice || msg.audio || msg.video) {
       const kind = msg.photo ? 'photo'
         : msg.document ? 'document'
@@ -545,14 +599,12 @@ export async function processTelegramUpdate(
         : msg.audio ? 'audio'
         : 'video';
       body = `[telegram ${kind}]` + (msg.caption ? ` ${msg.caption}` : '');
+      content = { msgtype: 'm.text', body: `[TG] ${senderName}: ${body}` };
     } else {
       return true; // service messages / unsupported — ack silently.
     }
 
-    const result = await performSendEvent(env, bridge.room_id, bridge.bot_user_id, 'm.room.message', {
-      msgtype: 'm.text',
-      body: `[TG] ${senderName}: ${body}`,
-    });
+    const result = await performSendEvent(env, bridge.room_id, bridge.bot_user_id, 'm.room.message', content);
     if ('error' in result) {
       console.error('[telegram-bridge] matrix send failed:', result.error.errcode);
     }

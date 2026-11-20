@@ -703,6 +703,113 @@ describe('telegram image bridging', () => {
   });
 });
 
+describe('telegram formatting relay', () => {
+  const bridge = { id: 'tgb1', bot_user_id: TG_BOT, room_id: ROOM, chat_id: '4711', tg_token: '111111111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', webhook_secret: 's3cret', last_update_id: 0, enabled: 1, created_at: 1 };
+
+  it('matrix formatted_body relays as Telegram HTML', async () => {
+    const env = makeEnv();
+    await handleRoomMessage(env, ROOM, USER, {
+      msgtype: 'm.text',
+      body: 'Bold link',
+      format: 'org.matrix.custom.html',
+      formatted_body: '<strong>Bold <a href="https://google.com">link</a></strong>',
+    }, 'local');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/sendMessage');
+    const payload = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(payload.chat_id).toBe('4711');
+    expect(payload.parse_mode).toBe('HTML');
+    expect(payload.text).toBe('Alice Display: <b>Bold <a href="https://google.com">link</a></b>');
+  });
+
+  it('rejected formatting retries once as plain text', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(async (_url: string, init: RequestInit) => {
+      const p = JSON.parse(init.body as string);
+      if (p.parse_mode === 'HTML') return Response.json({ ok: false, description: "can't parse entities" });
+      return Response.json({ ok: true });
+    });
+    await handleRoomMessage(env, ROOM, USER, {
+      msgtype: 'm.text',
+      body: 'Bold link',
+      format: 'org.matrix.custom.html',
+      formatted_body: '<strong>Bold</strong>',
+    }, 'local');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const first = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    const second = JSON.parse(fetchMock.mock.calls[1][1].body as string);
+    expect(first.parse_mode).toBe('HTML');
+    expect(second.parse_mode).toBeUndefined();
+    expect(second.text).toBe('Alice Display: Bold link');
+  });
+
+  it('plain matrix messages still send without parse_mode', async () => {
+    const env = makeEnv();
+    await handleRoomMessage(env, ROOM, USER, { body: 'plain **not bold**' }, 'local');
+    const payload = JSON.parse(fetchMock.mock.calls[0][1].body as string);
+    expect(payload.parse_mode).toBeUndefined();
+    expect(payload.text).toBe('Alice Display: plain **not bold**');
+  });
+
+  it('telegram entities arrive as a Matrix formatted_body', async () => {
+    const env = makeEnv();
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 300,
+      message: {
+        message_id: 21,
+        from: { id: 7, first_name: 'Ivan', username: 'ivan' },
+        chat: { id: 4711, type: 'private' },
+        text: 'Bold link ok',
+        entities: [
+          { offset: 0, length: 9, type: 'bold' },
+          { offset: 5, length: 4, type: 'text_link', url: 'https://google.com' },
+        ],
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const content = performSendEvent.mock.calls[0][4];
+    expect(content.body).toBe('[TG] Ivan (@ivan): Bold link ok');
+    expect(content.format).toBe('org.matrix.custom.html');
+    expect(content.formatted_body).toBe(
+      '[TG] Ivan (@ivan): <b>Bold <a href="https://google.com">link</a></b> ok'
+    );
+  });
+
+  it('telegram text without entities has no format field', async () => {
+    const env = makeEnv();
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 301,
+      message: {
+        message_id: 22,
+        from: { id: 7, first_name: 'Ivan' },
+        chat: { id: 4711, type: 'private' },
+        text: '__not parsed__',
+      },
+    });
+    const content = performSendEvent.mock.calls[0][4];
+    expect(content.body).toBe('[TG] Ivan: __not parsed__');
+    expect(content.format).toBeUndefined();
+    expect(content.formatted_body).toBeUndefined();
+  });
+
+  it('telegram entity offsets survive emoji (UTF-16 units)', async () => {
+    const env = makeEnv();
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 302,
+      message: {
+        message_id: 23,
+        from: { id: 7, first_name: 'Ivan' },
+        chat: { id: 4711, type: 'private' },
+        text: '🚀 go',
+        entities: [{ offset: 3, length: 2, type: 'bold' }],
+      },
+    });
+    const content = performSendEvent.mock.calls[0][4];
+    expect(content.formatted_body).toBe('[TG] Ivan: 🚀 <b>go</b>');
+  });
+});
+
 describe('bots registry', () => {
   it('createBotRow + isBotUser + getEnabledBotsInRoom', async () => {
     const env = makeEnv({ bots: [] });
