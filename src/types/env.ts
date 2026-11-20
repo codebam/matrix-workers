@@ -24,6 +24,9 @@ export interface Env {
   PUSH: DurableObjectNamespace;
   RATE_LIMIT: DurableObjectNamespace;
   DELAYED_EVENTS: DurableObjectNamespace;
+  // Dev-only: enforce Synapse-style auth_events selection checks on inbound
+  // federation PDUs (prod stays on the state-based checkEventAuth).
+  FEDERATION_STRICT_AUTH?: string;
 
   // Environment variables
   SERVER_NAME: string;

@@ -291,14 +291,12 @@ export async function legacyWireForRoom(
   const num = parseInt(roomVersion, 10);
   if (!Number.isFinite(num) || num < 3 || num > 10) return null;
   try {
-    const create = await env.DB.prepare(
-      `SELECT e.sender FROM room_state rs
-       JOIN events e ON rs.event_id = e.event_id
-       WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`
-    ).bind(roomId).first<{ sender: string }>();
-    if (!create || typeof create.sender !== 'string' || !create.sender.endsWith(`:${env.SERVER_NAME}`)) {
-      return null;
-    }
+    // Derivation re-signs every event; cap it so huge rooms keep the fast
+    // as-stored path (their state is resident-authored and already correct).
+    const count = await env.DB.prepare(
+      `SELECT COUNT(*) as count FROM events WHERE room_id = ?`
+    ).bind(roomId).first<{ count: number }>();
+    if ((count?.count ?? 0) > 1000) return null;
     const wire = await deriveRoomWireEvents(env, roomId, roomVersion);
     // Derivation is best-effort: without a usable signing key (or on any
     // storage error) fall back to the as-stored serving path.

@@ -18,6 +18,7 @@ import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, up
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
+import { checkAuthRules } from '../services/federation-verify';
 import { resolveState } from '../services/state-resolution';
 
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
@@ -716,6 +717,41 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
+      // Synapse-style auth_events selection check (dev instances only):
+      // rejects events whose auth_events omit types the auth rules select,
+      // which is what makes resident servers outlier our memberships.
+      if (c.env.FEDERATION_STRICT_AUTH === 'true' && room) {
+        const allRows = await c.env.DB.prepare(
+          `SELECT event_id, room_id, sender, event_type, state_key, content,
+           origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+           FROM events WHERE room_id = ?`
+        ).bind(roomId).all<any>();
+        const byId = new Map<string, PDU>();
+        for (const r of allRows.results ?? []) {
+          byId.set(r.event_id, {
+            event_id: r.event_id, room_id: r.room_id, sender: r.sender, type: r.event_type,
+            state_key: r.state_key ?? undefined, content: JSON.parse(r.content),
+            origin_server_ts: r.origin_server_ts, depth: r.depth,
+            auth_events: JSON.parse(r.auth_events), prev_events: JSON.parse(r.prev_events),
+            hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
+            signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
+          } as PDU);
+        }
+        const stateMap = new Map<string, PDU>();
+        for (const e of await getRoomState(c.env.DB, roomId)) {
+          stateMap.set(`${e.type}\0${e.state_key ?? ''}`, e);
+        }
+        const strictReason = checkAuthRules(pdu as PDU, room.room_version, { byId, state: stateMap });
+        if (strictReason) {
+          pduResults[eventId] = { error: strictReason };
+          await c.env.DB.prepare(
+            `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+             VALUES (?, ?, ?, ?, 0, ?)`
+          ).bind(eventId, pduOrigin, roomId, Date.now(), strictReason).run();
+          continue;
+        }
+      }
+
       // Run event authorization check if we have room state
       if (room) {
         try {
@@ -1158,10 +1194,18 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     ).bind(authId).first();
 
     if (authEvent) {
+      // Explicit field mapping: spreading the raw row would leak event_type
+      // and unsigned:null onto the wire, changing the content hash and
+      // making residents reject the PDU.
       authChain.push({
-        ...authEvent,
+        event_id: (authEvent as any).event_id,
+        room_id: (authEvent as any).room_id,
+        sender: (authEvent as any).sender,
         type: (authEvent as any).event_type,
+        state_key: (authEvent as any).state_key ?? undefined,
         content: JSON.parse((authEvent as any).content),
+        origin_server_ts: (authEvent as any).origin_server_ts,
+        depth: (authEvent as any).depth,
         auth_events: JSON.parse((authEvent as any).auth_events),
         prev_events: JSON.parse((authEvent as any).prev_events),
         hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
