@@ -49,11 +49,15 @@ vi.mock('../src/middleware/federation-auth', () => ({
 const getRemoteKeysWithNotarySignature = vi.fn();
 const verifyRemoteSignature = vi.fn();
 
-vi.mock('../src/services/federation-keys', () => ({
-  getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
-    getRemoteKeysWithNotarySignature(...args),
-  verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
-}));
+vi.mock('../src/services/federation-keys', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/federation-keys')>();
+  return {
+    ...actual,
+    getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
+      getRemoteKeysWithNotarySignature(...args),
+    verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
+  };
+});
 
 const getRoomState = vi.fn(async () => ({}));
 vi.mock('../src/services/database', async (importOriginal) => {
@@ -84,6 +88,7 @@ vi.mock('../src/utils/crypto', async (importOriginal) => {
 });
 
 import federation from '../src/api/federation';
+import { signSendBodyPdus } from './helpers/federation-origin-signatures';
 
 type SelectBarrier = { match: (sql: string, args: unknown[]) => boolean; count: number };
 type KvBarrier = { match: (key: string) => boolean; count: number };
@@ -840,7 +845,11 @@ async function req(
 ): Promise<{ status: number; body: unknown; headers: Headers }> {
   const init: RequestInit = { method, headers: { 'Content-Type': 'application/json' } };
   if (body !== undefined) {
-    init.body = typeof body === 'string' ? body : JSON.stringify(body);
+    const signedBody =
+      path.includes('/send/') && typeof body === 'object'
+        ? await signSendBodyPdus(env, body)
+        : body;
+    init.body = typeof signedBody === 'string' ? signedBody : JSON.stringify(signedBody);
   }
   const res = await federation.request(`http://localhost${path}`, init, env);
   const text = await res.text();

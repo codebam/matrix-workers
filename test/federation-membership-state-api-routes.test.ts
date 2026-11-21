@@ -37,6 +37,11 @@ vi.mock('../src/middleware/federation-auth', () => ({
 }));
 
 import federation from '../src/api/federation';
+import { calculateContentHash, generateSigningKeyPair } from '../src/utils/crypto';
+import {
+  seedPduVerifyKey,
+  signEventForOrigin,
+} from './helpers/federation-origin-signatures';
 
 const SERVER = 'example.com';
 const REMOTE = 'remote.example.org';
@@ -147,6 +152,7 @@ function createMembershipDb(opts: {
   aliases?: AliasRow[];
   users?: UserRow[];
   throwOn?: string;
+  serverKey?: { key_id: string; private_key_jwk: string };
 } = {}) {
   const rooms = opts.rooms ?? [
     { room_id: ROOM, room_version: '10', is_public: 1, created_at: NOW },
@@ -379,10 +385,10 @@ function createMembershipDb(opts: {
             return { position: 1 } as T;
           }
 
-          // Signing keys are not modeled in this fake; inbound joins are
-          // stored unsigned (persist* skips signing when no key is present).
+          // Signing keys are usually not modeled in this fake; send_leave
+          // fixtures opt in with a local key so the resident can countersign.
           if (sql.includes('FROM server_keys')) {
-            return null;
+            return (opts.serverKey ?? null) as T;
           }
 
           throw new Error(`Unhandled first() SQL: ${sql.slice(0, 180)}`);
@@ -815,15 +821,26 @@ describe('federation GET /state/:roomId', () => {
     ]);
   });
 
-  it('ignores event_id query (documented void) without error', async () => {
+  it('event_id query serves state before that event', async () => {
+    const { events, state } = baseline();
+    const env = createEnv({ db: createMembershipDb({ events, state }) });
+    const res = await request(
+      env,
+      `/_matrix/federation/v1/state/${encodeURIComponent(ROOM)}?event_id=${encodeURIComponent(MEMBER)}`
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.pdus.length).toBeGreaterThan(0);
+    expect(res.body.pdus.map((p: { event_id: string }) => p.event_id)).not.toContain(MEMBER);
+  });
+
+  it('event_id query 404s for an unknown event', async () => {
     const { events, state } = baseline();
     const env = createEnv({ db: createMembershipDb({ events, state }) });
     const res = await request(
       env,
       `/_matrix/federation/v1/state/${encodeURIComponent(ROOM)}?event_id=${encodeURIComponent(EVENT)}`
     );
-    expect(res.status).toBe(200);
-    expect(res.body.pdus.length).toBeGreaterThan(0);
+    expect(res.status).toBe(404);
   });
 });
 
@@ -857,14 +874,25 @@ describe('federation GET /state_ids/:roomId', () => {
     );
   });
 
-  it('with event_id query still returns current state ids (snapshot TODO)', async () => {
+  it('with event_id query returns state ids before that event', async () => {
+    const { events, state } = baseline();
+    const env = createEnv({ db: createMembershipDb({ events, state }) });
+    const res = await request(
+      env,
+      `/_matrix/federation/v1/state_ids/${encodeURIComponent(ROOM)}?event_id=${encodeURIComponent(MEMBER)}`
+    );
+    expect(res.status).toBe(200);
+    expect(res.body.pdu_ids.sort()).toEqual([CREATE, JOIN_RULES, POWER].sort());
+  });
+
+  it('with unknown event_id returns 404', async () => {
     const { events, state } = baseline();
     const env = createEnv({ db: createMembershipDb({ events, state }) });
     const res = await request(
       env,
       `/_matrix/federation/v1/state_ids/${encodeURIComponent(ROOM)}?event_id=$any`
     );
-    expect(res.body.pdu_ids).toHaveLength(4);
+    expect(res.status).toBe(404);
   });
 
   it('empty state yields empty id lists', async () => {
@@ -1433,7 +1461,36 @@ describe('federation make_leave / send_leave', () => {
     expect(mismatch.body.errcode).toBe('M_INVALID_PARAM');
   });
 
-  it('send_leave v1 404 when room missing; success returns [200, {}]', async () => {
+  const signedLeaveEnv = async (eventId: string) => {
+    const localPair = await generateSigningKeyPair();
+    const db = createMembershipDb({
+      serverKey: {
+        key_id: localPair.keyId,
+        private_key_jwk: JSON.stringify(localPair.privateKeyJwk),
+      },
+    });
+    const env = createEnv({ db, federationOrigin: REMOTE });
+    await seedPduVerifyKey(env.CACHE, REMOTE);
+    const base: Record<string, unknown> = {
+      event_id: eventId,
+      room_id: ROOM,
+      sender: REMOTE_USER,
+      state_key: REMOTE_USER,
+      type: 'm.room.member',
+      content: { membership: 'leave' },
+      origin_server_ts: NOW,
+      depth: 4,
+      auth_events: [],
+      prev_events: [],
+    };
+    const event = await signEventForOrigin(
+      { ...base, hashes: { sha256: await calculateContentHash(base) } },
+      REMOTE
+    );
+    return { db, env, event };
+  };
+
+  it('send_leave v1 404 when room missing; success returns {}', async () => {
     const missing = await request(
       createEnv({ db: createMembershipDb({ rooms: [] }) }),
       `/_matrix/federation/v1/send_leave/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`,
@@ -1441,28 +1498,33 @@ describe('federation make_leave / send_leave', () => {
     );
     expect(missing.status).toBe(404);
 
+    const { env, event, db } = await signedLeaveEnv(EVENT);
     const ok = await request(
-      createEnv(),
+      env,
       `/_matrix/federation/v1/send_leave/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`,
-      jsonInit('PUT', { type: 'm.room.member', content: { membership: 'leave' } })
+      jsonInit('PUT', event)
     );
     expect(ok.status).toBe(200);
-    expect(ok.body).toEqual([200, {}]);
+    expect(ok.body).toEqual({});
+    expect(db.selects.some((s) => s.sql.includes('INSERT OR IGNORE INTO events'))).toBe(true);
   });
 
-  it('send_leave v2 returns {} on success and rejects bad JSON', async () => {
+  it('send_leave v2 returns the signed event and rejects bad JSON', async () => {
     const bad = await request(
       createEnv(),
       `/_matrix/federation/v2/send_leave/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`,
       { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: '{' }
     );
     expect(bad.status).toBe(400);
+    const { env, event } = await signedLeaveEnv(EVENT);
     const ok = await request(
-      createEnv(),
+      env,
       `/_matrix/federation/v2/send_leave/${encodeURIComponent(ROOM)}/${encodeURIComponent(EVENT)}`,
-      jsonInit('PUT', { type: 'm.room.member', content: { membership: 'leave' } })
+      jsonInit('PUT', event)
     );
-    expect(ok.body).toEqual({});
+    expect(ok.status).toBe(200);
+    expect(ok.body.event).toBeDefined();
+    expect(ok.body.event.signatures[SERVER]).toBeDefined();
   });
 });
 

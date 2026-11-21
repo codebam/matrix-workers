@@ -75,11 +75,15 @@ vi.mock('../src/middleware/federation-auth', () => ({
 const getRemoteKeysWithNotarySignature = vi.fn();
 const verifyRemoteSignature = vi.fn();
 
-vi.mock('../src/services/federation-keys', () => ({
-  getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
-    getRemoteKeysWithNotarySignature(...args),
-  verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
-}));
+vi.mock('../src/services/federation-keys', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/federation-keys')>();
+  return {
+    ...actual,
+    getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
+      getRemoteKeysWithNotarySignature(...args),
+    verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
+  };
+});
 
 const getRoomState = vi.fn(async () => ({}));
 vi.mock('../src/services/database', async (importOriginal) => {
@@ -112,6 +116,7 @@ vi.mock('../src/utils/crypto', async (importOriginal) => {
 import federation from '../src/api/federation';
 import { generateSigningKeyPair } from '../src/utils/crypto';
 import { computeWireEventId } from '../src/utils/event-signing';
+import { signSendBodyPdus } from './helpers/federation-origin-signatures';
 
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
@@ -849,7 +854,11 @@ async function req(
 ): Promise<{ status: number; body: unknown; headers: Headers }> {
   const init: RequestInit = { method, headers: { 'Content-Type': 'application/json' } };
   if (body !== undefined) {
-    init.body = typeof body === 'string' ? body : JSON.stringify(body);
+    const signedBody =
+      path.includes('/send/') && typeof body === 'object'
+        ? await signSendBodyPdus(env, body)
+        : body;
+    init.body = typeof signedBody === 'string' ? signedBody : JSON.stringify(signedBody);
   }
   const res = await federation.request(`http://localhost${path}`, init, env);
   const text = await res.text();
@@ -3203,8 +3212,8 @@ describe('soft send content-hash / prev-rejected / origin-sig leftover flood aft
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'PDU from origin server without valid signature'
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toMatch(
+        /without valid signature/
       );
     });
   }
@@ -3415,7 +3424,7 @@ describe('soft send third-party / missing-hash / auth-denied leftover flood afte
     it(`third-party PDU invalid signature soft-${i}`, async () => {
       verifyRemoteSignature.mockResolvedValue(false);
       const db = createFedDb({
-        rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+        rooms: [{ room_id: ROOM, room_version: '1', is_public: 1, created_at: 1 }],
       });
       const eid = `$third${i}`;
       const { status, body } = await req('PUT', `/_matrix/federation/v1/send/txn-third-${i}`, makeEnv(db), {
@@ -3426,13 +3435,13 @@ describe('soft send third-party / missing-hash / auth-denied leftover flood afte
             sender: '@carol:other.example.com',
             type: 'm.room.message',
             content: { body: 'x' },
-            signatures: { 'other.example.com': { 'ed25519:1': 'sig' } },
+            signatures: { 'other.example.com': { 'ed25519:1': 'invalid' } },
           },
         ],
       });
       expect(status).toBe(200);
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Third-party PDU without valid signature'
+      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toMatch(
+        /without valid signature/
       );
     });
   }

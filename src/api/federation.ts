@@ -8,14 +8,14 @@ import { computeWireEventId, isMsc4291RoomVersion, redactEventForSigning, toWire
 import { requireFederationAuth } from '../middleware/federation-auth';
 import { federationOriginRateLimit } from '../middleware/rate-limit';
 import {
+  fetchRemoteServerKeys,
   getRemoteKeysWithNotarySignature,
   getServerSigningKey,
-  verifyRemoteSignature,
   type ServerKeyResponse,
 } from '../services/federation-keys';
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
-import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
+import { getRoom, getRoomState, createRoom, getEvent, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
 import { findServerAcl, isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId } from '../services/server-acl';
 import { getRoomVersion } from '../services/room-versions';
 import { evaluateRestrictedJoin, refreshRestrictedRoomState } from '../services/restricted-joins';
@@ -96,10 +96,11 @@ async function policySignatureMissing(
     return false;
   }
 }
+import { recordKeyChange } from './keys';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
-import { checkAuthRules } from '../services/federation-verify';
+import { checkAuthRules, verifyPdu, type VerifyKey } from '../services/federation-verify';
 import { resolveState } from '../services/state-resolution';
 
 // Supported room versions (v1-v12 per Matrix Spec v1.17)
@@ -134,6 +135,20 @@ async function getFederationBody<T = any>(c: any): Promise<T> {
 }
 
 const app = new Hono<AppEnv>();
+
+// Resolve a remote server's signing keys through the same KV/D1/network key
+// chain the rest of federation uses (verifyRemoteSignature -> fetchRemoteServerKeys).
+// verifyPdu needs the raw verify keys so it can enforce that the PDU was
+// signed by the sender's own server, not merely by *some* signatory.
+async function resolvePduVerifyKeys(env: Env, serverName: string): Promise<VerifyKey[]> {
+  try {
+    const keys = await fetchRemoteServerKeys(serverName, env.DB, env.CACHE);
+    return keys.map((key) => ({ keyId: key.key_id, publicKey: key.public_key }));
+  } catch (err) {
+    console.warn(`[federation] Cannot resolve signing keys for ${serverName}:`, err);
+    return [];
+  }
+}
 
 // GET /_matrix/federation/v1/version - Server version info (unauthenticated)
 // This must be defined BEFORE the auth middleware is applied
@@ -803,60 +818,6 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         continue;
       }
 
-      // Verify PDU signatures
-      if (pdu.signatures) {
-        let signatureValid = false;
-        const signatories = Object.keys(pdu.signatures);
-
-        for (const signatory of signatories) {
-          const keyIds = Object.keys(pdu.signatures[signatory]);
-          for (const keyId of keyIds) {
-            try {
-              // v4+ signatures cover the *redacted* wire form (no event_id,
-              // no unsigned), redacted with the ROOM VERSION's rules — v1-10
-              // differ from v11+ for create/power_levels; fall back to the
-              // legacy full-event form for older room versions.
-              const isValid =
-                (await verifyRemoteSignature(
-                  redactEventForSigning(toWireEventObject(pdu as Record<string, unknown>), room?.room_version),
-                  signatory,
-                  keyId,
-                  c.env.DB,
-                  c.env.CACHE
-                )) ||
-                (await verifyRemoteSignature(
-                  pdu,
-                  signatory,
-                  keyId,
-                  c.env.DB,
-                  c.env.CACHE
-                ));
-              if (isValid) {
-                signatureValid = true;
-                break;
-              }
-            } catch (e) {
-              console.warn(`Signature verification failed for ${signatory}:${keyId}:`, e);
-            }
-          }
-          if (signatureValid) break;
-        }
-
-        if (!signatureValid) {
-          // Reject ALL PDUs with invalid signatures, regardless of origin.
-          // A PDU from the sending server's own origin must still be properly signed.
-          const reason = pduOrigin !== origin
-            ? 'Third-party PDU without valid signature'
-            : 'PDU from origin server without valid signature';
-          pduResults[eventId] = { error: reason };
-          await c.env.DB.prepare(
-            `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-             VALUES (?, ?, ?, ?, 0, ?)`
-          ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
-          continue;
-        }
-      }
-
       // Content hash enforcement.
       //   - Room versions 1-2: hashes optional (legacy clients may omit).
       //   - Room versions 3+: hashes.sha256 is REQUIRED — modern room versions
@@ -916,6 +877,38 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             continue;
           }
         }
+      }
+
+      // Signature enforcement: every inbound PDU must carry a valid signature
+      // from the sender's OWN server. Accepting any signatory lets a relay
+      // forge events for users it does not host; accepting none lets anyone
+      // inject arbitrary events.
+      //
+      // PDUs that carry an explicit event_id use the legacy wire shape (v1-2);
+      // verify them with the legacy redaction rules even when the room itself
+      // is modern. v3+ PDUs omit event_id and are verified with the room's
+      // actual version rules. Content hashing is enforced above, so we drop
+      // `hashes` from the verification view to avoid verifying it twice.
+      const verificationVersion =
+        typeof pdu.event_id === 'string' && pdu.event_id
+          ? '2'
+          : (room?.room_version ?? '10');
+      const { hashes: _verifiedHashes, ...verificationView } = pdu as Record<string, unknown>;
+      const verifyKeys = await resolvePduVerifyKeys(c.env, pduOrigin);
+      const verification = await verifyPdu(
+        verificationView as unknown as PDU,
+        pduOrigin,
+        verificationVersion,
+        verifyKeys
+      );
+      if ('error' in verification) {
+        const reason = `PDU from origin server ${pduOrigin} without valid signature: ${verification.error}`;
+        pduResults[eventId] = { error: reason };
+        await c.env.DB.prepare(
+          `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+           VALUES (?, ?, ?, ?, 0, ?)`
+        ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+        continue;
       }
 
       // Synapse-style auth_events selection check (dev instances only):
@@ -1363,6 +1356,16 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
                   stream_id = MAX(remote_device_list_streams.stream_id, excluded.stream_id),
                   updated_at = excluded.updated_at
               `).bind(deviceUserId, streamId, Date.now()).run();
+
+              // /sync derives device_lists.changed from device_key_changes.
+              // Without a row here, clients never refresh a federated
+              // user's device keys even though our remote cache updated.
+              await recordKeyChange(
+                c.env.DB,
+                deviceUserId,
+                deviceId,
+                deleted ? 'delete' : 'update'
+              );
             } catch (devErr) {
               console.warn(`[federation] Failed to update device list for ${deviceUserId}:`, devErr);
             }
@@ -1510,11 +1513,80 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
   });
 });
 
+// Reconstruct the room state at a named event by walking the stored DAG
+// backwards from its prev_events/auth_events, then applying last-writer-wins
+// per (type, state_key). This avoids silently serving CURRENT state for an
+// event-scoped /state or /state_ids query.
+const MAX_STATE_WALK = 2000;
+const MAX_AUTH_CHAIN = 500;
+
+async function stateBeforeEvent(
+  db: D1Database,
+  roomId: string,
+  eventId: string
+): Promise<{ state: PDU[]; authSeeds: string[] } | null> {
+  const target = await getEvent(db, eventId);
+  if (!target || target.room_id !== roomId) return null;
+
+  const visited = new Set<string>();
+  const stateById = new Map<string, PDU>();
+  const queue: string[] = [...(target.prev_events ?? []), ...(target.auth_events ?? [])];
+  while (queue.length > 0 && visited.size < MAX_STATE_WALK) {
+    const id = queue.shift()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    const event = await getEvent(db, id);
+    if (!event || event.room_id !== roomId) continue;
+    stateById.set(id, event);
+    queue.push(...(event.prev_events ?? []), ...(event.auth_events ?? []));
+  }
+
+  const slots = new Map<string, PDU>();
+  for (const event of stateById.values()) {
+    if (event.state_key === undefined || event.state_key === null) continue;
+    const key = `${event.type}\0${event.state_key}`;
+    const incumbent = slots.get(key);
+    if (
+      !incumbent ||
+      (event.depth ?? 0) > (incumbent.depth ?? 0) ||
+      ((event.depth ?? 0) === (incumbent.depth ?? 0) &&
+        (event.origin_server_ts ?? 0) >= (incumbent.origin_server_ts ?? 0))
+    ) {
+      slots.set(key, event);
+    }
+  }
+
+  const authSeeds = [
+    ...(target.auth_events ?? []),
+    ...[...slots.values()].flatMap((event) => event.auth_events ?? []),
+  ];
+  return { state: [...slots.values()], authSeeds };
+}
+
+// Transitive auth chain (not just one hop): every auth_events reference of
+// every auth event must be included until the create event closes the chain.
+async function collectAuthChain(db: D1Database, seeds: string[]): Promise<PDU[]> {
+  const visited = new Set<string>();
+  const chain: PDU[] = [];
+  const queue = [...seeds];
+  while (queue.length > 0 && chain.length < MAX_AUTH_CHAIN) {
+    const id = queue.shift()!;
+    if (!id || visited.has(id)) continue;
+    visited.add(id);
+    const event = await getEvent(db, id);
+    if (!event) continue;
+    chain.push(event);
+    for (const ref of event.auth_events ?? []) {
+      if (!visited.has(ref)) queue.push(ref);
+    }
+  }
+  return chain;
+}
+
 // GET /_matrix/federation/v1/state/:roomId - Get room state
 app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
-  // Note: eventId could be used to get state at a specific point in time
-  void c.req.query('event_id');
+  const eventId = c.req.query('event_id');
 
   if (await callerDeniedByRoomAcl(c, roomId)) {
     return c.json(
@@ -1526,13 +1598,7 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   const stateRoom = await getRoom(c.env.DB, roomId);
 
   // Get current room state
-  const stateEvents = await c.env.DB.prepare(
-    `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures
-     FROM room_state rs
-     JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ?`
-  ).bind(roomId).all<{
+  type StateRow = {
     event_id: string;
     room_id: string;
     sender: string;
@@ -1545,9 +1611,40 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     prev_events: string;
     hashes: string | null;
     signatures: string | null;
-  }>();
+  };
+  const scoped = eventId ? await stateBeforeEvent(c.env.DB, roomId, eventId) : null;
+  if (eventId && !scoped) return Errors.notFound('Event not found').toResponse();
 
-  const pdus = stateEvents.results.map(e => ({
+  let stateEvents: StateRow[];
+  let authSeeds: string[];
+  if (scoped) {
+    stateEvents = scoped.state.map((p): StateRow => ({
+      event_id: p.event_id,
+      room_id: p.room_id,
+      sender: p.sender,
+      event_type: p.type,
+      state_key: p.state_key ?? null,
+      content: JSON.stringify(p.content),
+      origin_server_ts: p.origin_server_ts,
+      depth: p.depth,
+      auth_events: JSON.stringify(p.auth_events ?? []),
+      prev_events: JSON.stringify(p.prev_events ?? []),
+      hashes: p.hashes ? JSON.stringify(p.hashes) : null,
+      signatures: p.signatures ? JSON.stringify(p.signatures) : null,
+    }));
+    authSeeds = scoped.authSeeds;
+  } else {
+    stateEvents = (await c.env.DB.prepare(
+      `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
+       e.origin_server_ts, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures
+       FROM room_state rs
+       JOIN events e ON rs.event_id = e.event_id
+       WHERE rs.room_id = ?`
+    ).bind(roomId).all<StateRow>()).results ?? [];
+    authSeeds = stateEvents.flatMap((e) => JSON.parse(e.auth_events) as string[]);
+  }
+
+  const pdus = stateEvents.map(e => ({
     event_id: e.event_id,
     room_id: e.room_id,
     sender: e.sender,
@@ -1562,46 +1659,11 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
   }));
 
-  // Get auth chain
-  const authEventIds = new Set<string>();
-  for (const pdu of pdus) {
-    for (const authId of pdu.auth_events) {
-      authEventIds.add(authId);
-    }
-  }
-
-  const authChain: any[] = [];
-  for (const authId of authEventIds) {
-    const authEvent = await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events WHERE event_id = ?`
-    ).bind(authId).first();
-
-    if (authEvent) {
-      // Explicit field mapping: spreading the raw row would leak event_type
-      // and unsigned:null onto the wire, changing the content hash and
-      // making residents reject the PDU.
-      authChain.push({
-        event_id: (authEvent as any).event_id,
-        room_id: (authEvent as any).room_id,
-        sender: (authEvent as any).sender,
-        type: (authEvent as any).event_type,
-        state_key: (authEvent as any).state_key ?? undefined,
-        content: JSON.parse((authEvent as any).content),
-        origin_server_ts: (authEvent as any).origin_server_ts,
-        depth: (authEvent as any).depth,
-        auth_events: JSON.parse((authEvent as any).auth_events),
-        prev_events: JSON.parse((authEvent as any).prev_events),
-        hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
-        signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
-      });
-    }
-  }
+  const authChain = await collectAuthChain(c.env.DB, authSeeds);
 
   const stateWire = await wireForRoom(c.env, roomId, stateRoom?.room_version ?? '10');
   if (stateWire) {
-    const joined = buildWireJoinState(stateWire, stateEvents.results.map((e) => e.event_id));
+    const joined = buildWireJoinState(stateWire, stateEvents.map((e) => e.event_id));
     return c.json({
       origin: c.env.SERVER_NAME,
       origin_server_ts: Date.now(),
@@ -1638,52 +1700,29 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
     );
   }
 
-  // Get state event IDs
+  // event_id is authoritative when present: serve state before that event,
+  // never current state under an event-scoped query.
+  const scoped = eventId ? await stateBeforeEvent(c.env.DB, roomId, eventId) : null;
+  if (eventId && !scoped) return Errors.notFound('Event not found').toResponse();
+
   let stateEventIds: string[];
-  let authChainIds: string[];
-
-  if (eventId) {
-    // Get state at a specific event
-    // For now, we get current state - proper implementation would track state snapshots
-    const stateEvents = await c.env.DB.prepare(
-      `SELECT e.event_id, e.auth_events
-       FROM room_state rs
-       JOIN events e ON rs.event_id = e.event_id
-       WHERE rs.room_id = ?`
-    ).bind(roomId).all<{ event_id: string; auth_events: string }>();
-
-    stateEventIds = stateEvents.results.map(e => e.event_id);
-
-    // Collect auth chain IDs
-    const authChainSet = new Set<string>();
-    for (const event of stateEvents.results) {
-      const authEvents = JSON.parse(event.auth_events) as string[];
-      for (const authId of authEvents) {
-        authChainSet.add(authId);
-      }
-    }
-    authChainIds = Array.from(authChainSet);
+  let authSeeds: string[];
+  if (scoped) {
+    stateEventIds = scoped.state.map((event) => event.event_id);
+    authSeeds = scoped.authSeeds;
   } else {
-    // Get current state
     const stateEvents = await c.env.DB.prepare(
       `SELECT e.event_id, e.auth_events
        FROM room_state rs
        JOIN events e ON rs.event_id = e.event_id
        WHERE rs.room_id = ?`
     ).bind(roomId).all<{ event_id: string; auth_events: string }>();
-
-    stateEventIds = stateEvents.results.map(e => e.event_id);
-
-    // Collect auth chain IDs
-    const authChainSet = new Set<string>();
-    for (const event of stateEvents.results) {
-      const authEvents = JSON.parse(event.auth_events) as string[];
-      for (const authId of authEvents) {
-        authChainSet.add(authId);
-      }
-    }
-    authChainIds = Array.from(authChainSet);
+    stateEventIds = stateEvents.results.map((e) => e.event_id);
+    authSeeds = stateEvents.results.flatMap((e) => JSON.parse(e.auth_events) as string[]);
   }
+  const authChainIds = (await collectAuthChain(c.env.DB, authSeeds)).map(
+    (event) => event.event_id
+  );
 
   const idsWire = await wireForRoom(c.env, roomId, room.room_version);
   if (idsWire) {
@@ -2849,90 +2888,183 @@ app.get('/_matrix/federation/v1/make_leave/:roomId/:userId', async (c) => {
   });
 });
 
+// Verify that a send_leave event was signed by the server of the user it
+// concerns. A resident that countersigns and persists an unverified leave can
+// be tricked into ejecting a remote user by any peer that signs its own
+// requests (the request signature only authenticates the HTTP peer).
+async function verifyInboundLeaveSignature(
+  env: Env,
+  leaveEvent: Record<string, unknown>,
+  origin: string,
+  roomVersion: string
+): Promise<string | null> {
+  const verificationVersion =
+    typeof leaveEvent.event_id === 'string' && leaveEvent.event_id ? '2' : roomVersion;
+  const verifyKeys = await resolvePduVerifyKeys(env, origin);
+  const result = await verifyPdu(leaveEvent as unknown as PDU, origin, verificationVersion, verifyKeys);
+  return 'error' in result ? result.error : null;
+}
+
+// Authorize a leave against our copy of the room state, with the same ACL /
+// membership checks the send_join path applies before countersigning.
+async function authorizeInboundLeave(
+  env: Env,
+  roomId: string,
+  roomVersion: string,
+  leaveEvent: Record<string, unknown>,
+  origin?: string
+): Promise<string | null> {
+  const sender = typeof leaveEvent['sender'] === 'string' ? leaveEvent['sender'] : '';
+  const stateKey = typeof leaveEvent['state_key'] === 'string' ? leaveEvent['state_key'] : '';
+  if (!sender || !stateKey) return 'Leave event must have a sender and state key';
+  if (origin && serverNameFromId(sender) !== origin) {
+    return 'Leave event sender does not belong to the authenticated server';
+  }
+
+  const roomState = await getRoomState(env.DB, roomId);
+  if (roomState.length === 0) return null;
+
+  const acl = findServerAcl(roomState);
+  if (acl) {
+    const senderServer = serverNameFromId(sender);
+    if (!isServerAllowedByAcl(acl, senderServer)) {
+      return `Server ${senderServer} is denied by the room's server ACL`;
+    }
+  }
+
+  try {
+    const result = checkEventAuth(leaveEvent as unknown as PDU, roomState, roomVersion);
+    return result.allowed ? null : (result.error ?? 'Leave is not authorized');
+  } catch (err) {
+    console.warn('[federation] Inbound leave auth check failed:', err);
+    return 'Leave is not authorized';
+  }
+}
+
+// Countersign and persist a leave exactly as persistInboundJoin does for
+// joins: the joining/leaving server signs first, the resident adds its own
+// signature, and the event is stored under the ID the peers exchange.
+async function persistInboundLeave(
+  env: Env,
+  roomId: string,
+  leaveEvent: Record<string, unknown>,
+  origin: string | undefined,
+  roomVersion: string
+): Promise<string | null> {
+  if (
+    leaveEvent['room_id'] !== roomId ||
+    leaveEvent['type'] !== 'm.room.member' ||
+    (leaveEvent['content'] as { membership?: string } | undefined)?.membership !== 'leave' ||
+    typeof leaveEvent['state_key'] !== 'string'
+  ) {
+    return null;
+  }
+  const sender = typeof leaveEvent['sender'] === 'string' ? leaveEvent['sender'] : '';
+  if (origin && serverNameFromId(sender) !== origin) return null;
+
+  const signingKey = await getServerSigningKey(env.DB);
+  if (!signingKey) return null;
+
+  const signed = await signJson(
+    redactEventForSigning(toWireEventObject(leaveEvent), roomVersion),
+    env.SERVER_NAME,
+    signingKey.keyId,
+    signingKey.privateKeyJwk
+  );
+  const ourSig = (signed as { signatures?: Record<string, unknown> }).signatures?.[env.SERVER_NAME];
+  leaveEvent['signatures'] = {
+    ...((leaveEvent['signatures'] as Record<string, unknown> | undefined) ?? {}),
+    ...(ourSig ? { [env.SERVER_NAME]: ourSig } : {}),
+  };
+
+  const eventId =
+    typeof leaveEvent['event_id'] === 'string' && leaveEvent['event_id']
+      ? leaveEvent['event_id']
+      : await computeWireEventId(leaveEvent, roomVersion);
+  leaveEvent['event_id'] = eventId;
+
+  const event = leaveEvent as unknown as PDU;
+  await storeEventIdempotent(env.DB, event);
+  await updateMembership(env.DB, roomId, event.state_key as string, 'leave', eventId);
+  await fanoutEventToAppServices(env, event);
+
+  return eventId;
+}
+
+// Shared v1/v2 send_leave handler; both versions must verify, countersign and
+// persist the leave. Only the response envelope differs.
+async function handleSendLeave(c: any, version: 1 | 2) {
+  const roomId = c.req.param('roomId') as string;
+  const eventId = c.req.param('eventId') as string;
+
+  let body: any;
+  try {
+    body = await getFederationBody(c);
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  if (body.type !== 'm.room.member' || body.content?.membership !== 'leave') {
+    return c.json({ errcode: 'M_INVALID_PARAM', error: 'Event is not a leave event' }, 400);
+  }
+  if (body.event_id && body.event_id !== eventId) {
+    return c.json({ errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' }, 400);
+  }
+
+  const db = c.env.DB as D1Database;
+  const room = await db.prepare(
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
+  if (!room) return Errors.notFound('Room not found').toResponse();
+
+  const origin = c.get('federationOrigin' as any) as string | undefined;
+  const senderServer = serverNameFromId(typeof body.sender === 'string' ? body.sender : '');
+  if (origin && (!senderServer || senderServer !== origin)) {
+    return Errors.forbidden('Leave event sender does not belong to the authenticated server').toResponse();
+  }
+  if (!senderServer) {
+    return Errors.forbidden('Leave event has no valid sender').toResponse();
+  }
+
+  const signatureError = await verifyInboundLeaveSignature(c.env, body, senderServer, room.room_version);
+  if (signatureError) {
+    return Errors.forbidden(`Leave event is not signed by ${senderServer}: ${signatureError}`).toResponse();
+  }
+
+  const authError = await authorizeInboundLeave(c.env, roomId, room.room_version, body, origin);
+  if (authError) return Errors.forbidden(authError).toResponse();
+
+  // MSC4284: membership events in policy-server rooms are refused outright
+  // when they lack a valid countersignature, as on the send_join path.
+  if (await policySignatureMissing(c, body as Record<string, unknown>, room.room_version)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'The leave lacks a valid policy server signature' },
+      403
+    );
+  }
+
+  const storedId = await persistInboundLeave(
+    c.env,
+    roomId,
+    body as Record<string, unknown>,
+    origin,
+    room.room_version
+  );
+  if (!storedId) return Errors.forbidden('Leave event was rejected').toResponse();
+
+  // v1 is the legacy envelope; v2 carries the countersigned event.
+  if (version === 1) return c.json({});
+  return c.json({ event: toWireEventObject(body as Record<string, unknown>) });
+}
+
 // PUT /_matrix/federation/v1/send_leave/:roomId/:eventId - Complete leave
 // (v1 was REMOVED from the spec in v1.18 (MSC4376) — kept here
 // deliberately for older peers; v2 is the negotiated path for modern
 // servers.)
-app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
-  try {
-    body = await getFederationBody(c);
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  // Validate the event is a leave event
-  if (body.type !== 'm.room.member' || body.content?.membership !== 'leave') {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event is not a leave event' },
-      400
-    );
-  }
-
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // v1 returns empty array on success [200, {}]
-  return c.json([200, {}]);
-});
+app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => handleSendLeave(c, 1));
 
 // PUT /_matrix/federation/v2/send_leave/:roomId/:eventId - Complete leave (v2)
-app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => {
-  const roomId = c.req.param('roomId');
-  const eventId = c.req.param('eventId');
-
-  let body: any;
-  try {
-    body = await getFederationBody(c);
-  } catch {
-    return Errors.badJson().toResponse();
-  }
-
-  // Validate the event is a leave event
-  if (body.type !== 'm.room.member' || body.content?.membership !== 'leave') {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event is not a leave event' },
-      400
-    );
-  }
-
-  // Validate the event ID matches
-  if (body.event_id && body.event_id !== eventId) {
-    return c.json(
-      { errcode: 'M_INVALID_PARAM', error: 'Event ID mismatch' },
-      400
-    );
-  }
-
-  // Verify room exists
-  const room = await c.env.DB.prepare(
-    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
-  ).bind(roomId).first<{ room_id: string; room_version: string }>();
-
-  if (!room) {
-    return Errors.notFound('Room not found').toResponse();
-  }
-
-  // v2 returns empty object on success
-  return c.json({});
-});
+app.put('/_matrix/federation/v2/send_leave/:roomId/:eventId', async (c) => handleSendLeave(c, 2));
 
 // Persist an invite received from a remote server so the invited local user
 // actually sees it in /sync. The remote side is told "success" as soon as we

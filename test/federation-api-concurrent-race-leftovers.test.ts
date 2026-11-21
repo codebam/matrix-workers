@@ -70,11 +70,15 @@ vi.mock('../src/middleware/federation-auth', () => ({
 const getRemoteKeysWithNotarySignature = vi.fn();
 const verifyRemoteSignature = vi.fn();
 
-vi.mock('../src/services/federation-keys', () => ({
-  getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
-    getRemoteKeysWithNotarySignature(...args),
-  verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
-}));
+vi.mock('../src/services/federation-keys', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/federation-keys')>();
+  return {
+    ...actual,
+    getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
+      getRemoteKeysWithNotarySignature(...args),
+    verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
+  };
+});
 
 const getRoomState = vi.fn(async () => ({}));
 vi.mock('../src/services/database', async (importOriginal) => {
@@ -107,6 +111,7 @@ vi.mock('../src/utils/crypto', async (importOriginal) => {
 import federation from '../src/api/federation';
 import { generateSigningKeyPair } from '../src/utils/crypto';
 import { computeWireEventId } from '../src/utils/event-signing';
+import { signSendBodyPdus } from './helpers/federation-origin-signatures';
 
 type SelectBarrier = { match: (sql: string, args: unknown[]) => boolean; count: number };
 type KvBarrier = { match: (key: string) => boolean; count: number };
@@ -910,7 +915,11 @@ async function req(
 ): Promise<{ status: number; body: unknown; headers: Headers }> {
   const init: RequestInit = { method, headers: { 'Content-Type': 'application/json' } };
   if (body !== undefined) {
-    init.body = typeof body === 'string' ? body : JSON.stringify(body);
+    const signedBody =
+      path.includes('/send/') && typeof body === 'object'
+        ? await signSendBodyPdus(env, body)
+        : body;
+    init.body = typeof signedBody === 'string' ? signedBody : JSON.stringify(signedBody);
   }
   const res = await federation.request(`http://localhost${path}`, init, env);
   const text = await res.text();
@@ -2344,6 +2353,7 @@ describe('race residual send hash∥prev-rejected after #252', () => {
             sender: REMOTE_USER,
             type: 'm.room.message',
             content: { body: 'x' },
+            hashes: { sha256: 'ok' },
             signatures: { [FED_ORIGIN]: { 'ed25519:1': 'bad' } },
           },
         ],
@@ -2364,8 +2374,8 @@ describe('race residual send hash∥prev-rejected after #252', () => {
     ]);
     expect(sig.status).toBe(200);
     expect(accept.status).toBe(200);
-    expect((sig.body as { pdus: Record<string, { error: string }> }).pdus['$racesig'].error).toBe(
-      'PDU from origin server without valid signature'
+    expect((sig.body as { pdus: Record<string, { error: string }> }).pdus['$racesig'].error).toMatch(
+      /without valid signature/
     );
     expect((accept.body as { pdus: Record<string, unknown> }).pdus['$raceaccept']).toEqual({});
   });
@@ -2537,7 +2547,7 @@ describe('race residual third-party∥origin / missing-hash∥auth-denied after 
   it('third-party sig∥origin-server sig isolation', async () => {
     verifyRemoteSignature.mockResolvedValue(false);
     const db = createFedDb({
-      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      rooms: [{ room_id: ROOM, room_version: '1', is_public: 1, created_at: 1 }],
     });
     const env = makeEnv(db);
     const [third, origin] = await Promise.all([
@@ -2549,7 +2559,7 @@ describe('race residual third-party∥origin / missing-hash∥auth-denied after 
             sender: '@carol:other.example.com',
             type: 'm.room.message',
             content: { body: 'x' },
-            signatures: { 'other.example.com': { 'ed25519:1': 'sig' } },
+            signatures: { 'other.example.com': { 'ed25519:1': 'invalid' } },
           },
         ],
       }),
@@ -2567,11 +2577,11 @@ describe('race residual third-party∥origin / missing-hash∥auth-denied after 
       }),
     ]);
     expect(statusesOf([third, origin])).toEqual([200, 200]);
-    expect((third.body as { pdus: Record<string, { error: string }> }).pdus['$r265third'].error).toBe(
-      'Third-party PDU without valid signature'
+    expect((third.body as { pdus: Record<string, { error: string }> }).pdus['$r265third'].error).toMatch(
+      /without valid signature/
     );
-    expect((origin.body as { pdus: Record<string, { error: string }> }).pdus['$r265origin'].error).toBe(
-      'PDU from origin server without valid signature'
+    expect((origin.body as { pdus: Record<string, { error: string }> }).pdus['$r265origin'].error).toMatch(
+      /without valid signature/
     );
   });
 

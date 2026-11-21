@@ -39,12 +39,16 @@ const getRemoteKeysWithNotarySignature = vi.fn();
 const getServerSigningKey = vi.fn();
 const verifyRemoteSignature = vi.fn();
 
-vi.mock('../src/services/federation-keys', () => ({
-  getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
-    getRemoteKeysWithNotarySignature(...args),
-  getServerSigningKey: (...args: unknown[]) => getServerSigningKey(...args),
-  verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
-}));
+vi.mock('../src/services/federation-keys', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/federation-keys')>();
+  return {
+    ...actual,
+    getRemoteKeysWithNotarySignature: (...args: unknown[]) =>
+      getRemoteKeysWithNotarySignature(...args),
+    getServerSigningKey: (...args: unknown[]) => getServerSigningKey(...args),
+    verifyRemoteSignature: (...args: unknown[]) => verifyRemoteSignature(...args),
+  };
+});
 
 const getRoomState = vi.fn(async () => []);
 vi.mock('../src/services/database', async (importOriginal) => {
@@ -72,6 +76,11 @@ import { generateSigningKeyPair, calculateContentHash } from '../src/utils/crypt
 import { computeWireEventId } from '../src/utils/event-signing';
 import { prepareOutboundPdu } from '../src/api/rooms';
 import { deriveRoomWireEvents } from '../src/services/event-wire';
+import {
+  seedPduVerifyKey,
+  signEventForOrigin,
+  signSendBodyPdus,
+} from './helpers/federation-origin-signatures';
 
 const SERVER = 'example.com';
 const ROOM = '!room:example.com';
@@ -840,7 +849,11 @@ async function req(
 ): Promise<{ status: number; body: unknown; headers: Headers }> {
   const init: RequestInit = { method, headers: { 'Content-Type': 'application/json' } };
   if (body !== undefined) {
-    init.body = typeof body === 'string' ? body : JSON.stringify(body);
+    const signedBody =
+      path.includes('/send/') && typeof body === 'object'
+        ? await signSendBodyPdus(env, body)
+        : body;
+    init.body = typeof signedBody === 'string' ? signedBody : JSON.stringify(signedBody);
   }
   const res = await federation.request(`http://localhost${path}`, init, env);
   const text = await res.text();
@@ -1359,7 +1372,9 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
 
   it('rejects PDUs with invalid signatures', async () => {
     verifyRemoteSignature.mockResolvedValue(false);
-    const db = seedBasicRoom();
+    const db = seedBasicRoom({
+      rooms: [{ room_id: ROOM, room_version: '1', is_public: 1, created_at: 1 }],
+    });
     const { body } = await req('PUT', '/_matrix/federation/v1/send/txn-sig', makeEnv(db), {
       pdus: [
         {
@@ -1368,8 +1383,7 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
           sender: REMOTE_USER,
           type: 'm.room.message',
           content: { body: 'hi' },
-          hashes: { sha256: 'abc' },
-          signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          signatures: { [FED_ORIGIN]: { 'ed25519:1': 'invalid' } },
         },
       ],
     });
@@ -1538,7 +1552,7 @@ describe('event / state / state_ids / event_auth', () => {
     const db = seedBasicRoom();
     const { status, body } = await req(
       'GET',
-      `/_matrix/federation/v1/state/${encodeURIComponent(ROOM)}?event_id=%24e`,
+      `/_matrix/federation/v1/state/${encodeURIComponent(ROOM)}?event_id=%24member%3Aexample.com`,
       makeEnv(db)
     );
     expect(status).toBe(200);
@@ -1919,13 +1933,43 @@ describe('make_join / send_join / make_leave / send_leave', () => {
     );
     expect(mismatch.status).toBe(400);
 
+    const localPair = await generateSigningKeyPair();
+    getServerSigningKey.mockResolvedValue({
+      keyId: localPair.keyId,
+      privateKeyJwk: localPair.privateKeyJwk,
+    });
+    checkEventAuth.mockReturnValue({ allowed: true });
+    getRoomState.mockResolvedValue([]);
+    const env = makeEnv(db);
+    await seedPduVerifyKey(env.CACHE, FED_ORIGIN);
+    const signedLeave = async (id: string) => {
+      const base: Record<string, unknown> = {
+        event_id: id,
+        room_id: ROOM,
+        sender: REMOTE_USER,
+        state_key: REMOTE_USER,
+        type: 'm.room.member',
+        content: { membership: 'leave' },
+        origin_server_ts: 1_700_000_000_000,
+        depth: 6,
+        auth_events: [],
+        prev_events: [],
+      };
+      return signEventForOrigin(
+        { ...base, hashes: { sha256: await calculateContentHash(base) } },
+        FED_ORIGIN
+      );
+    };
+
     const ok = await req(
       'PUT',
       `/_matrix/federation/v1/send_leave/${encodeURIComponent(ROOM)}/%24l1`,
-      makeEnv(db),
-      { event_id: '$l1', type: 'm.room.member', content: { membership: 'leave' } }
+      env,
+      await signedLeave('$l1')
     );
     expect(ok.status).toBe(200);
+    expect(ok.body).toEqual({});
+    expect(db.memberships.some((m) => m.user_id === REMOTE_USER && m.membership === 'leave')).toBe(true);
 
     const v2bad = await req(
       'PUT',
@@ -1954,10 +1998,14 @@ describe('make_join / send_join / make_leave / send_leave', () => {
     const v2ok = await req(
       'PUT',
       `/_matrix/federation/v2/send_leave/${encodeURIComponent(ROOM)}/%24l2`,
-      makeEnv(db),
-      { event_id: '$l2', type: 'm.room.member', content: { membership: 'leave' } }
+      env,
+      await signedLeave('$l2')
     );
     expect(v2ok.status).toBe(200);
+    const v2body = v2ok.body as { event: { signatures?: Record<string, unknown> } };
+    expect(v2body.event).toBeDefined();
+    expect(v2body.event.signatures?.[SERVER]).toBeDefined();
+    expect(db.events.get('$l2')).toBeDefined();
   });
 });
 
@@ -2994,7 +3042,9 @@ describe('additional send / query / claim edges', () => {
 
   it('send rejects third-party PDU signature failures with distinct reason', async () => {
     verifyRemoteSignature.mockResolvedValue(false);
-    const db = seedBasicRoom();
+    const db = seedBasicRoom({
+      rooms: [{ room_id: ROOM, room_version: '1', is_public: 1, created_at: 1 }],
+    });
     const { body } = await req('PUT', '/_matrix/federation/v1/send/txn-3p', makeEnv(db), {
       pdus: [
         {
@@ -3003,13 +3053,12 @@ describe('additional send / query / claim edges', () => {
           sender: '@carol:other.example.com',
           type: 'm.room.message',
           content: { body: 'x' },
-          hashes: { sha256: 'abc' },
-          signatures: { 'other.example.com': { 'ed25519:1': 'sig' } },
+          signatures: { 'other.example.com': { 'ed25519:1': 'invalid' } },
         },
       ],
     });
     expect((body as { pdus: Record<string, { error: string }> }).pdus['$3p'].error).toMatch(
-      /Third-party/
+      /without valid signature/
     );
   });
 

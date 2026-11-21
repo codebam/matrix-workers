@@ -295,6 +295,31 @@ describe('federation m.device_list_update — device added deltas', () => {
     expect(db.processedEdus.some((e) => e.edu_type === 'm.device_list_update')).toBe(true);
   });
 
+  it('records a device_key_changes row so /sync reports the remote user as changed', async () => {
+    const db = createDeviceListDb();
+    const env = makeEnv(db);
+
+    await sendTxn(env, 'txn-dkc-1', {
+      pdus: [],
+      edus: [
+        deviceListEdu({
+          user_id: REMOTE_USER,
+          device_id: REMOTE_DEVICE,
+          device_display_name: 'Bob Phone',
+          stream_id: 11,
+          keys: { device_id: REMOTE_DEVICE },
+        }),
+      ],
+    });
+
+    const keyChange = db.runs.find((r) => r.sql.includes('INSERT INTO device_key_changes'));
+    expect(keyChange).toBeDefined();
+    expect(keyChange?.args[0]).toBe(REMOTE_USER);
+    expect(keyChange?.args[1]).toBe(REMOTE_DEVICE);
+    expect(keyChange?.args[2]).toBe('update');
+    expect(typeof keyChange?.args[3]).toBe('number');
+  });
+
   it('upserts an existing device with newer keys and display name', async () => {
     const db = createDeviceListDb({
       remoteDevices: [

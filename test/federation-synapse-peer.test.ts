@@ -12,7 +12,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env, PDU } from '../src/types';
 import { SynapsePeer, peerSigningKey, installNodeEd25519Shim } from './helpers/synapse-peer';
 import { prepareOutboundPdu } from '../src/services/event-wire';
-import { computeWireEventId } from '../src/utils/event-signing';
+import { computeWireEventId, redactEventForSigning } from '../src/utils/event-signing';
+import { signJson } from '../src/utils/crypto';
 
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => async (c: any, next: () => Promise<void>) => {
@@ -488,10 +489,26 @@ describe('inbound wire-ID derivation must use the room version (v10 phantom-ID b
     const prepared = await prepareOutboundPdu(env, plUpdate as PDU, '10');
     const senderId = prepared!.wireId;
     const { event_id: _e, ...wire } = prepared!.wire as Record<string, unknown>;
+    // The sender is a peer.test user: sign the PDU with that server's key
+    // (the fake key resolver serves this key for every origin in this file).
+    const { hashes: _hashes, ...forSignature } = wire;
+    const signed = await signJson(
+      redactEventForSigning(forSignature, '10'),
+      PEER_SERVER,
+      signing.keyId,
+      signing.privateKeyJwk
+    );
+    const signedWire = {
+      ...wire,
+      signatures: {
+        ...((wire.signatures as Record<string, unknown> | undefined) ?? {}),
+        [PEER_SERVER]: (signed.signatures as Record<string, Record<string, string>>)[PEER_SERVER],
+      },
+    };
 
     const res = await federationApp.request(
       'http://localhost/_matrix/federation/v1/send/1795000000000',
-      { method: 'PUT', body: JSON.stringify({ pdus: [wire], edus: [] }) },
+      { method: 'PUT', body: JSON.stringify({ pdus: [signedWire], edus: [] }) },
       env,
     );
     expect(res.status).toBe(200);
