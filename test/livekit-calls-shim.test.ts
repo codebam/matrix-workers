@@ -236,8 +236,10 @@ function installCallsFetch(options: { failDatachannels?: boolean } = {}): { call
         }), { status: 406, headers: { 'Content-Type': 'application/json' } });
       }
       return Response.json({
-        sessionDescription: { type: 'offer', sdp: INITIAL_OFFER_SDP },
-        requiresImmediateRenegotiation: true,
+        sessionDescription: body.sessionDescription
+          ? { type: 'answer', sdp: ANSWER_SDP }
+          : { type: 'offer', sdp: INITIAL_OFFER_SDP },
+        requiresImmediateRenegotiation: !body.sessionDescription,
         dataChannel: { location: 'remote', dataChannelName: 'server-events', id: 0 },
       });
     }
@@ -522,6 +524,30 @@ describe('livekit-calls-shim', () => {
       shim.close();
     });
 
+    it('answers a trackless publisher offer via datachannels instead of empty tracks', async () => {
+      const ws = new FakeSocket();
+      const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_trackless'), ws.asWebSocket(), {
+        registry: new LiveKitShimRegistry(5, 5),
+      });
+      await shim.start({
+        addTrackRequests: [],
+        publisherOffer: { type: 'offer', sdp: OFFER_SDP, id: 7 },
+      });
+      await vi.waitFor(() => expect(sentFrames(ws, 2).length).toBeGreaterThan(0));
+
+      const establish = callsFetch.calls.find((call) => call.url.includes('/datachannels/establish')
+        && call.body.sessionDescription)!;
+      expect(establish.url).toContain('/sessions/sess-1/datachannels/establish');
+      expect(establish.body.sessionDescription).toEqual({ type: 'offer', sdp: OFFER_SDP });
+      expect(callsFetch.calls.some((call) => call.url.includes('/tracks/new')
+        && (call.body.tracks as unknown[]).length === 0)).toBe(false);
+
+      const answer = sentFrames(ws, 2).find((frame) => s(frame.body, 1) === 'answer')!;
+      expect(s(answer.body, 2)).toBe(ANSWER_SDP);
+      expect(n(answer.body, 3)).toBe(7);
+      shim.close();
+    });
+
     it('enforces the per-participant track cap', async () => {
       const ws = new FakeSocket();
       const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_e'), ws.asWebSocket(), {
@@ -732,10 +758,10 @@ describe('livekit-calls-shim', () => {
       await expect(establishDataChannelTransport(makeEnv(), 'sess-dc')).rejects.toBeInstanceOf(CloudflareCallsError);
     });
 
-    it('falls back to empty tracks with a warning when the datachannels endpoint fails', async () => {
+    it('falls back to empty tracks with a log when the datachannels endpoint fails', async () => {
       callsFetch.restore();
       callsFetch = installCallsFetch({ failDatachannels: true });
-      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
       const ws = new FakeSocket();
       const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_fallback'), ws.asWebSocket(), {
         registry: new LiveKitShimRegistry(5, 5),
@@ -747,9 +773,9 @@ describe('livekit-calls-shim', () => {
         && (call.body.tracks as unknown[]).length === 0)!;
       expect(emptyTracks.url).toContain('/sessions/sess-2/tracks/new');
       expect(emptyTracks.body).toEqual({ tracks: [] });
-      expect(warn).toHaveBeenCalledWith(
+      expect(log).toHaveBeenCalledWith(
         expect.stringContaining('datachannels/establish failed'),
-        expect.anything()
+        expect.stringContaining('Calls API error')
       );
       const initial = sentFrames(ws, 3)[0]!;
       expect(s(initial.body, 2)).toBe(INITIAL_OFFER_SDP);

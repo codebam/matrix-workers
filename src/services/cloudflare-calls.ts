@@ -155,17 +155,19 @@ export async function createSession(env: Env): Promise<NewSessionResponse> {
 }
 
 /**
- * Establish a data-channel-only transport on an existing session. Asking to
- * pull the built-in `server-events` channel with no sessionDescription makes
- * Calls return an m=application SDP offer with no media tracks.
+ * Establish a data-channel-only transport on an existing session. With no
+ * sessionDescription Calls returns an m=application SDP offer; with a client
+ * offer it returns the SDP answer, without requiring any media tracks.
  * API: POST /apps/{appId}/sessions/{sessionId}/datachannels/establish
  */
 export async function establishDataChannelTransport(
   env: Env,
-  sessionId: string
+  sessionId: string,
+  offer?: SessionDescription
 ): Promise<SessionDescription> {
   const request: EstablishDataChannelsRequest = {
     dataChannel: { location: 'remote', dataChannelName: 'server-events' },
+    ...(offer ? { sessionDescription: offer } : {}),
   };
   const response = await callsRequest<EstablishDataChannelsResponse>(
     env,
@@ -182,7 +184,11 @@ export async function establishDataChannelTransport(
     );
   }
   if (!response.sessionDescription) {
-    throw new CloudflareCallsError('No offer received from SFU', 'NO_OFFER', 500);
+    throw new CloudflareCallsError(
+      offer ? 'No answer received from SFU' : 'No offer received from SFU',
+      offer ? 'NO_ANSWER' : 'NO_OFFER',
+      500
+    );
   }
   return response.sessionDescription;
 }

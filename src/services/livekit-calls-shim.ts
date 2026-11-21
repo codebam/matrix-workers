@@ -1080,7 +1080,7 @@ export class LiveKitCallsShimSession {
       try {
         offer = await establishDataChannelTransport(this.env, p.subscriberSessionId!);
       } catch (error) {
-        console.warn('[livekit-shim] datachannels/establish failed; falling back to empty tracks:', error);
+        console.log('[livekit-shim] datachannels/establish failed; falling back to empty tracks:', error instanceof Error ? error.message : String(error));
         const response = await addTracks(this.env, p.subscriberSessionId!, { tracks: [] });
         offer = response.sessionDescription;
       }
@@ -1192,6 +1192,20 @@ export class LiveKitCallsShimSession {
     await this.enqueue('publisher', async () => {
       const pending = [...p.pending.values()];
       const tracks: TrackObject[] = pending.map((track) => ({ location: 'local', trackName: track.trackName }));
+      if (tracks.length === 0) {
+        // The SDK sends a trackless initial publisher offer on join. Calls
+        // rejects tracks/new with an empty list, so answer it as a bare
+        // data-channel transport instead.
+        const answer = await establishDataChannelTransport(this.env, p.publisherSessionId, {
+          type: 'offer',
+          sdp: gatheredSdp,
+        });
+        if (answer.type !== 'answer' || !answer.sdp) {
+          throw new Error('Calls did not answer the initial publisher offer');
+        }
+        this.send({ message: 'answer', value: { type: 'answer', sdp: answer.sdp, id: sd.id } });
+        return;
+      }
       const response = await addTracks(this.env, p.publisherSessionId, {
         sessionDescription: { type: 'offer', sdp: gatheredSdp } as SessionDescription,
         tracks,
