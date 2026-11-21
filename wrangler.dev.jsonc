@@ -105,9 +105,13 @@
 		// Delegate federation to the workers.dev domain: same-zone fetches from
 		// the prod worker to dev.codebam.ca fail (HTTP 522), so peers resolve
 		// us via well-known to this off-zone hostname instead.
-		"FEDERATION_WELL_KNOWN_M_SERVER": "matrix-worker-codebam-dev.codebam.workers.dev:443"
+		"FEDERATION_WELL_KNOWN_M_SERVER": "matrix-worker-codebam-dev.codebam.workers.dev:443",
+		// Experimental Calls shim: point /livekit/get_token at our own signaling path.
+		// Rollback = restore the self-hosted LiveKit wss URL here.
+		"LIVEKIT_URL": "wss://dev.codebam.ca/livekit/signal"
 	},
 	"routes": [
+		"dev.codebam.ca/livekit/*",
 		"dev.codebam.ca/_matrix/*",
 		"dev.codebam.ca/oauth/*",
 		"dev.codebam.ca/.well-known/matrix/*",
