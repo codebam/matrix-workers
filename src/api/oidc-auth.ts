@@ -4,6 +4,7 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppEnv } from '../types';
+import type { OAuthEndpoints, OIDCUserClaims } from '../services/oidc';
 import {
   fetchOIDCDiscovery,
   fetchJWKS,
@@ -12,6 +13,9 @@ import {
   validateIDToken,
   generateRandomString,
   deriveUsername,
+  buildOAuthAuthorizationUrl,
+  exchangeOAuthCode,
+  fetchOAuthUserInfo,
 } from '../services/oidc';
 import { formatUserId } from '../utils/ids';
 import { generateAccessToken, generateDeviceId } from '../utils/ids';
@@ -34,6 +38,11 @@ export interface IdPProvider {
   username_claim: string;
   display_order: number;
   icon_url: string | null;
+  provider_type: string;
+  authorization_endpoint: string | null;
+  token_endpoint: string | null;
+  userinfo_endpoint: string | null;
+  emails_endpoint: string | null;
 }
 
 interface IdPUserLink {
@@ -43,6 +52,22 @@ interface IdPUserLink {
   user_id: string;
   external_email: string | null;
   external_name: string | null;
+}
+
+// Generic OAuth2 providers store their endpoints on the provider row instead
+// of advertising an OIDC discovery document. A partially configured provider
+// fails closed rather than silently redirecting to a missing endpoint.
+function getOAuthEndpoints(provider: IdPProvider): OAuthEndpoints {
+  const { authorization_endpoint, token_endpoint, userinfo_endpoint, emails_endpoint } = provider;
+  if (!authorization_endpoint || !token_endpoint || !userinfo_endpoint) {
+    throw new Error('OAuth2 provider is missing required endpoint configuration');
+  }
+  return {
+    authorization_endpoint,
+    token_endpoint,
+    userinfo_endpoint,
+    ...(emails_endpoint ? { emails_endpoint } : {}),
+  };
 }
 
 interface OAuthState {
@@ -184,6 +209,39 @@ export async function initiateIdpLogin(
   opts: { returnTo?: string; ssoRedirectUrl?: string } = {}
 ): Promise<Response> {
   try {
+    if (provider.provider_type === 'oauth2') {
+      const endpoints = getOAuthEndpoints(provider);
+
+      // Generate state and nonce. The nonce is still stored in OAuthState so
+      // the state shape stays identical; generic OAuth2 has no nonce param.
+      const state = generateRandomString(32);
+      const nonce = generateRandomString(32);
+
+      const host = c.req.header('host') || c.env.SERVER_NAME;
+      const redirectUri = `https://${host}/auth/oidc/${provider.id}/callback`;
+
+      const stateData: OAuthState = {
+        providerId: provider.id,
+        nonce,
+        redirectUri,
+        returnTo: opts.returnTo,
+        ssoRedirectUrl: opts.ssoRedirectUrl,
+      };
+      await c.env.SESSIONS.put(`oidc_state:${state}`, JSON.stringify(stateData), {
+        expirationTtl: 600,
+      });
+
+      const authUrl = buildOAuthAuthorizationUrl(
+        endpoints,
+        provider.client_id,
+        redirectUri,
+        provider.scopes,
+        state
+      );
+
+      return c.redirect(authUrl);
+    }
+
     // Fetch OIDC discovery
     const discovery = await fetchOIDCDiscovery(provider.issuer_url);
 
@@ -286,30 +344,50 @@ app.get('/auth/oidc/:providerId/callback', async (c) => {
   }
 
   try {
-    // Fetch OIDC discovery and JWKS
-    const discovery = await fetchOIDCDiscovery(provider.issuer_url);
-    const jwks = await fetchJWKS(discovery.jwks_uri);
+    let claims: OIDCUserClaims;
 
-    // Decrypt client secret
-    const clientSecret = await decryptSecret(provider.client_secret_encrypted, c.env);
+    if (provider.provider_type === 'oauth2') {
+      const endpoints = getOAuthEndpoints(provider);
 
-    // Exchange code for tokens
-    const tokens = await exchangeCodeForTokens(
-      discovery,
-      provider.client_id,
-      clientSecret,
-      code,
-      stateData.redirectUri
-    );
+      // Decrypt client secret (same scheme as OIDC providers)
+      const clientSecret = await decryptSecret(provider.client_secret_encrypted, c.env);
 
-    // Validate ID token and extract claims
-    const claims = await validateIDToken(
-      tokens.id_token,
-      provider.issuer_url,
-      provider.client_id,
-      stateData.nonce,
-      jwks
-    );
+      // Exchange the code and read the user profile from the OAuth2 endpoints.
+      // There is no ID token/JWKS/nonce validation for generic OAuth2.
+      const tokens = await exchangeOAuthCode(
+        endpoints,
+        provider.client_id,
+        clientSecret,
+        code,
+        stateData.redirectUri
+      );
+      claims = await fetchOAuthUserInfo(endpoints, tokens.access_token);
+    } else {
+      // Fetch OIDC discovery and JWKS
+      const discovery = await fetchOIDCDiscovery(provider.issuer_url);
+      const jwks = await fetchJWKS(discovery.jwks_uri);
+
+      // Decrypt client secret
+      const clientSecret = await decryptSecret(provider.client_secret_encrypted, c.env);
+
+      // Exchange code for tokens
+      const tokens = await exchangeCodeForTokens(
+        discovery,
+        provider.client_id,
+        clientSecret,
+        code,
+        stateData.redirectUri
+      );
+
+      // Validate ID token and extract claims
+      claims = await validateIDToken(
+        tokens.id_token,
+        provider.issuer_url,
+        provider.client_id,
+        stateData.nonce,
+        jwks
+      );
+    }
 
     // Check if user link exists
     let userLink = await db.prepare(`
