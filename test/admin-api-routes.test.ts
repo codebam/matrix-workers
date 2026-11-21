@@ -70,6 +70,7 @@ vi.mock('../src/api/oidc-auth', async (importOriginal) => {
 });
 
 import adminApp from '../src/api/admin';
+import { fetchOIDCDiscovery } from '../src/services/oidc';
 import federationApp from '../src/api/federation';
 import versionsApp from '../src/api/versions';
 import loginApp from '../src/api/login';
@@ -180,6 +181,11 @@ type IdpProvider = {
   id: string;
   name: string;
   issuer_url: string;
+  provider_type?: string;
+  authorization_endpoint?: string | null;
+  token_endpoint?: string | null;
+  userinfo_endpoint?: string | null;
+  emails_endpoint?: string | null;
   client_id: string;
   client_secret_encrypted: string;
   scopes: string;
@@ -553,6 +559,11 @@ function createAdminDb(opts: {
       id: 'idp1',
       name: 'GitHub',
       issuer_url: 'https://idp.example.com',
+      provider_type: 'oidc',
+      authorization_endpoint: null,
+      token_endpoint: null,
+      userinfo_endpoint: null,
+      emails_endpoint: null,
       client_id: 'cid',
       client_secret_encrypted: 'enc:secret',
       scopes: 'openid profile email',
@@ -760,10 +771,13 @@ function createAdminDb(opts: {
                 return { position: streamPositions.to_device ?? 1 } as T;
               }
 
-              if (sql.includes('SELECT id FROM idp_providers WHERE id = ?')) {
+              if (
+                sql.includes('SELECT id FROM idp_providers WHERE id = ?') ||
+                sql.includes('SELECT id, provider_type FROM idp_providers WHERE id = ?')
+              ) {
                 const id = args[0] as string;
                 const p = idpProviders.find((x) => x.id === id);
-                return (p ? { id: p.id } : null) as T;
+                return (p ? { id: p.id, provider_type: p.provider_type ?? 'oidc' } : null) as T;
               }
 
               if (
@@ -778,6 +792,11 @@ function createAdminDb(opts: {
                   id: p.id,
                   name: p.name,
                   issuer_url: p.issuer_url,
+                  provider_type: p.provider_type ?? 'oidc',
+                  authorization_endpoint: p.authorization_endpoint ?? null,
+                  token_endpoint: p.token_endpoint ?? null,
+                  userinfo_endpoint: p.userinfo_endpoint ?? null,
+                  emails_endpoint: p.emails_endpoint ?? null,
                   client_id: p.client_id,
                   scopes: p.scopes,
                   enabled: p.enabled,
@@ -790,10 +809,17 @@ function createAdminDb(opts: {
                 } as T;
               }
 
-              if (sql.includes('SELECT issuer_url FROM idp_providers WHERE id = ?')) {
+              if (sql.includes('FROM idp_providers WHERE id = ?') && sql.includes('issuer_url') && !sql.includes('client_id')) {
                 const id = args[0] as string;
                 const p = idpProviders.find((x) => x.id === id);
-                return (p ? { issuer_url: p.issuer_url } : null) as T;
+                return (p ? {
+                  issuer_url: p.issuer_url,
+                  provider_type: p.provider_type ?? 'oidc',
+                  authorization_endpoint: p.authorization_endpoint ?? null,
+                  token_endpoint: p.token_endpoint ?? null,
+                  userinfo_endpoint: p.userinfo_endpoint ?? null,
+                  emails_endpoint: p.emails_endpoint ?? null,
+                } : null) as T;
               }
 
               // room state content joins
@@ -1337,6 +1363,11 @@ function createAdminDb(opts: {
                       id: p.id,
                       name: p.name,
                       issuer_url: p.issuer_url,
+                      provider_type: p.provider_type ?? 'oidc',
+                      authorization_endpoint: p.authorization_endpoint ?? null,
+                      token_endpoint: p.token_endpoint ?? null,
+                      userinfo_endpoint: p.userinfo_endpoint ?? null,
+                      emails_endpoint: p.emails_endpoint ?? null,
                       client_id: p.client_id,
                       scopes: p.scopes,
                       enabled: p.enabled,
@@ -1571,6 +1602,11 @@ function createAdminDb(opts: {
                   icon_url: args[8] as string | null,
                   created_at: args[9] as number,
                   updated_at: args[10] as number,
+                  provider_type: (args[11] as string) ?? 'oidc',
+                  authorization_endpoint: (args[12] as string | null) ?? null,
+                  token_endpoint: (args[13] as string | null) ?? null,
+                  userinfo_endpoint: (args[14] as string | null) ?? null,
+                  emails_endpoint: (args[15] as string | null) ?? null,
                 });
               }
               if (sql.includes('INSERT INTO admin_audit_log')) {
@@ -2475,6 +2511,167 @@ describe('admin IdP provider management', () => {
     const del = await req('/admin/api/idp/providers/idp1', { method: 'DELETE' }, env);
     expect(del.status).toBe(200);
     expect(db.idpProviders.some((p) => p.id === 'idp1')).toBe(false);
+  });
+
+  function oauth2Provider(): IdpProvider {
+    return {
+      id: 'gh1',
+      name: 'GitHub',
+      issuer_url: 'https://github.com',
+      provider_type: 'oauth2',
+      authorization_endpoint: 'https://github.com/login/oauth/authorize',
+      token_endpoint: 'https://github.com/login/oauth/access_token',
+      userinfo_endpoint: 'https://api.github.com/user',
+      emails_endpoint: 'https://api.github.com/user/emails',
+      client_id: 'gh-client',
+      client_secret_encrypted: 'enc:gh-secret',
+      scopes: 'read:user user:email',
+      enabled: 1,
+      auto_create_users: 1,
+      username_claim: 'preferred_username',
+      display_order: 0,
+      icon_url: null,
+      created_at: 1_000,
+      updated_at: 1_000,
+    };
+  }
+
+  it('creates an OAuth2 provider without fetching OIDC discovery', async () => {
+    const db = createAdminDb({ idpProviders: [] });
+    const env = createEnv({ db });
+    const discovery = vi.mocked(fetchOIDCDiscovery);
+    discovery.mockClear();
+
+    const noEndpoints = await req(
+      '/admin/api/idp/providers',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'GitHub', provider_type: 'oauth2', issuer_url: 'https://github.com',
+          client_id: 'cid', client_secret: 'secret',
+        }),
+      },
+      env
+    );
+    expect(noEndpoints.status).toBe(400);
+    expect(discovery).not.toHaveBeenCalled();
+
+    const badUrl = await req(
+      '/admin/api/idp/providers',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'GitHub', provider_type: 'oauth2', issuer_url: 'https://github.com',
+          client_id: 'cid', client_secret: 'secret',
+          authorization_endpoint: 'not-a-url',
+          token_endpoint: 'https://github.com/login/oauth/access_token',
+          userinfo_endpoint: 'https://api.github.com/user',
+        }),
+      },
+      env
+    );
+    expect(badUrl.status).toBe(400);
+    expect(discovery).not.toHaveBeenCalled();
+
+    const created = await req(
+      '/admin/api/idp/providers',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'GitHub', provider_type: 'oauth2', issuer_url: 'https://github.com/',
+          client_id: 'gh-client', client_secret: 'gh-secret',
+          authorization_endpoint: 'https://github.com/login/oauth/authorize',
+          token_endpoint: 'https://github.com/login/oauth/access_token',
+          userinfo_endpoint: 'https://api.github.com/user',
+          emails_endpoint: 'https://api.github.com/user/emails',
+        }),
+      },
+      env
+    );
+    expect(created.status).toBe(200);
+    expect(discovery).not.toHaveBeenCalled();
+    const stored = db.idpProviders[0];
+    expect(stored.provider_type).toBe('oauth2');
+    expect(stored.issuer_url).toBe('https://github.com');
+    expect(stored.scopes).toBe('read:user user:email');
+    expect(stored.username_claim).toBe('preferred_username');
+    expect(stored.authorization_endpoint).toBe('https://github.com/login/oauth/authorize');
+    expect(stored.token_endpoint).toBe('https://github.com/login/oauth/access_token');
+    expect(stored.userinfo_endpoint).toBe('https://api.github.com/user');
+    expect(stored.emails_endpoint).toBe('https://api.github.com/user/emails');
+  });
+
+  it('round-trips OAuth2 provider fields through list and detail GETs', async () => {
+    const db = createAdminDb({ idpProviders: [oauth2Provider()], idpLinks: [] });
+    const env = createEnv({ db });
+
+    const list = await req('/admin/api/idp/providers', {}, env);
+    expect((await list.json()).providers[0]).toMatchObject({
+      id: 'gh1',
+      provider_type: 'oauth2',
+      authorization_endpoint: 'https://github.com/login/oauth/authorize',
+      token_endpoint: 'https://github.com/login/oauth/access_token',
+      userinfo_endpoint: 'https://api.github.com/user',
+      emails_endpoint: 'https://api.github.com/user/emails',
+    });
+
+    const detail = await req('/admin/api/idp/providers/gh1', {}, env);
+    expect(await detail.json()).toMatchObject({
+      id: 'gh1',
+      provider_type: 'oauth2',
+      authorization_endpoint: 'https://github.com/login/oauth/authorize',
+      token_endpoint: 'https://github.com/login/oauth/access_token',
+      userinfo_endpoint: 'https://api.github.com/user',
+      emails_endpoint: 'https://api.github.com/user/emails',
+    });
+  });
+
+  it('updates an OAuth2 provider without discovery validation', async () => {
+    const db = createAdminDb({ idpProviders: [oauth2Provider()], idpLinks: [] });
+    const env = createEnv({ db });
+    const discovery = vi.mocked(fetchOIDCDiscovery);
+    discovery.mockClear();
+
+    const updated = await req(
+      '/admin/api/idp/providers/gh1',
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'GitHub Updated',
+          issuer_url: 'https://github.com/',
+          userinfo_endpoint: 'https://api.github.com/user/new',
+          emails_endpoint: null,
+        }),
+      },
+      env
+    );
+    expect(updated.status).toBe(200);
+    expect(discovery).not.toHaveBeenCalled();
+    const updateSql = db.updates.find((u) => u.sql.includes('UPDATE idp_providers SET'))?.sql ?? '';
+    expect(updateSql).toContain('issuer_url = ?');
+    expect(updateSql).toContain('userinfo_endpoint = ?');
+    expect(updateSql).toContain('emails_endpoint = ?');
+  });
+
+  it('tests an OAuth2 connection without discovery and returns endpoints_found', async () => {
+    const db = createAdminDb({ idpProviders: [oauth2Provider()], idpLinks: [] });
+    const env = createEnv({ db });
+    const discovery = vi.mocked(fetchOIDCDiscovery);
+    discovery.mockClear();
+
+    const tested = await req('/admin/api/idp/providers/gh1/test', { method: 'POST' }, env);
+    expect(tested.status).toBe(200);
+    const body = await tested.json();
+    expect(body.success).toBe(true);
+    expect(body.endpoints_found).toEqual([
+      'authorization_endpoint', 'token_endpoint', 'userinfo_endpoint', 'emails_endpoint',
+    ]);
+    expect(body.discovery).toBeUndefined();
+    expect(discovery).not.toHaveBeenCalled();
   });
 });
 

@@ -1,16 +1,20 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   buildAuthorizationUrl,
+  buildOAuthAuthorizationUrl,
   decodeJWT,
   deriveUsername,
   exchangeCodeForTokens,
+  exchangeOAuthCode,
   fetchJWKS,
+  fetchOAuthUserInfo,
   fetchOIDCDiscovery,
   generateRandomString,
   validateIDToken,
   type JWK,
   type JWKS,
   type OIDCDiscovery,
+  type OAuthEndpoints,
 } from '../src/services/oidc';
 
 const discovery: OIDCDiscovery = {
@@ -912,5 +916,219 @@ describe('oidc TOKENMAXX edge paths after #75', () => {
         'user_12345678'
       );
     });
+  });
+});
+
+describe('generic OAuth2 provider helpers', () => {
+  const endpoints: OAuthEndpoints = {
+    authorization_endpoint: 'https://github.com/login/oauth/authorize',
+    token_endpoint: 'https://github.com/login/oauth/access_token',
+    userinfo_endpoint: 'https://api.github.com/user',
+    emails_endpoint: 'https://api.github.com/user/emails',
+  };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function okJson(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  it('builds an authorization URL with every param and no nonce', () => {
+    const url = new URL(
+      buildOAuthAuthorizationUrl(
+        endpoints,
+        'client-1',
+        'https://matrix.example.com/callback',
+        'read:user user:email',
+        'state-xyz'
+      )
+    );
+    expect(url.origin + url.pathname).toBe('https://github.com/login/oauth/authorize');
+    expect(url.searchParams.get('response_type')).toBe('code');
+    expect(url.searchParams.get('client_id')).toBe('client-1');
+    expect(url.searchParams.get('redirect_uri')).toBe('https://matrix.example.com/callback');
+    expect(url.searchParams.get('scope')).toBe('read:user user:email');
+    expect(url.searchParams.get('state')).toBe('state-xyz');
+    expect(url.searchParams.has('nonce')).toBe(false);
+  });
+
+  it('POSTs the grant with Accept: application/json and the secret in the body', async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      expect(init?.method).toBe('POST');
+      expect(init?.headers).toMatchObject({
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+      });
+      expect(Object.fromEntries(new URLSearchParams(String(init?.body)))).toEqual({
+        grant_type: 'authorization_code',
+        code: 'auth-code',
+        redirect_uri: 'https://cb',
+        client_id: 'cid',
+        client_secret: 'supersecret',
+      });
+      return okJson({ access_token: 'at', token_type: 'bearer', scope: 'read:user' });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      exchangeOAuthCode(endpoints, 'cid', 'supersecret', 'auth-code', 'https://cb')
+    ).resolves.toEqual({ access_token: 'at', token_type: 'bearer', scope: 'read:user' });
+    expect(fetchMock.mock.calls[0][0]).toBe(endpoints.token_endpoint);
+  });
+
+  it('throws with status and error text when the token exchange fails', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('bad_verification_code', { status: 400 }))
+    );
+    await expect(
+      exchangeOAuthCode(endpoints, 'cid', 'sec', 'bad', 'https://cb')
+    ).rejects.toThrow(/Token exchange failed: 400 - bad_verification_code/);
+  });
+
+  it('maps GitHub user fields onto OIDC claims and stringifies a numeric id', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === endpoints.userinfo_endpoint) {
+        expect(init?.headers).toMatchObject({
+          'Authorization': 'Bearer at',
+          'Accept': 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+          'User-Agent': expect.any(String),
+        });
+        return okJson({
+          id: 123456,
+          login: 'octocat',
+          name: 'The Octocat',
+          email: 'octo@users.noreply.github.com',
+          avatar_url: 'https://avatars.example/octocat',
+        });
+      }
+      return okJson([]);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchOAuthUserInfo(endpoints, 'at')).resolves.toEqual({
+      sub: '123456',
+      preferred_username: 'octocat',
+      name: 'The Octocat',
+      email: 'octo@users.noreply.github.com',
+      picture: 'https://avatars.example/octocat',
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe(endpoints.userinfo_endpoint);
+  });
+
+  it('falls back to the login for name when the profile has no name', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => okJson({ id: 'u7', login: 'user7' }))
+    );
+    await expect(fetchOAuthUserInfo(endpoints, 'at')).resolves.toMatchObject({
+      sub: 'u7',
+      preferred_username: 'user7',
+      name: 'user7',
+    });
+  });
+
+  it('selects the primary verified email from the emails endpoint', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === endpoints.userinfo_endpoint) {
+          return okJson({ id: 'u8', login: 'user8' });
+        }
+        return okJson([
+          { email: 'secondary@example.com', primary: false, verified: true },
+          { email: 'primary@example.com', primary: true, verified: true },
+          { email: 'unverified@example.com', primary: true, verified: false },
+        ]);
+      })
+    );
+
+    await expect(fetchOAuthUserInfo(endpoints, 'at')).resolves.toEqual({
+      sub: 'u8',
+      preferred_username: 'user8',
+      name: 'user8',
+      email: 'primary@example.com',
+      email_verified: true,
+    });
+  });
+
+  it('falls back to any verified email when no primary verified address exists', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        if (url === endpoints.userinfo_endpoint) {
+          return okJson({ id: 9, login: 'nine' });
+        }
+        return okJson([
+          { email: 'secondary@example.com', primary: false, verified: true },
+          { email: 'unverified@example.com', primary: false, verified: false },
+        ]);
+      })
+    );
+
+    await expect(fetchOAuthUserInfo(endpoints, 'at')).resolves.toMatchObject({
+      sub: '9',
+      email: 'secondary@example.com',
+      email_verified: true,
+    });
+  });
+
+  it('uses the profile email without claiming verification when no emails endpoint is configured', async () => {
+    const fetchMock = vi.fn(async () =>
+      okJson({ id: 42, login: 'fortytwo', email: 'profile@example.com' })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const claims = await fetchOAuthUserInfo(
+      { ...endpoints, emails_endpoint: undefined },
+      'at'
+    );
+    expect(claims).toMatchObject({ sub: '42', email: 'profile@example.com' });
+    expect(claims.email_verified).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a failing emails endpoint as non-fatal', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === endpoints.userinfo_endpoint) {
+        return okJson({ id: 11, login: 'eleven', email: 'profile@example.com' });
+      }
+      return new Response('rate limited', { status: 403 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const claims = await fetchOAuthUserInfo(endpoints, 'at');
+    expect(claims).toMatchObject({ sub: '11', email: 'profile@example.com' });
+    expect(claims.email_verified).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('treats a thrown emails-endpoint error as non-fatal', async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === endpoints.userinfo_endpoint) {
+        return okJson({ id: 12, login: 'twelve' });
+      }
+      throw new Error('network down');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchOAuthUserInfo(endpoints, 'at')).resolves.toMatchObject({
+      sub: '12',
+      preferred_username: 'twelve',
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('throws with status when the userinfo request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('nope', { status: 401 })));
+    await expect(fetchOAuthUserInfo(endpoints, 'at')).rejects.toThrow(
+      /Failed to fetch user info.*401/
+    );
   });
 });

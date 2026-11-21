@@ -8,6 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
+import { hashToken } from '../src/utils/crypto';
 
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => {
@@ -26,6 +27,9 @@ const exchangeCodeForTokens = vi.fn();
 const validateIDToken = vi.fn();
 const generateRandomString = vi.fn();
 const deriveUsername = vi.fn();
+const buildOAuthAuthorizationUrl = vi.fn();
+const exchangeOAuthCode = vi.fn();
+const fetchOAuthUserInfo = vi.fn();
 
 vi.mock('../src/services/oidc', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/services/oidc')>();
@@ -38,6 +42,9 @@ vi.mock('../src/services/oidc', async (importOriginal) => {
     validateIDToken: (...args: unknown[]) => validateIDToken(...args),
     generateRandomString: (...args: unknown[]) => generateRandomString(...args),
     deriveUsername: (...args: unknown[]) => deriveUsername(...args),
+    buildOAuthAuthorizationUrl: (...args: unknown[]) => buildOAuthAuthorizationUrl(...args),
+    exchangeOAuthCode: (...args: unknown[]) => exchangeOAuthCode(...args),
+    fetchOAuthUserInfo: (...args: unknown[]) => fetchOAuthUserInfo(...args),
   };
 });
 
@@ -138,6 +145,11 @@ type IdPProvider = {
   username_claim: string;
   display_order: number;
   icon_url: string | null;
+  provider_type?: string;
+  authorization_endpoint?: string | null;
+  token_endpoint?: string | null;
+  userinfo_endpoint?: string | null;
+  emails_endpoint?: string | null;
 };
 
 type IdPUserLink = {
@@ -164,6 +176,11 @@ function seedProvider(partial: Partial<IdPProvider> = {}): IdPProvider {
     username_claim: 'preferred_username',
     display_order: 1,
     icon_url: 'https://cdn.example.com/google.svg',
+    provider_type: 'oidc',
+    authorization_endpoint: null,
+    token_endpoint: null,
+    userinfo_endpoint: null,
+    emails_endpoint: null,
     ...partial,
   };
 }
@@ -403,6 +420,18 @@ const DISCOVERY = {
   jwks_uri: `${ISSUER}/jwks`,
 };
 
+const OAUTH_ENDPOINTS = {
+  authorization_endpoint: 'https://github.com/login/oauth/authorize',
+  token_endpoint: 'https://github.com/login/oauth/access_token',
+  userinfo_endpoint: 'https://api.github.com/user',
+  emails_endpoint: 'https://api.github.com/user/emails',
+};
+
+const OAUTH_PROVIDER = {
+  provider_type: 'oauth2',
+  ...OAUTH_ENDPOINTS,
+};
+
 beforeEach(() => {
   deviceSeq = 0;
   tokenSeq = 0;
@@ -414,6 +443,9 @@ beforeEach(() => {
   validateIDToken.mockReset();
   generateRandomString.mockReset();
   deriveUsername.mockReset();
+  buildOAuthAuthorizationUrl.mockReset();
+  exchangeOAuthCode.mockReset();
+  fetchOAuthUserInfo.mockReset();
   getUserById.mockReset();
   createUser.mockReset();
   createDevice.mockReset();
@@ -435,6 +467,16 @@ beforeEach(() => {
     preferred_username: 'alice',
   });
   deriveUsername.mockReturnValue('alice');
+  buildOAuthAuthorizationUrl.mockReturnValue(
+    'https://github.com/login/oauth/authorize?client_id=client-abc&state=STATE'
+  );
+  exchangeOAuthCode.mockResolvedValue({ access_token: 'oauth-at', token_type: 'bearer' });
+  fetchOAuthUserInfo.mockResolvedValue({
+    sub: 'gh-sub-1',
+    email: 'octocat@example.com',
+    name: 'The Octocat',
+    preferred_username: 'octocat',
+  });
   getUserById.mockResolvedValue(null);
   createUser.mockResolvedValue(undefined);
   createDevice.mockResolvedValue(undefined);
@@ -748,6 +790,59 @@ describe('GET /auth/oidc/:providerId/login', () => {
     await request(`/auth/oidc/${PROVIDER_ID}/login`, {}, envFor({ db, sessions }));
     expect(sessions.puts).toHaveLength(0);
   });
+
+  it('OAuth2 provider redirects to configured authorization URL without discovery or nonce', async () => {
+    const sessions = mockKv();
+    const db = createOidcDb({ providers: [seedProvider(OAUTH_PROVIDER)] });
+    const state = 'OAUTHSTATE____________________';
+    generateRandomString.mockReturnValue(state);
+    buildOAuthAuthorizationUrl.mockReturnValue(
+      'https://github.com/login/oauth/authorize?client_id=client-abc&state=oauthstate'
+    );
+
+    const { status, headers } = await request(
+      `/auth/oidc/${PROVIDER_ID}/login?return_to=/rooms`,
+      {},
+      envFor({ db, sessions })
+    );
+
+    expect(status).toBe(302);
+    expect(headers.get('location')).toBe(
+      'https://github.com/login/oauth/authorize?client_id=client-abc&state=oauthstate'
+    );
+    expect(fetchOIDCDiscovery).not.toHaveBeenCalled();
+    expect(buildAuthorizationUrl).not.toHaveBeenCalled();
+    expect(buildOAuthAuthorizationUrl).toHaveBeenCalledWith(
+      OAUTH_ENDPOINTS,
+      'client-abc',
+      `https://${SERVER}/auth/oidc/${PROVIDER_ID}/callback`,
+      'openid profile email',
+      state
+    );
+    // buildOAuthAuthorizationUrl takes no nonce argument.
+    expect(buildOAuthAuthorizationUrl.mock.calls[0]).toHaveLength(5);
+
+    const put = sessions.puts.find((p) => p.key.startsWith('oidc_state:'));
+    expect(put).toBeDefined();
+    expect(put!.options?.expirationTtl).toBe(600);
+    // OAuthState keeps its nonce field even for OAuth2 providers.
+    expect(JSON.parse(put!.value)).toEqual({
+      providerId: PROVIDER_ID,
+      nonce: state,
+      redirectUri: `https://${SERVER}/auth/oidc/${PROVIDER_ID}/callback`,
+      returnTo: '/rooms',
+    });
+  });
+
+  it('OAuth2 provider with missing endpoints returns M_UNKNOWN 500', async () => {
+    const db = createOidcDb({
+      providers: [seedProvider({ provider_type: 'oauth2', authorization_endpoint: null })],
+    });
+    const { status, body } = await request(`/auth/oidc/${PROVIDER_ID}/login`, {}, envFor({ db }));
+    expect(status).toBe(500);
+    expect(body).toEqual({ errcode: 'M_UNKNOWN', error: 'Failed to initiate login' });
+    expect(buildOAuthAuthorizationUrl).not.toHaveBeenCalled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -766,6 +861,7 @@ describe('GET /auth/oidc/:providerId/callback', () => {
       nonce: string;
       redirectUri: string;
       returnTo: string;
+      ssoRedirectUrl: string;
     }> = {}
   ): Promise<string> {
     const state = 'callback-state-1';
@@ -1150,6 +1246,87 @@ describe('GET /auth/oidc/:providerId/callback', () => {
       envFor({ sessions, db })
     );
     expect(text).toContain('href="/"');
+  });
+
+  it('OAuth2 callback uses userinfo claims to create/link a user without OIDC validation', async () => {
+    const sessions = mockKv();
+    const state = await seedState(sessions, { returnTo: '/app' });
+    const secret = await encryptClientSecret();
+    const db = createOidcDb({ providers: [seedProvider({ ...OAUTH_PROVIDER, client_secret_encrypted: secret })] });
+    deriveUsername.mockReturnValue('octocat');
+    getUserById.mockResolvedValue(null);
+
+    const { status, text } = await request(
+      `/auth/oidc/${PROVIDER_ID}/callback?code=ghcode&state=${state}`,
+      {},
+      envFor({ sessions, db })
+    );
+
+    expect(status).toBe(200);
+    expect(text).toContain('Login Successful');
+    expect(text).toContain('@octocat:example.com');
+    expect(text).toContain('href="/app"');
+    expect(fetchOIDCDiscovery).not.toHaveBeenCalled();
+    expect(fetchJWKS).not.toHaveBeenCalled();
+    expect(exchangeCodeForTokens).not.toHaveBeenCalled();
+    expect(validateIDToken).not.toHaveBeenCalled();
+    expect(exchangeOAuthCode).toHaveBeenCalledWith(
+      OAUTH_ENDPOINTS,
+      'client-abc',
+      'idp-client-secret',
+      'ghcode',
+      `https://${SERVER}/auth/oidc/${PROVIDER_ID}/callback`
+    );
+    expect(fetchOAuthUserInfo).toHaveBeenCalledWith(OAUTH_ENDPOINTS, 'oauth-at');
+    expect(createUser).toHaveBeenCalledWith(
+      expect.anything(),
+      '@octocat:example.com',
+      'octocat',
+      null,
+      false
+    );
+    expect(db.inserts.some((i) => i.sql.includes('INSERT INTO idp_user_links'))).toBe(true);
+    expect(db.links[0]).toMatchObject({
+      provider_id: PROVIDER_ID,
+      external_id: 'gh-sub-1',
+      user_id: '@octocat:example.com',
+      external_email: 'octocat@example.com',
+      external_name: 'The Octocat',
+    });
+  });
+
+  it('OAuth2 callback completes the spec SSO loginToken path with userinfo claims', async () => {
+    const sessions = mockKv();
+    const redirectUrl = 'https://client.example/done';
+    const state = await seedState(sessions, { ssoRedirectUrl: redirectUrl });
+    const secret = await encryptClientSecret();
+    const db = createOidcDb({ providers: [seedProvider({ ...OAUTH_PROVIDER, client_secret_encrypted: secret })] });
+    deriveUsername.mockReturnValue('octocat');
+
+    const { status, headers } = await request(
+      `/auth/oidc/${PROVIDER_ID}/callback?code=ghcode&state=${state}`,
+      {},
+      envFor({ sessions, db })
+    );
+
+    expect(status).toBe(302);
+    const location = new URL(headers.get('location')!);
+    expect(location.origin + location.pathname).toBe(redirectUrl);
+    const loginToken = location.searchParams.get('loginToken')!;
+    expect(loginToken).toBeTruthy();
+    const stored = JSON.parse(sessions.data[`login_token:${await hashToken(loginToken)}`]);
+    expect(stored.user_id).toBe('@octocat:example.com');
+    expect(stored.expires_at).toBeGreaterThan(NOW);
+    expect(createUser).toHaveBeenCalledWith(
+      expect.anything(),
+      '@octocat:example.com',
+      'octocat',
+      null,
+      false
+    );
+    expect(createDevice).not.toHaveBeenCalled();
+    expect(createAccessToken).not.toHaveBeenCalled();
+    expect(fetchOAuthUserInfo).toHaveBeenCalledWith(OAUTH_ENDPOINTS, 'oauth-at');
   });
 });
 
