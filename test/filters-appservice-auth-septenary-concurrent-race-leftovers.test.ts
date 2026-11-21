@@ -565,9 +565,13 @@ describe('race septenary appservice empty events [] body after #292', () => {
       expect(fullCall).toBeTruthy();
       expect(JSON.parse((emptyCall![1] as RequestInit).body as string)).toEqual({
         events: [],
+        ephemeral: [],
+        to_device: [],
       });
       expect(JSON.parse((fullCall![1] as RequestInit).body as string)).toEqual({
         events: fullEvents,
+        ephemeral: [],
+        to_device: [],
       });
       expect(Array.isArray(JSON.parse((emptyCall![1] as RequestInit).body as string))).toBe(
         false

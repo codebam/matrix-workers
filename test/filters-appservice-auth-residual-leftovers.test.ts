@@ -411,7 +411,7 @@ describe('appservice residual sendAppServiceTransaction fetch contract after #23
           'Content-Type': 'application/json',
           Authorization: 'Bearer hs-bridge',
         },
-        body: JSON.stringify({ events }),
+        body: JSON.stringify({ events, ephemeral: [], to_device: [] }),
         signal: expect.any(AbortSignal),
       }
     );
@@ -419,7 +419,7 @@ describe('appservice residual sendAppServiceTransaction fetch contract after #23
     const call = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0][1] as {
       body: string;
     };
-    expect(JSON.parse(call.body)).toEqual({ events });
+    expect(JSON.parse(call.body)).toEqual({ events, ephemeral: [], to_device: [] });
     expect(Array.isArray(JSON.parse(call.body))).toBe(false);
   });
 

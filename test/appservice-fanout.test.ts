@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env, PDU } from '../src/types';
+import { signSendBodyPdus } from './helpers/federation-origin-signatures';
 
 vi.mock('../src/middleware/auth', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/middleware/auth')>();
@@ -205,7 +206,18 @@ function envFor(db: Db, ephemeralState: {
   return {
     SERVER_NAME: SERVER,
     DB: db as unknown as D1Database,
-    CACHE: { get: async () => null, put: async () => {}, delete: async () => {} } as unknown as KVNamespace,
+    CACHE: (() => {
+      const kv = new Map<string, string>();
+      return {
+        get: async (key: string, type?: string) => {
+          const v = kv.get(key);
+          if (v === undefined) return null;
+          return type === 'json' ? JSON.parse(v) : v;
+        },
+        put: async (key: string, value: string) => { kv.set(key, value); },
+        delete: async (key: string) => { kv.delete(key); },
+      } as unknown as KVNamespace;
+    })(),
     ROOMS: {
       idFromName: (n: string) => n,
       get: () => ({
@@ -426,9 +438,8 @@ describe('local send → appservice fanout', () => {
 
 describe('federation inbound /send → appservice fanout', () => {
   it('delivers accepted remote PDUs to interested ASes', async () => {
-    // Room v1: legacy hash rules, so an unsigned/hashless PDU from the
-    // authenticated origin is accepted without crypto fixtures.
     const db = createDb({ appservices: [asRow('bridge', '^!r:example\\.com$')], roomVersion: '1', remoteMember: true });
+    const env = envFor(db);
     const pdu = {
       event_id: '$remote1',
       room_id: ROOM,
@@ -440,17 +451,21 @@ describe('federation inbound /send → appservice fanout', () => {
       auth_events: [],
       prev_events: [],
     };
+    const body = await signSendBodyPdus(env, { pdus: [pdu], edus: [] });
     const res = await federation.request(
       'http://localhost/_matrix/federation/v1/send/txn-remote-1',
-      { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pdus: [pdu], edus: [] }) },
-      envFor(db)
+      { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+      env
     );
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { pdus: Record<string, unknown> };
-    expect(body.pdus['$remote1']).toEqual({});
+    const body2 = (await res.json()) as { pdus: Record<string, unknown> };
+    expect(body2.pdus['$remote1']).toEqual({});
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const asCalls = fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes('/_matrix/app/v1/transactions/')
+    );
+    expect(asCalls).toHaveLength(1);
+    const [url, init] = asCalls[0] as [string, RequestInit];
     expect(url).toContain('https://bridge.example.com/_matrix/app/v1/transactions/');
     const sent = JSON.parse(String(init.body)) as { events: Array<Record<string, unknown>> };
     expect(sent.events[0].event_id).toBe('$remote1');
@@ -491,11 +506,15 @@ describe('federation inbound /send → appservice fanout', () => {
       auth_events: [],
       prev_events: [],
     };
-    const init = { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pdus: [pdu], edus: [] }) };
     const env = envFor(db);
+    const signedBody = await signSendBodyPdus(env, { pdus: [pdu], edus: [] });
+    const init = { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(signedBody) };
+    const asCalls = () => fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes('/_matrix/app/v1/transactions/')
+    );
     await federation.request('http://localhost/_matrix/federation/v1/send/txn-a', init, env);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(asCalls()).toHaveLength(1);
     await federation.request('http://localhost/_matrix/federation/v1/send/txn-b', init, env);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(asCalls()).toHaveLength(1);
   });
 });
