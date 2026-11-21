@@ -109,6 +109,17 @@ function createSyncEnv(opts?: { failUsers?: Set<string>; throwNonError?: boolean
     SERVER_NAME: 'example.com',
     DB: {} as D1Database,
     CACHE: {} as KVNamespace,
+    MEDIA: (() => {
+      const objects = new Map<string, string>();
+      return {
+        async put(key: string, value: string) { objects.set(key, value); },
+        async get(key: string) {
+          const value = objects.get(key);
+          return value === undefined ? null : { json: async () => JSON.parse(value) };
+        },
+        async delete(key: string) { objects.delete(key); },
+      };
+    })(),
     notified,
     SYNC: {
       idFromName(name: string) {

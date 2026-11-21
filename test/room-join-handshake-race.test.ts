@@ -163,6 +163,17 @@ function createEnv(db: ReturnType<typeof createDb>, fetchImpl: (req: Request) =>
   return {
     DB: db,
     CACHE: {},
+    MEDIA: (() => {
+      const objects = new Map<string, string>();
+      return {
+        async put(key: string, value: string) { objects.set(key, value); },
+        async get(key: string) {
+          const value = objects.get(key);
+          return value === undefined ? null : { json: async () => JSON.parse(value) };
+        },
+        async delete(key: string) { objects.delete(key); },
+      };
+    })(),
     SERVER_NAME: 'example.com',
     FEDERATION: {
       idFromName: (name: string) => name,

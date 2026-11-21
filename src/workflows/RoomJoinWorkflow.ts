@@ -139,15 +139,18 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       }) as SerializableEvent;
 
       // Step 3: For remote joins, send signed event to remote server
-      let sendJoinResponse: { auth_chain?: any[]; state?: any[]; event?: any } | null = null;
+      // send_join for a large public room carries megabytes of state, far
+      // above Workflows' 1 MiB step-output cap. Keep the payload in R2 and
+      // return only its key; the store step reads it back.
+      let sendJoinRef: { stateKey: string } | null = null;
       if (isRemote && remoteServer && joinEventData) {
-        sendJoinResponse = (await step.do('send-join', {
+        sendJoinRef = (await step.do('send-join', {
           retries: {
             limit: 3,
             delay: 5000,
             backoff: 'exponential',
           },
-          timeout: 30000,
+          timeout: 120000,
         }, async () => {
           // MSC4284 (spec v1.18): if the room's state (already known to us
           // from a previous join or a partial state sync) names a policy
@@ -169,8 +172,11 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
               throw new Error(`policy server refused the join: ${asked.error}`);
             }
           }
-          return await this.sendJoinRequest(chosenServer ?? remoteServer, roomId, joinEventData);
-        })) as { auth_chain?: any[]; state?: any[]; event?: any };
+          const response = await this.sendJoinRequest(chosenServer ?? remoteServer, roomId, joinEventData);
+          const stateKey = `join-state/${encodeURIComponent(roomId)}/${encodeURIComponent(joinEventData.event_id)}.json`;
+          await this.env.MEDIA.put(stateKey, JSON.stringify(response));
+          return { stateKey };
+        })) as { stateKey: string };
       }
 
       // Step 4: Persist event and membership locally
@@ -203,7 +209,10 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       // when the response echoes the counter-signed join event, the
       // idempotent store simply skips the duplicate.
       if (isRemote && remoteServer) {
-        await step.do('store-remote-state', async () => {
+        await step.do('store-remote-state', {
+          retries: { limit: 2, delay: 2000, backoff: 'exponential' },
+          timeout: 300000,
+        }, async () => {
           // Derive wire IDs with the resident's room version (see
           // storeRemoteStateEvent): the make_join template negotiated it, and
           // the local rooms row is the fallback for rooms we already hold.
@@ -217,10 +226,19 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
             // Best-effort fallback only; the template version is primary.
           }
           const roomVersion = remoteEventTemplate?.room_version ?? localVersion;
+          const storedResponse = sendJoinRef
+            ? await this.env.MEDIA.get(sendJoinRef.stateKey)
+            : null;
+          if (sendJoinRef && !storedResponse) {
+            throw new Error(`send_join payload missing from R2: ${sendJoinRef.stateKey}`);
+          }
+          const joinPayload = storedResponse
+            ? await storedResponse.json() as { auth_chain?: any[]; state?: any[]; event?: any }
+            : null;
           const remoteEvents = [
-            ...(Array.isArray(sendJoinResponse?.auth_chain) ? sendJoinResponse.auth_chain : []),
-            ...(Array.isArray(sendJoinResponse?.state) ? sendJoinResponse.state : []),
-            ...(sendJoinResponse?.event ? [sendJoinResponse.event] : []),
+            ...(Array.isArray(joinPayload?.auth_chain) ? joinPayload.auth_chain : []),
+            ...(Array.isArray(joinPayload?.state) ? joinPayload.state : []),
+            ...(joinPayload?.event ? [joinPayload.event] : []),
           ];
           // State snapshot: store with stream_ordering 0 (invisible to
           // timeline serving). The echoed join event was already persisted
@@ -269,6 +287,9 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
             }
           }
           }
+          // Only after every consumer succeeded: a step retry must still find
+          // the payload if a later operation in this step throws.
+          if (sendJoinRef) await this.env.MEDIA.delete(sendJoinRef.stateKey);
         });
       }
 
@@ -330,8 +351,15 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       // Step 5: Get room members for notification
       const members = await step.do('get-members', async () => {
         const memberList = await getRoomMembers(this.env.DB, roomId);
-        // Exclude the joining user from notifications
-        return memberList.filter(m => m.userId !== userId).map(m => ({ userId: m.userId }));
+        // Only local users can be notified (remote users have no Sync DO
+        // here). A large public room has thousands of remote members, which
+        // would also exceed Workflows' 1 MiB step-output cap.
+        const localSuffix = `:${this.env.SERVER_NAME}`;
+        // Exclude the joining user and cap the fan-out per join.
+        return memberList
+          .filter(m => m.userId.endsWith(localSuffix) && m.userId !== userId)
+          .slice(0, 5000)
+          .map(m => ({ userId: m.userId }));
       }) as Array<{ userId: string }>;
 
       // Step 6: Notify members in batches of 50

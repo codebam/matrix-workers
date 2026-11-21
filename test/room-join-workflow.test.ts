@@ -81,22 +81,36 @@ const USER = '@alice:example.com';
 
 function mockStep() {
   const names: string[] = [];
+  const outputs: Record<string, unknown> = {};
   return {
     names,
+    outputs,
     async do(name: string, optsOrFn: unknown, maybeFn?: unknown) {
       names.push(name);
       const fn = typeof optsOrFn === 'function' ? optsOrFn : maybeFn;
-      return (fn as () => Promise<unknown>)();
+      const output = await (fn as () => Promise<unknown>)();
+      outputs[name] = output;
+      return output;
     },
   };
 }
 
 function createSyncEnv(opts?: { failUsers?: Set<string> }) {
   const notified: Array<{ userId: string; body: unknown }> = [];
+  const r2Objects = new Map<string, string>();
   return {
     SERVER_NAME: 'example.com',
     DB: {} as D1Database,
     CACHE: {} as KVNamespace,
+    MEDIA: {
+      async put(key: string, value: string) { r2Objects.set(key, value); },
+      async get(key: string) {
+        const value = r2Objects.get(key);
+        return value === undefined ? null : { json: async () => JSON.parse(value) };
+      },
+      async delete(key: string) { r2Objects.delete(key); },
+    },
+    r2Objects,
     notified,
     SYNC: {
       idFromName(name: string) {
@@ -389,6 +403,45 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
       '$st1:remote.example',
       '$generated:example.com',
     ]);
+  });
+
+  it('keeps a >1MiB send_join payload out of workflow step outputs', async () => {
+    federationGet.mockResolvedValue(
+      new Response(JSON.stringify(validRemoteTemplate()), { status: 200 })
+    );
+    // A large public room's state easily exceeds Workflows' 1 MiB step cap.
+    const state = Array.from({ length: 12000 }, (_, i) => ({
+      event_id: `$big${i}:remote.example`,
+      type: 'm.room.member',
+      room_id: ROOM,
+      sender: `@u${i}:remote.example`,
+      state_key: `@u${i}:remote.example`,
+      content: { membership: 'join', displayname: 'x'.repeat(100) },
+      origin_server_ts: 1,
+      depth: 1,
+      auth_events: [],
+      prev_events: [],
+    }));
+    federationPut.mockResolvedValue(
+      new Response(JSON.stringify({ origin: 'remote.example', auth_chain: [], state }), { status: 200 })
+    );
+    const env = createSyncEnv();
+    const step = mockStep();
+    const wf = new RoomJoinWorkflow({} as any, env as any);
+    const result = await wf.run(
+      {
+        payload: { roomId: ROOM, userId: USER, isRemote: true, remoteServer: 'remote.example' },
+      } as any,
+      step as any
+    );
+
+    expect(result.success).toBe(true);
+    const ref = step.outputs['send-join'] as { stateKey: string };
+    expect(JSON.stringify(ref).length).toBeLessThan(1000);
+    expect(ref.stateKey).toContain('join-state/');
+    // The store step consumed the payload and cleaned up the R2 object.
+    expect(env.r2Objects.size).toBe(0);
+    expect(storeEventIdempotent).toHaveBeenCalledTimes(state.length);
   });
 
   it('modern room (v12) join uses v4+ wire format: no event_id, reference-hash id, derived remote state ids', async () => {

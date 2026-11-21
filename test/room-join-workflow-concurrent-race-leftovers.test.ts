@@ -100,6 +100,16 @@ const EXPECTED_FED_RETRY = {
   retries: { limit: 3, delay: 5000, backoff: 'exponential' },
   timeout: 30000,
 };
+// Large public rooms need longer than the make_join deadline to fetch,
+// serialise and stash a multi-megabyte state snapshot in R2.
+const EXPECTED_SEND_JOIN_OPTS = {
+  ...EXPECTED_FED_RETRY,
+  timeout: 120000,
+};
+const EXPECTED_STORE_STATE_OPTS = {
+  retries: { limit: 2, delay: 2000, backoff: 'exponential' },
+  timeout: 300000,
+};
 
 function mockStep() {
   const names: string[] = [];
@@ -135,6 +145,17 @@ function createSyncEnv(opts?: {
     SERVER_NAME: 'example.com',
     DB: {} as D1Database,
     CACHE: {} as KVNamespace,
+    MEDIA: (() => {
+      const objects = new Map<string, string>();
+      return {
+        async put(key: string, value: string) { objects.set(key, value); },
+        async get(key: string) {
+          const value = objects.get(key);
+          return value === undefined ? null : { json: async () => JSON.parse(value) };
+        },
+        async delete(key: string) { objects.delete(key); },
+      };
+    })(),
     notified,
     started,
     release,
@@ -237,7 +258,8 @@ describe('room-join after #187: durable retry-step contracts', () => {
     expect(result.success).toBe(true);
     expect(step.optsLog).toEqual([
       { name: 'make-join', opts: EXPECTED_FED_RETRY },
-      { name: 'send-join', opts: EXPECTED_FED_RETRY },
+      { name: 'send-join', opts: EXPECTED_SEND_JOIN_OPTS },
+      { name: 'store-remote-state', opts: EXPECTED_STORE_STATE_OPTS },
     ]);
   });
 });
