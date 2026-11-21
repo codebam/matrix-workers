@@ -63,7 +63,12 @@ export async function prepareOutboundPdu(
       signingKey.keyId,
       signingKey.privateKeyJwk
     );
-    const signatures = (signed as { signatures?: Record<string, unknown> }).signatures || {};
+    // Preserve foreign signatures already on the event (e.g. the policy
+    // server's MSC4284 countersignature) and layer ours on top.
+    const signatures = {
+      ...((event.signatures as Record<string, unknown> | undefined) ?? {}),
+      ...((signed as { signatures?: Record<string, unknown> }).signatures || {}),
+    };
     return { wireId, hashes, signatures, wire: { ...hashed, signatures } };
   } catch (err) {
     console.error('[event-wire] prepareOutboundPdu failed:', err);

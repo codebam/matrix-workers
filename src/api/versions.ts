@@ -2,6 +2,7 @@
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
+import { getPolicyServerKey } from '../services/policy-server';
 
 const app = new Hono<AppEnv>();
 
@@ -50,6 +51,21 @@ app.get('/.well-known/matrix/server', (c) => {
   const mServer = c.env.FEDERATION_WELL_KNOWN_M_SERVER || `${serverName}:443`;
   return c.json({
     'm.server': mServer,
+  });
+});
+
+// GET /.well-known/matrix/policy_server - MSC4284 (spec v1.18)
+// Publishes the policy key so clients can populate a room's m.room.policy
+// state event for THIS server.
+app.get('/.well-known/matrix/policy_server', async (c) => {
+  const key = await getPolicyServerKey(c.env.DB);
+  if (!key) {
+    return c.json({ errcode: 'M_NOT_FOUND', error: 'No policy server information available.' }, 404);
+  }
+  return c.json({
+    public_keys: {
+      ed25519: key.publicKey,
+    },
   });
 });
 

@@ -49,6 +49,7 @@ import oauth from './api/oauth';
 import { adminDashboardHtml } from './admin/dashboard';
 import { rateLimitMiddleware } from './middleware/rate-limit';
 import { requireAuth, optionalAuth } from './middleware/auth';
+import { MatrixApiError } from './utils/errors';
 import { analyticsMiddleware } from './middleware/analytics';
 import { federationGet, federationPost } from './services/federation-keys';
 
@@ -673,6 +674,11 @@ app.notFound((c) => {
 
 // Error handler
 app.onError((err, c) => {
+  // MatrixApiErrors carry a designed status/errcode — e.g. a policy
+  // server's MSC4284 refusal surfacing verbatim to a client send.
+  if (err instanceof MatrixApiError) {
+    return err.toResponse();
+  }
   console.error('Unhandled error:', err);
   return c.json({
     errcode: 'M_UNKNOWN',

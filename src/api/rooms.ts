@@ -4,17 +4,20 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppEnv, Env, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors, MatrixApiError } from '../utils/errors';
+import type { ErrorCode } from '../types';
+import { askPolicyServerSignature, attachPolicySignature, eventExemptFromPolicy, getRoomPolicyServer, verifyPolicySignature } from '../services/policy-server';
 import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias, generateOpaqueId, parseUserId } from '../utils/ids';
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
+import { applyEventRedaction } from '../services/event-redaction';
 import { calculateContentHash, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId } from '../utils/event-signing';
 import { federationGet } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
 import { augmentAuthEvents, legacyWireForRoom, prepareOutboundPdu } from '../services/event-wire';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
-import { isServerAllowedInRoom } from '../services/server-acl';
+import { isServerAllowedByAcl, isServerAllowedInRoom, type ServerAclContent } from '../services/server-acl';
 import {
   createRoom,
   getRoom,
@@ -1504,10 +1507,16 @@ app.get('/_matrix/client/v3/rooms/:roomId/event/:eventId', requireAuth(), async 
     return Errors.notFound('Event not found').toResponse();
   }
 
+  // Redacted events serve their pruned content (getEvent stays on the
+  // original because auth-chain building shares it).
+  const pruned = await c.env.DB.prepare(
+    `SELECT redacted_content FROM events WHERE event_id = ?`
+  ).bind(eventId).first<{ redacted_content: string | null }>();
+
   return c.json({
     type: event.type,
     state_key: event.state_key,
-    content: event.content,
+    content: pruned?.redacted_content ? JSON.parse(pruned.redacted_content) : event.content,
     sender: event.sender,
     origin_server_ts: event.origin_server_ts,
     event_id: event.event_id,
@@ -1529,6 +1538,19 @@ async function getJoinedRemoteServers(db: D1Database, roomId: string, serverName
     for (const row of results || []) {
       const server = row.user_id?.split(':')[1];
       if (server && server !== serverName) servers.add(server);
+    }
+    // Server ACL (MSC4436): never queue outbound traffic for servers the
+    // room denies — compliant peers drop it anyway, and denied servers get
+    // no visibility into the room's live traffic from us.
+    try {
+      const aclEvent = await getStateEvent(db, roomId, 'm.room.server_acl', '');
+      if (aclEvent) {
+        return [...servers].filter((s) =>
+          isServerAllowedByAcl(aclEvent.content as ServerAclContent, s)
+        );
+      }
+    } catch (aclErr) {
+      console.warn('[rooms] ACL destination filter failed; sending to all joined servers:', aclErr);
     }
     return [...servers];
   } catch (err) {
@@ -1680,6 +1702,46 @@ async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): 
       event.event_id = await generateEventId(env.SERVER_NAME, roomVersion);
     }
   }
+
+  // MSC4284 (spec v1.18): rooms using a policy server need its
+  // countersignature on every event before storage/delivery — including
+  // membership and state changes, exactly as the spec demands. The ask
+  // happens AFTER the wire-ID derivation so the PS signs the final form
+  // remote servers will verify. The m.room.policy state event itself is
+  // exempt so the room can always disable a misbehaving PS. A refusal
+  // fails the request with the PS's error verbatim (app.onError maps
+  // MatrixApiError to its response).
+  const policy = await getRoomPolicyServer(env.DB, roomId);
+  if (policy && !eventExemptFromPolicy(event)) {
+    const asked = await askPolicyServerSignature(
+      env, policy, event as unknown as Record<string, unknown>
+    );
+    if ('signature' in asked) {
+      attachPolicySignature(event as unknown as Record<string, unknown>, policy.via, asked.signature);
+      // Validate the returned signature against the room's pinned key
+      // before trusting it (spec SHOULD).
+      const verified = await verifyPolicySignature(
+        event as unknown as Record<string, unknown>,
+        policy.via,
+        policy.ed25519,
+        String(room?.room_version ?? '10')
+      );
+      if (!verified) {
+        throw new MatrixApiError(
+          'M_UNKNOWN' as ErrorCode,
+          'The policy server returned an invalid signature',
+          502
+        );
+      }
+    } else {
+      throw new MatrixApiError(
+        asked.errcode as ErrorCode,
+        asked.error,
+        asked.status === 429 ? 429 : asked.status === 403 ? 403 : 400
+      );
+    }
+  }
+
   await storeEvent(env.DB, event);
   await fanoutEventToAppServices(env, event);
   return event.event_id;
@@ -1986,6 +2048,48 @@ export async function performSendEvent(
         wirePdu = prepared.wire;
         console.log(`[rooms] Federation wire PDU prepared for ${prepared.wireId} -> ${remoteServers.join(', ')}`);
       }
+    }
+  }
+
+  // MSC4284 (spec v1.18): ask the room's policy server to countersign
+  // before the event is stored or delivered. Same rules as the state
+  // path in prepareAndStoreLocalEvent: post-derivation ask, exemption
+  // for m.room.policy itself, refusals fail the request verbatim, and
+  // the returned signature is validated against the room's pinned key.
+  const policy = await getRoomPolicyServer(env.DB, roomId);
+  if (policy && !eventExemptFromPolicy(event)) {
+    const asked = await askPolicyServerSignature(
+      env, policy, event as unknown as Record<string, unknown>
+    );
+    if ('signature' in asked) {
+      attachPolicySignature(event as unknown as Record<string, unknown>, policy.via, asked.signature);
+      const verified = await verifyPolicySignature(
+        event as unknown as Record<string, unknown>,
+        policy.via,
+        policy.ed25519,
+        roomVersionStr
+      );
+      if (!verified) {
+        return {
+          error: new MatrixApiError(
+            'M_UNKNOWN' as ErrorCode,
+            'The policy server returned an invalid signature',
+            502
+          ),
+        };
+      }
+      if (wirePdu) {
+        // Carry the countersignature on the wire alongside ours.
+        wirePdu = { ...wirePdu, signatures: (event as unknown as Record<string, unknown>).signatures };
+      }
+    } else {
+      return {
+        error: new MatrixApiError(
+          asked.errcode as ErrorCode,
+          asked.error,
+          asked.status === 429 ? 429 : asked.status === 403 ? 403 : 400
+        ),
+      };
     }
   }
 
@@ -2784,10 +2888,23 @@ async function performRedaction(
 
   const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
 
-  // Mark the original event as redacted
-  await env.DB.prepare(`
-    UPDATE events SET redacted_because = ? WHERE event_id = ?
-  `).bind(eventId, targetEventId).run();
+  // Mark the original event as redacted and store the pruned client view.
+  // The original `content` column is untouched: federation hashes and
+  // signatures are computed over it, and remote servers receive the
+  // original PDU form.
+  const roomRow = await getRoom(env.DB, roomId);
+  await applyEventRedaction(
+    env.DB,
+    roomId,
+    String(roomRow?.room_version ?? '10'),
+    {
+      eventId,
+      sender: userId,
+      originServerTs: event.origin_server_ts,
+      content: redactionContent,
+    },
+    targetEventId
+  );
 
   // Notify room members about the redaction
   await notifyUsersOfEvent(env, roomId, eventId, 'm.room.redaction');
@@ -2856,6 +2973,14 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     return Errors.notFound('Event not found').toResponse();
   }
 
+  // Redacted targets serve their pruned content in the client view.
+  const targetPruned = await c.env.DB.prepare(
+    `SELECT redacted_content FROM events WHERE event_id = ?`
+  ).bind(eventId).first<{ redacted_content: string | null }>();
+  const targetForFormat = targetPruned?.redacted_content
+    ? { ...targetEvent, redacted_content: targetPruned.redacted_content }
+    : targetEvent;
+
   console.log('[rooms/context] Found event:', {
     eventId,
     eventType: targetEvent.type,
@@ -2880,7 +3005,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
   const formatEvent = (e: any) => ({
     type: e.event_type,
     state_key: e.state_key,
-    content: JSON.parse(e.content || '{}'),
+    content: JSON.parse(e.redacted_content || e.content || '{}'),
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,
@@ -2900,7 +3025,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
   }));
 
   return c.json({
-    event: formatEvent(targetEvent),
+    event: formatEvent(targetForFormat),
     events_before: eventsBefore.results.reverse().map(formatEvent),
     events_after: eventsAfter.results.map(formatEvent),
     state: stateEvents,

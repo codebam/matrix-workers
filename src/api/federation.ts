@@ -16,6 +16,16 @@ import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
 import { findServerAcl, isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId } from '../services/server-acl';
+import { getRoomVersion } from '../services/room-versions';
+import { applyEventRedaction } from '../services/event-redaction';
+import {
+  askPolicyServerSignature,
+  attachPolicySignature,
+  eventExemptFromPolicy,
+  getRoomPolicyServer,
+  signEventAsPolicyServer,
+  verifyPolicySignature,
+} from '../services/policy-server';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
@@ -75,6 +85,10 @@ app.use('/_matrix/federation/v1/*', requireFederationAuth());
 // X-Matrix requests. Without this the request bodies were trusted verbatim,
 // so anyone could inject joins, leaves or invites into a room.
 app.use('/_matrix/federation/v2/*', requireFederationAuth());
+
+// MSC4284 (spec v1.18): the policy server signing endpoint lives under its
+// own federation-authenticated prefix.
+app.use('/_matrix/policy/v1/*', requireFederationAuth());
 
 // Matrix publishes Ed25519 verify keys as standard (non-URL-safe) unpadded
 // base64. Keys generated here are stored URL-safe, so normalize on publish --
@@ -782,6 +796,11 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
+      // MSC4284 soft-fail flag: events lacking a valid policy server
+      // countersignature are stored (DAG integrity) but never delivered
+      // to clients.
+      let policySoftFail = false;
+
       // Run event authorization check if we have room state
       if (room) {
         try {
@@ -813,6 +832,47 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
                VALUES (?, ?, ?, ?, 0, ?)`
             ).bind(eventId, pduOrigin, roomId, Date.now(), authResult.error || 'Auth failed').run();
             continue;
+          }
+
+          // MSC4284 (spec v1.18, PDU check #7): when the room uses a
+          // policy server, every event except m.room.policy itself must
+          // carry a valid PS countersignature. Missing/invalid ones are
+          // re-requested from the PS (keys can rotate between send and
+          // receipt); events that still fail are soft-failed — stored,
+          // never shown to clients.
+          const policy = await getRoomPolicyServer(c.env.DB, roomId, roomState);
+          if (policy && !eventExemptFromPolicy(pdu as unknown as { type?: unknown; state_key?: unknown })) {
+            const pduRecord = pdu as unknown as Record<string, unknown>;
+            let policyOk = await verifyPolicySignature(
+              pduRecord, policy.via, policy.ed25519, room.room_version
+            );
+            if (!policyOk) {
+              const asked = await askPolicyServerSignature(
+                c.env, policy, { ...pduRecord, event_id: eventId }
+              );
+              if ('signature' in asked) {
+                const candidate = { ...(pduRecord.signatures as Record<string, unknown> | undefined ?? {}) };
+                attachPolicySignature(candidate, policy.via, asked.signature);
+                if (
+                  await verifyPolicySignature(
+                    { ...pduRecord, signatures: candidate },
+                    policy.via, policy.ed25519, room.room_version
+                  )
+                ) {
+                  // Redeemed: persist the fresh countersignature so
+                  // backfill/outbound serves carry it too.
+                  (pdu as unknown as Record<string, unknown>).signatures = candidate;
+                  policyOk = true;
+                }
+              }
+            }
+            if (!policyOk) {
+              policySoftFail = true;
+              console.warn(
+                '[federation] soft-failing event without valid policy server signature',
+                { eventId, roomId, policyServer: policy.via }
+              );
+            }
           }
         } catch (authErr) {
           console.warn(`[federation] Auth check failed for ${eventId}, accepting anyway:`, authErr);
@@ -956,9 +1016,40 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             }
           }
 
+          // Inbound redactions prune the target's client view, mirroring the
+          // local redaction pipeline (events.redacted_content +
+          // unsigned.redacted_because). Versions with the updated redaction
+          // rules (v11+) carry the target in content.redacts; older
+          // versions use the top-level `redacts` field.
+          if (pdu.type === 'm.room.redaction') {
+            const behavior = getRoomVersion(room.room_version);
+            const targetId = behavior?.updatedRedactionRules
+              ? ((pdu.content as { redacts?: unknown } | null)?.redacts)
+              : (pdu as { redacts?: unknown }).redacts;
+            if (typeof targetId === 'string' && targetId) {
+              try {
+                await applyEventRedaction(
+                  c.env.DB,
+                  roomId,
+                  room.room_version,
+                  {
+                    eventId,
+                    sender: pdu.sender as string,
+                    originServerTs: pdu.origin_server_ts,
+                    content: (pdu.content ?? {}) as Record<string, unknown>,
+                  },
+                  targetId
+                );
+              } catch (redactionErr) {
+                console.warn('[federation] inbound redaction prune failed:', redactionErr);
+              }
+            }
+          }
+
           // Wake local members' sync loops so the new event is delivered
-          // promptly instead of waiting out a long-poll timeout.
-          if ((insertResult.meta?.changes ?? 0) > 0) {
+          // promptly instead of waiting out a long-poll timeout. Policy
+          // soft-failed events stay invisible to clients by design.
+          if ((insertResult.meta?.changes ?? 0) > 0 && !policySoftFail) {
             const localMembers = await c.env.DB.prepare(
               `SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join' AND user_id LIKE ?`
             ).bind(roomId, `%:${c.env.SERVER_NAME}`).all<{ user_id: string }>();
@@ -4451,6 +4542,78 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
   }
 
   return c.json({});
+});
+
+// POST /_matrix/policy/v1/sign - MSC4284 (spec v1.18)
+//
+// This server acting AS a Policy Server. A 200 means the event is
+// recommended for inclusion and carries our countersignature (always
+// keyed ed25519:policy_server); anything else is a refusal. What we
+// check is an implementation detail — the current policy is permissive:
+// known room + caller allowed by the room's server ACL. Per-room rules
+// can layer in later without touching the contract.
+app.post('/_matrix/policy/v1/sign', async (c) => {
+  let event: Record<string, unknown>;
+  try {
+    event = (await getFederationBody(c)) as Record<string, unknown>;
+  } catch {
+    return c.json({ errcode: 'M_NOT_JSON', error: 'Request body was not JSON' }, 400);
+  }
+
+  if (
+    !event ||
+    typeof event !== 'object' ||
+    typeof event.room_id !== 'string' ||
+    typeof event.type !== 'string' ||
+    typeof event.sender !== 'string' ||
+    !event.content ||
+    typeof event.content !== 'object'
+  ) {
+    return c.json(
+      { errcode: 'M_BAD_JSON', error: 'The supplied PDU-formatted event was improperly formatted' },
+      400
+    );
+  }
+
+  // The m.room.policy state event itself is never signed by policy
+  // servers — it is what disables us.
+  if (eventExemptFromPolicy(event)) {
+    return c.json(
+      { errcode: 'M_BAD_JSON', error: 'The m.room.policy state event is not signed by policy servers' },
+      400
+    );
+  }
+
+  const room = await getRoom(c.env.DB, event.room_id as string);
+  if (!room) {
+    return c.json(
+      { errcode: 'M_NOT_FOUND', error: 'The room is not known to this policy server' },
+      404
+    );
+  }
+
+  // Optional per spec: respect the room's server ACL for callers. A PS
+  // that does not track the DAG may skip this; we do track rooms.
+  const origin = (c as any).get('federationOrigin') as string | undefined;
+  if (origin && !(await isServerAllowedInRoom(c.env.DB, event.room_id as string, origin))) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'The calling server is denied by the room ACL' },
+      403
+    );
+  }
+
+  const signatures = await signEventAsPolicyServer(
+    c.env.DB,
+    c.env.SERVER_NAME,
+    event,
+    String(room.room_version ?? '10')
+  );
+  if (!signatures) {
+    console.error('[policy] signing key unavailable');
+    return c.json({ errcode: 'M_UNKNOWN', error: 'Policy server key unavailable' }, 500);
+  }
+
+  return c.json(signatures);
 });
 
 export default app;
