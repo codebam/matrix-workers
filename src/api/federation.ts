@@ -15,6 +15,7 @@ import {
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
+import { findServerAcl, isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId } from '../services/server-acl';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
@@ -785,6 +786,25 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       if (room) {
         try {
           const roomState = await getRoomState(c.env.DB, roomId);
+
+          // Server ACL (spec module; MSC4436 case-insensitive): deny
+          // non-compliant servers' events outright. The ACL acts at the
+          // network layer, before the DAG auth rules — a banned server gets
+          // no participation at all, including ACL edits of its own.
+          const acl = findServerAcl(roomState);
+          if (acl && typeof (pdu as { sender?: unknown }).sender === 'string') {
+            const senderServer = serverNameFromId((pdu as { sender: string }).sender);
+            if (!isServerAllowedByAcl(acl, senderServer)) {
+              const reason = `Server ${senderServer} is denied by the room's server ACL`;
+              pduResults[eventId] = { error: reason };
+              await c.env.DB.prepare(
+                `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+                 VALUES (?, ?, ?, ?, 0, ?)`
+              ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+              continue;
+            }
+          }
+
           const authResult = checkEventAuth(pdu as PDU, roomState, room.room_version);
           if (!authResult.allowed) {
             pduResults[eventId] = { error: authResult.error || 'Event authorization failed' };
@@ -914,6 +934,25 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
               membership === 'knock'
             ) {
               await updateMembership(c.env.DB, roomId, pdu.state_key, membership, eventId);
+
+              // MSC4267 (m.forget_forced_upon_leave): a FRESH leave/ban for a
+              // local user forgets the room locally. Replayed historical
+              // member events and duplicate redeliveries are skipped so an
+              // old leave can never erase a newer membership row.
+              if (
+                (membership === 'leave' || membership === 'ban') &&
+                !replayedOldMember &&
+                (insertResult.meta?.changes ?? 0) > 0
+              ) {
+                const targetDomain = pdu.state_key.includes(':')
+                  ? pdu.state_key.slice(pdu.state_key.indexOf(':') + 1)
+                  : '';
+                if (targetDomain && targetDomain === c.env.SERVER_NAME) {
+                  await c.env.DB.prepare(
+                    `DELETE FROM room_memberships WHERE room_id = ? AND user_id = ?`
+                  ).bind(roomId, pdu.state_key).run();
+                }
+              }
             }
           }
 
@@ -1815,6 +1854,16 @@ async function authorizeInboundJoin(
   // No synced state: cannot authorize, keep the previous permissive behavior
   // rather than refusing joins into rooms whose state we have not received.
   if (roomState.length === 0) return null;
+
+  // Server ACL (spec module; MSC4436): denied servers cannot join either.
+  const acl = findServerAcl(roomState);
+  if (acl) {
+    const senderServer = serverNameFromId(sender);
+    if (!isServerAllowedByAcl(acl, senderServer)) {
+      return `Server ${senderServer} is denied by the room's server ACL`;
+    }
+  }
+
   try {
     const result = checkEventAuth(joinEvent as unknown as PDU, roomState, roomVersion);
     return result.allowed ? null : (result.error ?? 'Join is not authorized');
@@ -1879,6 +1928,15 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
   const membership = (membershipEvent?.content as { membership?: string } | undefined)?.membership;
   const joinRulesState = roomState.find((e) => e.type === 'm.room.join_rules');
   const joinRule = (joinRulesState?.content as { join_rule?: string } | undefined)?.join_rule;
+
+  // Server ACL (spec module; MSC4436): denied servers get no join template.
+  const acl = findServerAcl(roomState);
+  if (acl) {
+    const userServer = userId.includes(':') ? userId.slice(userId.indexOf(':') + 1) : '';
+    if (!isServerAllowedByAcl(acl, userServer)) {
+      return Errors.forbidden("Server is denied by the room's server ACL").toResponse();
+    }
+  }
 
   // Join-rule gate: refuse uninvited users of invite-only rooms here, with
   // M_FORBIDDEN, rather than serving a template the client then fails to use
@@ -2590,6 +2648,17 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
+  // Server ACL (spec module; MSC4436): denied servers cannot invite either.
+  if (
+    senderServer &&
+    !(await isServerAllowedInRoom(c.env.DB, inviteEvent.room_id, senderServer))
+  ) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "Inviting server is denied by the room's server ACL" },
+      403
+    );
+  }
+
   // Validate the invite is for a local user
   const stateKey = inviteEvent.state_key;
   if (!stateKey || !stateKey.includes(':')) {
@@ -2623,7 +2692,7 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
   // federation invites too.
   if ((await getInvitePermission(c.env.DB, stateKey, inviteEvent.sender)) === 'block') {
     return c.json(
-      { errcode: 'ORG.MATRIX.MSC4155.M_INVITE_BLOCKED', error: 'The recipient does not accept invites from this sender' },
+      { errcode: 'M_INVITE_BLOCKED', error: 'The recipient does not accept invites from this sender' },
       403
     );
   }
@@ -2758,7 +2827,7 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
   // federation invites too.
   if ((await getInvitePermission(c.env.DB, stateKey, inviteEvent.sender)) === 'block') {
     return c.json(
-      { errcode: 'ORG.MATRIX.MSC4155.M_INVITE_BLOCKED', error: 'The recipient does not accept invites from this sender' },
+      { errcode: 'M_INVITE_BLOCKED', error: 'The recipient does not accept invites from this sender' },
       403
     );
   }

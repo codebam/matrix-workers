@@ -1232,6 +1232,63 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
     expect(pdus['$bad2'].error).toMatch(/Invalid sender/);
   });
 
+  it('rejects PDUs from servers denied by the room ACL', async () => {
+    const db = seedBasicRoom();
+    const env = makeEnv(db);
+    // MSC4436 semantics: the deny match is case-insensitive and the port is
+    // ignored; allow ["*"] keeps everyone else in.
+    getRoomState.mockResolvedValue([
+      {
+        event_id: '$acl',
+        room_id: ROOM,
+        sender: REMOTE_USER,
+        type: 'm.room.server_acl',
+        state_key: '',
+        content: { allow: ['*'], deny: ['evil.example.org'], allow_ip_literals: false },
+      },
+    ] as never);
+    const pduWith = async (base: Record<string, unknown>) => {
+      const hashes = { sha256: await calculateContentHash(base) };
+      return { ...base, hashes };
+    };
+    const evilPdu = await pduWith({
+      event_id: '$evil-msg',
+      room_id: ROOM,
+      // Mixed case + port: still matches the deny glob for evil.example.org.
+      sender: '@eve:EVIL.Example.org:8448',
+      type: 'm.room.message',
+      content: { body: 'spam' },
+      origin_server_ts: 1_710_000_000_000,
+      depth: 7,
+      auth_events: [],
+      prev_events: [],
+    });
+    const okPdu = await pduWith({
+      event_id: '$ok-msg',
+      room_id: ROOM,
+      sender: REMOTE_USER,
+      type: 'm.room.message',
+      content: { body: 'fine' },
+      origin_server_ts: 1_710_000_000_001,
+      depth: 8,
+      auth_events: [],
+      prev_events: [],
+    });
+    const { status, body } = await req('PUT', '/_matrix/federation/v1/send/txn-acl', env, {
+      pdus: [evilPdu, okPdu],
+    });
+    expect(status).toBe(200);
+    const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
+    expect(pdus['$evil-msg'].error).toMatch(/server ACL/);
+    expect(pdus['$ok-msg'].error).toBeUndefined();
+    // The denied PDU never reaches the (mocked) DAG auth check.
+    expect(checkEventAuth).toHaveBeenCalledTimes(1);
+    const inserted = (id: string) =>
+      db.inserts.find((i) => i.sql.includes('INTO events') && i.args[0] === id);
+    expect(inserted('$evil-msg')).toBeUndefined();
+    expect(inserted('$ok-msg')).toBeDefined();
+  });
+
   it('replayed old member events store outside the live timeline', async () => {
     const db = seedBasicRoom();
     const env = makeEnv(db);
