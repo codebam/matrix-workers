@@ -11,7 +11,7 @@
 // valid one.
 
 import type { Env, PDU } from '../types';
-import { getStateEvent } from './database';
+import { getRoom, getStateEvent } from './database';
 import { federationPost } from './federation-keys';
 import { redactEventForSigning } from '../utils/event-signing';
 import { verifySignature, signJson, generateSigningKeyPair } from '../utils/crypto';
@@ -130,6 +130,47 @@ export async function askPolicyServerSignature(
   config: PolicyConfig,
   event: Record<string, unknown>
 ): Promise<PolicyAskResult> {
+  // We are the policy server: resolve the ask in-process instead of a
+  // network hop. A Cloudflare route-worker cannot fetch its own URL (the
+  // edge blocks worker self-invocation), so the network path would always
+  // fail — and the in-process result is identical: same key, same policy
+  // as POST /_matrix/policy/v1/sign, same signature remote servers verify
+  // against the well-known key.
+  if (config.via === env.SERVER_NAME) {
+    try {
+      const room = await getRoom(env.DB, String(event.room_id ?? ''));
+      if (!room) {
+        return {
+          errcode: 'M_NOT_FOUND',
+          error: 'The room is not known to this policy server',
+          status: 404,
+        };
+      }
+      const signatures = await signEventAsPolicyServer(
+        env.DB,
+        env.SERVER_NAME,
+        event,
+        String(room.room_version ?? '10')
+      );
+      const signature = signatures?.[env.SERVER_NAME]?.[POLICY_KEY_ID];
+      if (typeof signature === 'string') {
+        return { signature };
+      }
+      return {
+        errcode: 'M_UNKNOWN',
+        error: 'The policy server key is unavailable',
+        status: 500,
+      };
+    } catch (err) {
+      console.warn('[policy] in-process self-ask failed:', err);
+      return {
+        errcode: 'M_UNKNOWN',
+        error: 'The policy server could not sign the event',
+        status: 500,
+      };
+    }
+  }
+
   let response: Response;
   try {
     response = await Promise.race([

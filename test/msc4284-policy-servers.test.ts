@@ -132,6 +132,7 @@ vi.mock('../src/services/room-cache', () => ({
 }));
 
 import {
+  askPolicyServerSignature,
   eventExemptFromPolicy,
   getRoomPolicyServer,
   parsePolicyConfig,
@@ -424,6 +425,45 @@ describe('MSC4284 send-side ask', () => {
     expect(body.errcode).toBe('M_FORBIDDEN');
     expect(body.error).toBe('The message appears to contain possible spam');
     expect(storeEvent).not.toHaveBeenCalled();
+  });
+
+  it('the in-process self-ask short-circuits when we are the policy server', async () => {
+    const key = await generateSigningKeyPair();
+    const db = policyDb({
+      joinedServers: [PS],
+      serverKeys: { publicKey: key.publicKey, privateKeyJwk: JSON.stringify(key.privateKeyJwk) },
+    });
+    const env = {
+      DB: db,
+      SERVER_NAME: SERVER,
+      CACHE: {} as KVNamespace,
+    } as unknown as Env;
+
+    getRoom.mockResolvedValue({ room_id: ROOM, room_version: '10' });
+
+    const event = {
+      room_id: ROOM,
+      sender: USER,
+      type: 'm.room.message',
+      content: { body: 'self-ask', msgtype: 'm.text' },
+      origin_server_ts: 1_700_000_000_000,
+      depth: 1,
+      auth_events: [],
+      prev_events: [],
+    } as Record<string, unknown>;
+
+    const asked = await askPolicyServerSignature(env, { via: SERVER, ed25519: key.publicKey }, event);
+    expect('signature' in asked).toBe(true);
+    if ('signature' in asked) {
+      const withSig = { ...event, signatures: { [SERVER]: { [POLICY_KEY_ID]: asked.signature } } };
+      expect(await verifyPolicySignature(withSig, SERVER, key.publicKey, '10')).toBe(true);
+    }
+    expect(federationPost).not.toHaveBeenCalled();
+
+    // Unknown rooms refuse with M_NOT_FOUND, matching the endpoint.
+    getRoom.mockResolvedValue(null);
+    const refused = await askPolicyServerSignature(env, { via: SERVER, ed25519: key.publicKey }, event);
+    expect(refused).toMatchObject({ errcode: 'M_NOT_FOUND' });
   });
 
   it('an invalid returned signature is rejected', async () => {
