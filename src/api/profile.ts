@@ -5,6 +5,7 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth, optionalAuth } from '../middleware/auth';
 import { getUserById, updateUserProfile } from '../services/database';
+import { broadcastProfileMemberUpdates } from './rooms';
 import { parseUserId, isLocalServerName } from '../utils/ids';
 
 const app = new Hono<AppEnv>();
@@ -84,7 +85,15 @@ app.put('/_matrix/client/v3/profile/:userId/displayname', requireAuth(), async (
 
   const { displayname } = body;
 
+  const before = await getUserById(c.env.DB, userId);
   await updateUserProfile(c.env.DB, userId, displayname);
+
+  // Spec "Events on Change of Profile Information": fan out an updated
+  // m.room.member event per joined room so the change is visible without
+  // a profile query. No-op writes (same value) skip the fanout.
+  if (displayname !== undefined && (before?.display_name ?? null) !== (displayname ?? null)) {
+    await broadcastProfileMemberUpdates(c.env, userId, { displayNameChanged: true });
+  }
 
   return c.json({});
 });
@@ -131,7 +140,14 @@ app.put('/_matrix/client/v3/profile/:userId/avatar_url', requireAuth(), async (c
 
   const { avatar_url } = body;
 
+  const before = await getUserById(c.env.DB, userId);
   await updateUserProfile(c.env.DB, userId, undefined, avatar_url);
+
+  // Spec "Events on Change of Profile Information": fan out an updated
+  // m.room.member event per joined room. No-op writes skip the fanout.
+  if (avatar_url !== undefined && (before?.avatar_url ?? null) !== (avatar_url ?? null)) {
+    await broadcastProfileMemberUpdates(c.env, userId, { avatarChanged: true });
+  }
 
   return c.json({});
 });
@@ -172,6 +188,8 @@ app.put('/_matrix/client/unstable/org.matrix.msc4437/profile/:userId', requireAu
     ).toResponse();
   }
 
+  const before = await getUserById(c.env.DB, targetUserId);
+
   // Absent standard fields are DELETED (null), per the replace semantics.
   await updateUserProfile(
     c.env.DB,
@@ -179,6 +197,15 @@ app.put('/_matrix/client/unstable/org.matrix.msc4437/profile/:userId', requireAu
     displayname === undefined ? null : displayname,
     avatarUrl === undefined ? null : avatarUrl
   );
+
+  // Spec "Events on Change of Profile Information": fan out updated
+  // m.room.member events for the standard-field changes.
+  await broadcastProfileMemberUpdates(c.env, targetUserId, {
+    displayNameChanged:
+      displayname !== undefined && (before?.display_name ?? null) !== (displayname ?? null),
+    avatarChanged:
+      avatarUrl !== undefined && (before?.avatar_url ?? null) !== (avatarUrl ?? null),
+  });
 
   // Custom fields replace the stored set wholesale.
   await c.env.CACHE.put(

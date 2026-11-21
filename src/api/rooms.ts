@@ -1682,6 +1682,88 @@ export async function joinBotUserToRoom(env: Env, roomId: string, botUserId: str
   return eventId;
 }
 
+// Spec Profiles module, "Events on Change of Profile Information": when a
+// user's display name or avatar URL changes, the server sends an updated
+// m.room.member event to every room they are joined to, so the change
+// renders for other users (locally and over federation) without anyone
+// re-querying the profile. Joins have always carried the profile
+// snapshot; this covers CHANGES. Best-effort per room — the profile
+// write itself must never fail because one room's fanout did.
+export async function broadcastProfileMemberUpdates(
+  env: Env,
+  userId: string,
+  opts: { displayNameChanged?: boolean; avatarChanged?: boolean }
+): Promise<number> {
+  if (!opts.displayNameChanged && !opts.avatarChanged) return 0;
+
+  // The profile write has already succeeded at this point; the fanout is
+  // strictly best-effort and must never fail (or even slow-fail) the
+  // caller. Any unexpected environment failure aborts quietly — rooms
+  // converge on the next change instead.
+  try {
+    const user = await getUserById(env.DB, userId);
+    const roomIds = await getUserRooms(env.DB, userId, 'join');
+    let updated = 0;
+
+    for (const roomId of roomIds) {
+      try {
+        const membership = await getMembership(env.DB, roomId, userId);
+        if (!membership || membership.membership !== 'join') continue;
+
+        // Rooms whose ACL denies our server cannot accept our events —
+        // skip them like the send cores do.
+        if (!(await isServerAllowedInRoom(env.DB, roomId, env.SERVER_NAME))) continue;
+
+        const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
+        const powerLevelsEvent = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
+        const authEvents: string[] = [];
+        if (createEvent) authEvents.push(createEvent.event_id);
+        if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
+        if (membership) authEvents.push(membership.eventId);
+
+        const { events: latestEvents } = await getRoomEvents(env.DB, roomId, undefined, 1);
+        const prevEvents = latestEvents.map((e) => e.event_id);
+
+        // Absent displayname/avatar_url means "no profile value" — omit.
+        const content: Record<string, unknown> = { membership: 'join' };
+        if (user?.display_name) content.displayname = user.display_name;
+        if (user?.avatar_url) content.avatar_url = user.avatar_url;
+
+        const event: PDU = {
+          event_id: '',
+          room_id: roomId,
+          sender: userId,
+          type: 'm.room.member',
+          state_key: userId,
+          content,
+          origin_server_ts: Date.now(),
+          depth: (latestEvents[0]?.depth ?? 0) + 1,
+          auth_events: authEvents,
+          prev_events: prevEvents,
+        };
+
+        const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
+
+        // Wake members' sync loops; remote delivery follows the standard
+        // state pipeline (incl. the policy-server ask inside the core).
+        await notifyUsersOfEvent(env, roomId, eventId, 'm.room.member');
+        const destinations = await getJoinedRemoteServers(env.DB, roomId, env.SERVER_NAME);
+        await federateLocalStateEventToRemotes(env, event, roomId, destinations);
+        updated++;
+      } catch (err) {
+        console.warn('[rooms] profile member-event fanout failed for room', {
+          roomId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return updated;
+  } catch (err) {
+    console.warn('[rooms] profile member-event fanout aborted:', err);
+    return 0;
+  }
+}
+
 async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): Promise<string> {
   const room = await getRoom(env.DB, roomId);
   const roomVersion = String(room?.room_version ?? '10');
