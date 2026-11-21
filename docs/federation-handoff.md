@@ -774,3 +774,27 @@ notes: the /tmp fed-repro scripts insert PROD tokens directly into D1
 — not safe to run as-is; and trust live probes over this doc's older
 top-level Deploy state section, which records historical version IDs
 only.
+
+Watch list for the next wave (post-wave gap hunt, 2026-11-21): fifteen
+verified items beyond the closed wave and the v1.20 list. High:
+federation /state and /state_ids ignore the REQUIRED event_id snapshot
+parameter (state-at-event — large fix); send_leave v1/v2 neither verify
+signatures nor sign/persist the leave, and both response shapes are
+wrong; inbound PDU verification accepts ANY signatory — the strict
+verifyPdu helper in services/federation-verify.ts has no callers;
+room upgrade skips the mandatory invites of all old members and does
+not fully freeze power in the tombstoned room (PL users map survives);
+UIA on deactivation and /account/3pid/add accepts the bare stage name
+(passwordless accounts deactivate with no stage credential — HITL
+territory); remote device-list changes never reach clients
+(device_lists.left hardcoded empty in all four sync paths).
+Medium: media thumbnails miss Content-Disposition inline + security
+headers and allow_remote is ignored; push-rule before/after and pusher
+replacement semantics; .m.rule.suppress_edits missing and
+sender_notification_permission always true; presence is stored and
+federated but never delivered by legacy /sync; createRoom ignores
+creation_content and power_level_content_override; /keys/claim
+overwrites earlier algorithms per device. Low: /notifications limit
+defaults 20 not 50 with mixed ordering; /sync room summary and
+event_format/event_fields unimplemented; AS transactions carry only
+events (no ephemeral/to_device).
