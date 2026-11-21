@@ -25,6 +25,11 @@ import {
   getMembership,
 } from '../services/database';
 import { getServerSigningKey, federationGet, federationPut } from '../services/federation-keys';
+import {
+  deriveRoomWireEvents,
+  prepareOutboundPdu,
+  wireForRoom,
+} from '../services/event-wire';
 import { getRoomVersion } from '../services/room-versions';
 import { applyEventRedaction } from '../services/event-redaction';
 import {
@@ -56,6 +61,10 @@ export interface JoinParams {
   servers?: string[];
   // When true, backfill full room state + members after join (large rooms).
   backfill?: boolean;
+  // Newest local stream position at /join request time. Local events written
+  // after it but before send_join lands have no federation destination yet;
+  // the workflow re-sweeps them once the handshake registers us remotely.
+  sinceStreamOrdering?: number;
 }
 
 // Result returned when workflow completes
@@ -83,7 +92,7 @@ interface SerializableEvent {
 
 export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
   async run(event: WorkflowEvent<JoinParams>, step: WorkflowStep): Promise<JoinResult> {
-    const { roomId, userId, isRemote, remoteServer, displayName, avatarUrl, reason, servers, backfill } = event.payload;
+    const { roomId, userId, isRemote, remoteServer, displayName, avatarUrl, reason, servers, backfill, sinceStreamOrdering } = event.payload;
 
     console.log('[RoomJoinWorkflow] Starting join', { roomId, userId, isRemote, remoteServer });
 
@@ -169,6 +178,22 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
         await storeEvent(this.env.DB, joinEventData);
         await updateMembership(this.env.DB, roomId, userId, 'join', joinEventData.event_id);
       });
+
+      // Step 4a: close the /join race. Until send_join registered us as a
+      // destination, locally-written events (resident messages, state changes)
+      // had no remote to queue for — the 200 had already gone to the client.
+      // Now that membership is persisted, later sends fan out normally; sweep
+      // the gap exactly once, as a durable workflow step (never waitUntil).
+      if (isRemote && remoteServer && typeof sinceStreamOrdering === 'number') {
+        await step.do('resweep-recent-events', {
+          retries: { limit: 2, delay: 1000, backoff: 'exponential' },
+          timeout: 30000,
+        }, async () => {
+          await this.resweepLocalEventsToServer(
+            roomId, chosenServer ?? remoteServer, sinceStreamOrdering, joinEventData.event_id
+          );
+        });
+      }
 
       // Step 4b: Persist the room state the remote server returned with the
       // accepted join (v2 send_join: auth_chain + state + counter-signed
@@ -336,7 +361,124 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     }
   }
 
-  // Make an authenticated make_join request to a remote server
+  // Re-deliver locally written events from the /join → send_join gap. The
+  // send path only prepares a wire PDU when it already has remote
+  // destinations; during the gap there were none, so nothing was queued for
+  // the joining server. Now that our membership is persisted, future sends
+  // fan out normally — this sweep covers the finite window before that.
+  private async resweepLocalEventsToServer(
+    roomId: string,
+    destination: string,
+    sinceStreamOrdering: number,
+    joinEventId: string
+  ): Promise<void> {
+    const SWEEP_LIMIT = 200;
+    try {
+      const rows = await this.env.DB.prepare(
+        `SELECT event_id, room_id, sender, event_type, state_key, content,
+                origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+         FROM events
+         WHERE room_id = ? AND stream_ordering > ? AND stream_ordering > 0
+           AND sender LIKE ? AND event_id <> ?
+         ORDER BY stream_ordering ASC LIMIT ?`
+      ).bind(roomId, sinceStreamOrdering, `%:${this.env.SERVER_NAME}`, joinEventId, SWEEP_LIMIT)
+        .all<Record<string, any>>();
+      const events = rows.results ?? [];
+      if (events.length === 0) return;
+
+      const room = await this.env.DB.prepare(
+        `SELECT room_version FROM rooms WHERE room_id = ?`
+      ).bind(roomId).first<{ room_version: string }>();
+      const roomVersion = room?.room_version ?? '10';
+      const numericVersion = parseInt(roomVersion, 10);
+      const creator = await this.env.DB.prepare(
+        `SELECT e.sender FROM room_state rs
+         JOIN events e ON rs.event_id = e.event_id
+         WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`
+      ).bind(roomId).first<{ sender: string }>();
+      const localCreate = !!creator?.sender?.endsWith(`:${this.env.SERVER_NAME}`);
+      // Re-derive local rooms (including v11, which the serving-side helper
+      // leaves as-stored) so random pre-destination IDs and their references
+      // become the wire IDs peers expect. Never re-derive a remote-created
+      // legacy room: our stored bytes cannot reproduce the resident's IDs.
+      const wire = numericVersion >= 3 && (localCreate || roomVersion === '12')
+        ? await deriveRoomWireEvents(this.env, roomId, roomVersion)
+        : await wireForRoom(this.env, roomId, roomVersion);
+
+      let queued = 0;
+      for (const row of events) {
+        const storedId = String(row.event_id);
+        let wireId = storedId;
+        let pdu: Record<string, unknown> | null = null;
+        if (wire) {
+          pdu = wire.wireById.get(storedId) ?? null;
+          wireId = wire.idMap.get(storedId) ?? storedId;
+        } else if (!Number.isFinite(numericVersion) || numericVersion <= 2) {
+          // Room versions 1-2 keep explicit IDs on the wire. Sign the stored
+          // content if it predates the wire-form derivation, retaining the ID.
+          const event: Record<string, any> = {
+            event_id: storedId,
+            room_id: row.room_id,
+            sender: row.sender,
+            type: row.event_type,
+            content: JSON.parse(row.content),
+            origin_server_ts: row.origin_server_ts,
+            depth: row.depth,
+            auth_events: JSON.parse(row.auth_events),
+            prev_events: JSON.parse(row.prev_events),
+          };
+          if (row.state_key !== null && row.state_key !== undefined) event.state_key = row.state_key;
+          if (row.hashes) event.hashes = JSON.parse(row.hashes);
+          if (row.signatures) event.signatures = JSON.parse(row.signatures);
+          const prepared = await prepareOutboundPdu(
+            this.env, event as unknown as Parameters<typeof prepareOutboundPdu>[1], roomVersion
+          );
+          if (prepared) pdu = { ...prepared.wire, event_id: storedId };
+        }
+        if (!pdu) continue;
+        await this.queueResweepPdu(destination, wireId, roomId, pdu);
+        queued++;
+      }
+      console.log('[RoomJoinWorkflow] re-swept local events after handshake', {
+        roomId, destination, found: events.length, queued,
+      });
+    } catch (err) {
+      // Best-effort: a sweep failure must not fail an otherwise accepted join.
+      console.warn('[RoomJoinWorkflow] recent-event re-sweep failed', {
+        roomId, destination, error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // One durable DO queue put with a hard timeout. A stuck destination must
+  // never wedge the workflow step (Worker subrequest limits); delivery itself
+  // remains durable in the Federation DO's alarm queue.
+  private async queueResweepPdu(
+    destination: string,
+    eventId: string,
+    roomId: string,
+    pdu: Record<string, unknown>
+  ): Promise<void> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    try {
+      const fedDO = this.env.FEDERATION.get(this.env.FEDERATION.idFromName(destination));
+      await fedDO.fetch(new Request('http://internal/queue', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ destination, event_id: eventId, room_id: roomId, pdu }),
+        signal: controller.signal,
+      }));
+    } catch (err) {
+      console.warn('[RoomJoinWorkflow] re-sweep queue failed', {
+        destination, eventId, error: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // Make an authenticated make_join request to a remote server.
   // Try make_join against the resident server first, then fallback participants.
   // Some residents fetch our signing key on a port we don't serve (8448) and
   // reject us; other participants in the same room may accept over 443.

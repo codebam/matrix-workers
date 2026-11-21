@@ -766,6 +766,24 @@ async function resolveRemoteAlias(
   }
 }
 
+// Snapshot the newest local stream position before handing a remote join to
+// RoomJoinWorkflow. Between /join and the federation handshake's membership
+// registration the joining server is not a destination, so locally-written
+// events are never queued for federation. The workflow re-sweeps everything
+// above this watermark once send_join succeeds (see resweep-recent-events).
+export async function joinStreamWatermark(db: D1Database, roomId: string): Promise<number> {
+  try {
+    const row = await db.prepare(
+      `SELECT COALESCE(MAX(stream_ordering), 0) AS ordering FROM events WHERE room_id = ?`
+    ).bind(roomId).first<{ ordering: number }>();
+    return Number(row?.ordering ?? 0);
+  } catch {
+    // Best-effort snapshot: 0 still sweeps (at most the bounded window), and a
+    // storage failure must never prevent a client from joining.
+    return 0;
+  }
+}
+
 // POST /_matrix/client/v3/rooms/:roomId/join - Join a room
 // Fallback join candidates: the room-ID domain may be dead or serving a
 // broken federation endpoint while other residents are fine. Synapse tries
@@ -877,6 +895,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
     const fallbackServers = await joinFallbackServers(
       c.env.DB, roomId, c.env.SERVER_NAME, localMembership?.eventId
     );
+    const sinceStreamOrdering = await joinStreamWatermark(c.env.DB, roomId);
     const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
       params: {
         roomId,
@@ -885,6 +904,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
         remoteServer: roomServer,
         backfill: true,
         servers: fallbackServers,
+        sinceStreamOrdering,
       },
     });
 
@@ -3585,8 +3605,9 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
       const fallbackServers = await joinFallbackServers(
         db, roomId, c.env.SERVER_NAME, mem?.eventId
       );
+      const sinceStreamOrdering = await joinStreamWatermark(db, roomId);
       const instance = await c.env.ROOM_JOIN_WORKFLOW.create({
-        params: { roomId, userId, isRemote: true, remoteServer: residentServer, servers: [...(aliasServers ?? []), ...fallbackServers], backfill: true },
+        params: { roomId, userId, isRemote: true, remoteServer: residentServer, servers: [...(aliasServers ?? []), ...fallbackServers], backfill: true, sinceStreamOrdering },
       });
       try {
         const status = await instance.status();

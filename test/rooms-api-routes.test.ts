@@ -1253,6 +1253,9 @@ describe('POST /rooms/:roomId/join', () => {
         userId: USER,
         isRemote: true,
         remoteServer: 'remote.org',
+        // Snapshot is passed so the workflow can re-sweep events written
+        // between this 200 and send_join's destination registration.
+        sinceStreamOrdering: expect.any(Number),
       },
     });
   });
@@ -1275,6 +1278,7 @@ describe('POST /rooms/:roomId/join', () => {
         userId: USER,
         isRemote: true,
         remoteServer: 'remote.org',
+        sinceStreamOrdering: expect.any(Number),
       },
     });
     // The join must be registered by the workflow's make_join/send_join
