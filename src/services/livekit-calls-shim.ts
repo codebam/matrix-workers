@@ -860,6 +860,10 @@ export class LiveKitCallsShimSession {
       const session = await createSession(this.env);
       this.participant.publisherSessionId = session.sessionId;
       this.sendJoin(joinRequest);
+      // Tell already-joined participants about this one immediately. Without
+      // this they only learn of each other when a track is published or the
+      // session closes, so a call with muted participants appears 1:1.
+      this.broadcastUpdate();
       for (const request of joinRequest.addTrackRequests) this.handleAddTrack(request);
       if (joinRequest.publisherOffer?.sdp) await this.handleOffer(joinRequest.publisherOffer);
     } catch (error) {
