@@ -930,12 +930,32 @@ subscriptions are the open blocker; this section is the handoff point.
   `{location:'remote', sessionId, trackName: <LiveKit TR sid>, mid: <unused placeholder mid>}`
   and NO sessionDescription, then signal the binding via `TrackInfo.mid` in an
   `update` frame; the SDK maps RTP to the publication via msid (it recognises
-  `TR...` sids). This was assigned to a follow-up worktree subagent; check the
-  current HEAD before assuming it shipped.
+  `TR...` sids). This was implemented (f1fe242, then auto-bind on publish)
+  and then ruled out live — see the result below.
+
+#### Client-driven subscriptions: attempted and ruled out (2026-11-21, 515ef1a)
+
+The client-driven design was implemented end to end, including proactive binds
+for autoSubscribe clients (the SDK creates each publication with
+`subscribed = autoSubscribe` and never emits a subscription update, so it never
+sends `SignalRequest.subscription` — confirmed by capturing the signaling
+socket). A two-client live probe then showed the precise server-side answer:
+`POST /sessions/{id}/tracks/new` with
+`{location:'remote', sessionId, trackName: TR-sid, mid: '3'}` returns HTTP 200
+with `tracks: [{mid:'', errorCode:'internal_error',
+errorDescription:'Backend error'}]`. Calls does not bind a remote track into
+an already-negotiated peer connection by mid: there is no SDP answer a
+single-PC LiveKit client can apply. The shim now detects that per-track error
+and leaves the subscription unclaimed instead of telling the SDK to wait for
+RTP that never arrives. **Conclusion: Calls can carry publishing but cannot
+carry two-way MatrixRTC calls through this shim.** Two-way calls need the
+self-hosted LiveKit path; making Calls work would require a client-side SDK
+change to answer server offers, which unmodified Element Web cannot do.
 
 ### Deploy state
 - prod (`codebam.ca`): **version `5f44fbc7`** — health and
   `/_matrix/client/versions` verified; prod keeps its self-hosted LiveKit URL,
   the shim is NOT enabled there.
-- dev (`dev.codebam.ca`): experimental shim deployed.
-- Full suite green at the time of writing: 378 files / 45,887 tests.
+- dev (`dev.codebam.ca`): experimental shim deployed (stable connect + publish;
+  no two-way calls).
+- Full suite green at the end of the investigation: 378 files / 45,894 tests.
