@@ -26,6 +26,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
 
 vi.mock('../src/middleware/rate-limit', () => ({
+  federationOriginRateLimit: () => async (_c: unknown, next: () => Promise<void>) => next(),
   rateLimitMiddleware: async (_c: unknown, next: () => Promise<void>) => next(),
   getRateLimitType: () => 'default',
   getClientId: () => 'unknown',

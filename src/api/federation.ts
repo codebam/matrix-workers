@@ -6,6 +6,7 @@ import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
 import { computeWireEventId, isMsc4291RoomVersion, redactEventForSigning, toWireEventObject, omitWireEventId } from '../utils/event-signing';
 import { requireFederationAuth } from '../middleware/federation-auth';
+import { federationOriginRateLimit } from '../middleware/rate-limit';
 import {
   getRemoteKeysWithNotarySignature,
   getServerSigningKey,
@@ -19,6 +20,11 @@ import { findServerAcl, isServerAllowedByAcl, isServerAllowedInRoom, serverNameF
 import { getRoomVersion } from '../services/room-versions';
 import { applyEventRedaction } from '../services/event-redaction';
 import {
+  getActivePolicyRules,
+  isServerBannedByPolicy,
+  isUserBannedByPolicy,
+} from '../services/moderation-policy';
+import {
   askPolicyServerSignature,
   attachPolicySignature,
   eventExemptFromPolicy,
@@ -26,6 +32,69 @@ import {
   signEventAsPolicyServer,
   verifyPolicySignature,
 } from '../services/policy-server';
+
+// Spec module "Server ACLs" (MSC4436): denied servers get no room content
+// from any federation surface. The transaction, make_join, send_join and
+// invite paths enforce this at their auth points; this guard covers the
+// read endpoints. Lookup failures fall open (read posture).
+async function callerDeniedByRoomAcl(
+  c: { env: Env; get: (key: string) => unknown },
+  roomId: string
+): Promise<boolean> {
+  const origin = c.get('federationOrigin') as string | undefined;
+  if (!origin || !roomId) return false;
+  try {
+    return !(await isServerAllowedInRoom(c.env.DB, roomId, origin));
+  } catch {
+    return false;
+  }
+}
+
+// MSC4284: membership events (invites, joins) in policy-server rooms must
+// carry a valid PS countersignature. Timeline events without one are
+// soft-failed; membership is refused outright instead — soft-failing a
+// join/invite would corrupt local membership views. A fresh signature is
+// requested first (the PS key may have rotated between send and receipt).
+// Resolution failures fall open: membership must not wedge on our bugs.
+async function policySignatureMissing(
+  c: { env: Env; get: (key: string) => unknown },
+  event: Record<string, unknown>,
+  roomVersion: string
+): Promise<boolean> {
+  try {
+    const roomId = typeof event.room_id === 'string' ? event.room_id : '';
+    if (!roomId) return false;
+    const config = await getRoomPolicyServer(c.env.DB, roomId);
+    if (!config || eventExemptFromPolicy(event)) return false;
+
+    if (await verifyPolicySignature(event, config.via, config.ed25519, roomVersion)) {
+      return false;
+    }
+    const asked = await askPolicyServerSignature(c.env, config, event);
+    if ('signature' in asked) {
+      const candidate = {
+        ...((event.signatures as Record<string, unknown> | undefined) ?? {}),
+      };
+      attachPolicySignature(candidate, config.via, asked.signature);
+      if (
+        await verifyPolicySignature(
+          { ...event, signatures: candidate },
+          config.via,
+          config.ed25519,
+          roomVersion
+        )
+      ) {
+        // Redeemed: keep the fresh countersignature on the event.
+        event.signatures = candidate;
+        return false;
+      }
+    }
+    return true;
+  } catch (err) {
+    console.warn('[policy] membership countersignature check failed:', err);
+    return false;
+  }
+}
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
@@ -591,6 +660,11 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
   const { pdus, edus } = body;
   const pduResults: Record<string, any> = {};
 
+  // Moderation policy lists (spec module): m.ban server rules deny the
+  // sending server's PDUs with the same posture as ACL denial. Fetched
+  // once per transaction; no subscriptions means no-op.
+  const moderationRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
+
   // Process incoming PDUs (Persistent Data Units - events)
   for (const pdu of pdus || []) {
     try {
@@ -820,6 +894,24 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
                 `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
                  VALUES (?, ?, ?, ?, 0, ?)`
               ).bind(eventId, pduOrigin, roomId, Date.now(), reason).run();
+              continue;
+            }
+          }
+
+          // Moderation policy lists (spec module): m.ban server rules deny
+          // the sending server's traffic with ACL posture.
+          if (moderationRules.subscriptions > 0 && typeof (pdu as { sender?: unknown }).sender === 'string') {
+            const modBan = isServerBannedByPolicy(
+              moderationRules,
+              serverNameFromId((pdu as { sender: string }).sender)
+            );
+            if (modBan) {
+              const modReason = `Server is banned by a moderation policy list (${modBan.reason || modBan.entity})`;
+              pduResults[eventId] = { error: modReason };
+              await c.env.DB.prepare(
+                `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+                 VALUES (?, ?, ?, ?, 0, ?)`
+              ).bind(eventId, pduOrigin, roomId, Date.now(), modReason).run();
               continue;
             }
           }
@@ -1288,6 +1380,14 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
   }
 
   const eventRoom = await getRoom(c.env.DB, event.room_id);
+
+  // Server ACL: denied servers get no room content, single events included.
+  if (await callerDeniedByRoomAcl(c, event.room_id)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "The calling server is denied by the room's server ACL" },
+      403
+    );
+  }
   const evWire = await wireForRoom(c.env, event.room_id, eventRoom?.room_version ?? '10');
   const evWirePdu = evWire?.wireById.get(event.event_id);
   if (evWirePdu) {
@@ -1325,6 +1425,13 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
   // Note: eventId could be used to get state at a specific point in time
   void c.req.query('event_id');
+
+  if (await callerDeniedByRoomAcl(c, roomId)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "The calling server is denied by the room's server ACL" },
+      403
+    );
+  }
 
   const stateRoom = await getRoom(c.env.DB, roomId);
 
@@ -1432,6 +1539,13 @@ app.get('/_matrix/federation/v1/state_ids/:roomId', async (c) => {
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  if (await callerDeniedByRoomAcl(c, roomId)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "The calling server is denied by the room's server ACL" },
+      403
+    );
   }
 
   // Get state event IDs
@@ -1620,6 +1734,13 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     }
   }
 
+  if (await callerDeniedByRoomAcl(c, roomId)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "The calling server is denied by the room's server ACL" },
+      403
+    );
+  }
+
   // Parse starting event IDs (cap at 20 to prevent oversized IN queries)
   const startEventIds = vParam ? vParam.split(',').slice(0, 20) : [];
 
@@ -1717,6 +1838,13 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
     if (!hasMember) {
       return c.json({ errcode: 'M_FORBIDDEN', error: 'Requesting server has no users in this room' }, 403);
     }
+  }
+
+  if (await callerDeniedByRoomAcl(c, roomId)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "The calling server is denied by the room's server ACL" },
+      403
+    );
   }
 
   // Walk backwards from latest_events to earliest_events
@@ -2094,6 +2222,9 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
 });
 
 // PUT /_matrix/federation/v1/send_join/:roomId/:eventId - Complete join
+// (v1 was REMOVED from the spec in v1.18 (MSC4376) — kept here
+// deliberately for older peers; v2 is the negotiated path for modern
+// servers.)
 app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   const roomId = c.req.param('roomId');
   const eventId = c.req.param('eventId');
@@ -2132,6 +2263,15 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   );
   if (joinAuthError) {
     return Errors.forbidden(joinAuthError).toResponse();
+  }
+
+  // MSC4284 (spec v1.18): joins in policy-server rooms must carry a valid
+  // countersignature (membership events are refused, not soft-failed).
+  if (await policySignatureMissing(c, body as Record<string, unknown>, room.room_version)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'The join lacks a valid policy server signature' },
+      403
+    );
   }
 
   // Room versions 11+ (derived event IDs): countersign and store the join,
@@ -2286,6 +2426,15 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
   );
   if (joinAuthError) {
     return Errors.forbidden(joinAuthError).toResponse();
+  }
+
+  // MSC4284 (spec v1.18): joins in policy-server rooms must carry a valid
+  // countersignature (membership events are refused, not soft-failed).
+  if (await policySignatureMissing(c, body as Record<string, unknown>, room.room_version)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'The join lacks a valid policy server signature' },
+      403
+    );
   }
 
   // Room versions 11+ (derived event IDs): countersign and store the join,
@@ -2505,6 +2654,9 @@ app.get('/_matrix/federation/v1/make_leave/:roomId/:userId', async (c) => {
 });
 
 // PUT /_matrix/federation/v1/send_leave/:roomId/:eventId - Complete leave
+// (v1 was REMOVED from the spec in v1.18 (MSC4376) — kept here
+// deliberately for older peers; v2 is the negotiated path for modern
+// servers.)
 app.put('/_matrix/federation/v1/send_leave/:roomId/:eventId', async (c) => {
   const roomId = c.req.param('roomId');
   const eventId = c.req.param('eventId');
@@ -2750,6 +2902,43 @@ app.put('/_matrix/federation/v1/invite/:roomId/:eventId', async (c) => {
     );
   }
 
+  // MSC4284 (spec v1.18): invites in policy-server rooms must carry a
+  // valid countersignature. v1 invites carry no room_version: use the
+  // stored one (unknown rooms default harmlessly — no policy state).
+  const v1InviteRoom = await getRoom(c.env.DB, inviteEvent.room_id);
+  if (
+    await policySignatureMissing(
+      c, inviteEvent as unknown as Record<string, unknown>, String(v1InviteRoom?.room_version ?? '10')
+    )
+  ) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'The invite lacks a valid policy server signature' },
+      403
+    );
+  }
+
+  // Moderation policy lists (spec module): banned users/servers cannot
+  // invite our users.
+  {
+    const modRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
+    if (modRules.subscriptions > 0) {
+      const bannedUser = isUserBannedByPolicy(modRules, inviteEvent.sender as string);
+      const bannedServer = senderServer
+        ? isServerBannedByPolicy(modRules, senderServer)
+        : null;
+      if (bannedUser || bannedServer) {
+        const banReason = bannedUser?.reason || bannedServer?.reason || 'banned entity';
+        return c.json(
+          {
+            errcode: 'M_FORBIDDEN',
+            error: `The inviter is banned by a moderation policy list (${banReason})`,
+          },
+          403
+        );
+      }
+    }
+  }
+
   // Validate the invite is for a local user
   const stateKey = inviteEvent.state_key;
   if (!stateKey || !stateKey.includes(':')) {
@@ -2883,6 +3072,52 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
       { errcode: 'M_FORBIDDEN', error: 'Sender does not belong to the authenticated origin server' },
       403
     );
+  }
+
+  // Server ACL (spec module; MSC4436): denied servers cannot invite either.
+  if (
+    v2SenderServer &&
+    !(await isServerAllowedInRoom(c.env.DB, inviteEvent.room_id, v2SenderServer))
+  ) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "Inviting server is denied by the room's server ACL" },
+      403
+    );
+  }
+
+  // MSC4284 (spec v1.18): invites in policy-server rooms must carry a
+  // valid countersignature (membership events are refused, not soft-failed).
+  if (
+    await policySignatureMissing(
+      c, inviteEvent as unknown as Record<string, unknown>, roomVersion
+    )
+  ) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: 'The invite lacks a valid policy server signature' },
+      403
+    );
+  }
+
+  // Moderation policy lists (spec module): banned users/servers cannot
+  // invite our users.
+  {
+    const modRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
+    if (modRules.subscriptions > 0) {
+      const bannedUser = isUserBannedByPolicy(modRules, inviteEvent.sender as string);
+      const bannedServer = v2SenderServer
+        ? isServerBannedByPolicy(modRules, v2SenderServer)
+        : null;
+      if (bannedUser || bannedServer) {
+        const banReason = bannedUser?.reason || bannedServer?.reason || 'banned entity';
+        return c.json(
+          {
+            errcode: 'M_FORBIDDEN',
+            error: `The inviter is banned by a moderation policy list (${banReason})`,
+          },
+          403
+        );
+      }
+    }
   }
 
   // Validate the invite is for a local user
@@ -4040,6 +4275,14 @@ app.get('/_matrix/federation/v1/hierarchy/:roomId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
+  // Server ACL: denied servers get no room content, space hierarchies included.
+  if (await callerDeniedByRoomAcl(c, roomId)) {
+    return c.json(
+      { errcode: 'M_FORBIDDEN', error: "The calling server is denied by the room's server ACL" },
+      403
+    );
+  }
+
   // Parse pagination token
   let offset = 0;
   if (from && from.startsWith('offset_')) {
@@ -4552,7 +4795,11 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
 // check is an implementation detail — the current policy is permissive:
 // known room + caller allowed by the room's server ACL. Per-room rules
 // can layer in later without touching the contract.
-app.post('/_matrix/policy/v1/sign', async (c) => {
+//
+// The spec marks this endpoint rate-limited: one bucket per calling
+// server (federationOriginRateLimit) so a flood from one server cannot
+// crowd out the rest.
+app.post('/_matrix/policy/v1/sign', federationOriginRateLimit(120, 60_000), async (c) => {
   let event: Record<string, unknown>;
   try {
     event = (await getFederationBody(c)) as Record<string, unknown>;

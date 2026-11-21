@@ -201,3 +201,63 @@ export function strictRateLimit(requests: number, windowMs: number) {
     return next();
   };
 }
+
+// Origin-keyed strict limit for federation-authenticated endpoints (e.g.
+// the MSC4284 policy /sign endpoint, which the spec marks rate-limited):
+// one bucket per CALLING SERVER rather than per user or IP, so a busy
+// room's asks cannot be dodged by rotating tokens and a misbehaving
+// server cannot crowd out others.
+export function federationOriginRateLimit(requests: number, windowMs: number) {
+  return async (c: Context<AppEnv>, next: Next) => {
+    const origin = (c as { get: (key: string) => unknown }).get('federationOrigin') as
+      | string
+      | undefined;
+    // No origin means federation auth did not run (or failed open in a
+    // test harness): nothing sensible to key on — let the auth middleware
+    // be the gate.
+    if (!origin) return next();
+    // Degrade gracefully without the DO binding (test harnesses, minimal
+    // environments): enforcement is best-effort, never a 500.
+    if (!c.env.RATE_LIMIT) return next();    const doId = c.env.RATE_LIMIT.idFromName(`federation:${c.req.path}:${origin}`);
+    const stub = c.env.RATE_LIMIT.get(doId);
+
+    try {
+      const response = await stub.fetch(
+        new Request('https://internal/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'check',
+            clientId: `origin:${origin}`,
+            limit: requests,
+            windowMs,
+          }),
+        })
+      );
+
+      const result = (await response.json()) as {
+        allowed: boolean;
+        remaining: number;
+        retryAfterMs?: number;
+      };
+
+      if (!result.allowed) {
+        const retryAfter = Math.ceil((result.retryAfterMs || windowMs) / 1000);
+        c.header('Retry-After', String(retryAfter));
+
+        return c.json(
+          {
+            errcode: 'M_LIMIT_EXCEEDED',
+            error: 'Too many requests',
+            retry_after_ms: result.retryAfterMs || windowMs,
+          },
+          429
+        );
+      }
+    } catch (error) {
+      console.error('Federation origin rate limiting error:', error);
+    }
+
+    return next();
+  };
+}

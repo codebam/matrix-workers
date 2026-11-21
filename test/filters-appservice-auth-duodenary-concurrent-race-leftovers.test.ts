@@ -53,6 +53,7 @@ import { extractAccessToken } from '../src/middleware/auth';
 // ---------------------------------------------------------------------------
 
 vi.mock('../src/middleware/rate-limit', () => ({
+  federationOriginRateLimit: () => async (_c: unknown, next: () => Promise<void>) => next(),
   rateLimitMiddleware: async (_c: unknown, next: () => Promise<void>) => next(),
   getRateLimitType: () => 'default',
   getClientId: () => 'unknown',
