@@ -988,7 +988,7 @@ describe('presence leftovers method matrix', () => {
 });
 
 describe('presence leftovers SQL / KV bind contracts', () => {
-  it('INSERT binds user, presence, status_msg, last_active_ts in order', async () => {
+  it('INSERT binds user, presence, status_msg, last_active_ts, currently_active in order', async () => {
     const env = createEnv({ db: createPresenceDb({ memberships: [] }) });
     await request(
       env,
@@ -996,7 +996,7 @@ describe('presence leftovers SQL / KV bind contracts', () => {
       jsonInit('PUT', { presence: 'unavailable', status_msg: 'bind' })
     );
     expect(env._db.inserts[0].sql).toContain('INSERT INTO presence');
-    expect(env._db.inserts[0].args).toEqual([USER, 'unavailable', 'bind', NOW]);
+    expect(env._db.inserts[0].args).toEqual([USER, 'unavailable', 'bind', NOW, 0, 0]);
   });
 
   it('KV key is presence:${userId} with TTL 300', async () => {
@@ -1045,7 +1045,9 @@ describe('presence leftovers SQL / KV bind contracts', () => {
       const env = createEnv({ db: createPresenceDb({ memberships: [] }) });
       const res = await request(env, statusPath(), jsonInit('PUT', { presence: state }));
       expect(res.status).toBe(200);
-      expect(env._db.inserts[0].args).toEqual([USER, state, null, NOW]);
+      expect(env._db.inserts[0].args).toEqual([
+        USER, state, null, NOW, state === 'online' ? 1 : 0, 0,
+      ]);
       expect(JSON.parse(env._cache.puts[0].value)).toEqual({
         presence: state,
         status_msg: null,

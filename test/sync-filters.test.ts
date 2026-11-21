@@ -526,3 +526,39 @@ describe('sync tokens — account-data and device-key stream positions', () => {
     expect(Object.keys(parsed)).toEqual(['events', 'toDevice']);
   });
 });
+
+describe('sync tokens — presence stream position', () => {
+  it('parses _pr with and without the account-data/device-key suffix', () => {
+    expect(parseSyncToken('s84_td119_pr6')).toEqual({
+      events: 84,
+      toDevice: 119,
+      presence: 6,
+    });
+    expect(parseSyncToken('s84_td119_ad33_dk7_pr6')).toEqual({
+      events: 84,
+      toDevice: 119,
+      accountData: 33,
+      deviceKeys: 7,
+      presence: 6,
+    });
+  });
+
+  it('omits _pr when the presence position is zero', () => {
+    expect(buildSyncToken(10, 20)).toBe('s10_td20');
+    expect(buildSyncToken(10, 20, 1, 2)).toBe('s10_td20_ad1_dk2');
+    expect(buildSyncToken(10, 20, 0, 0, 0)).toBe('s10_td20');
+  });
+
+  it('round-trips a presence-only suffix', () => {
+    const token = buildSyncToken(7, 8, 0, 0, 9);
+    expect(token).toBe('s7_td8_pr9');
+    expect(parseSyncToken(token)).toEqual({ events: 7, toDevice: 8, presence: 9 });
+    expect(Object.keys(parseSyncToken(token))).toEqual(['events', 'toDevice', 'presence']);
+  });
+
+  it('rejects malformed presence suffixes', () => {
+    expect(parseSyncToken('s1_td2_pr')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s1_td2_prx')).toEqual({ events: 0, toDevice: 0 });
+    expect(parseSyncToken('s1_td2_pr3_extra')).toEqual({ events: 0, toDevice: 0 });
+  });
+});

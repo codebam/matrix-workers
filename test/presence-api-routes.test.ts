@@ -401,7 +401,7 @@ describe('presence PUT /status — success writes', () => {
     expect(res.body).toEqual({});
 
     expect(env._db.inserts).toHaveLength(1);
-    expect(env._db.inserts[0].args).toEqual([USER, 'online', null, NOW]);
+    expect(env._db.inserts[0].args).toEqual([USER, 'online', null, NOW, 1, 0]);
     expect(env._db.presence[0]).toMatchObject({
       user_id: USER,
       presence: 'online',
@@ -427,7 +427,7 @@ describe('presence PUT /status — success writes', () => {
       jsonInit('PUT', { presence: 'online', status_msg: 'coding' })
     );
     expect(res.status).toBe(200);
-    expect(env._db.inserts[0].args).toEqual([USER, 'online', 'coding', NOW]);
+    expect(env._db.inserts[0].args).toEqual([USER, 'online', 'coding', NOW, 1, 0]);
     expect(JSON.parse(env._cache.puts[0].value)).toMatchObject({
       presence: 'online',
       status_msg: 'coding',
@@ -454,7 +454,7 @@ describe('presence PUT /status — success writes', () => {
       jsonInit('PUT', { presence: 'unavailable' })
     );
     expect(res.status).toBe(200);
-    expect(env._db.inserts[0].args).toEqual([USER, 'unavailable', null, NOW]);
+    expect(env._db.inserts[0].args).toEqual([USER, 'unavailable', null, NOW, 0, 0]);
   });
 
   it('upserts existing presence row on conflict', async () => {

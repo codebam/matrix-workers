@@ -162,6 +162,13 @@ type AccountDataRow = {
 type OtkCount = { algorithm: string; count: number };
 type FallbackAlgo = { algorithm: string };
 type DeviceKeyChange = { user_id: string; stream_position: number };
+type PresenceRow = {
+  user_id: string;
+  presence: string;
+  status_msg: string | null;
+  last_active_ts: number;
+  currently_active?: number;
+};
 
 type ConnectionState = {
   userId: string;
@@ -326,6 +333,7 @@ function createSlidingDb(opts: {
   fallbackAlgos?: FallbackAlgo[];
   deviceKeyChanges?: DeviceKeyChange[];
   sharedRoomUsers?: string[];
+  presence?: PresenceRow[];
 } = {}) {
   const maxStreamPos = opts.maxStreamPos === undefined ? 42 : opts.maxStreamPos;
   const memberships = [...(opts.memberships ?? [])];
@@ -336,6 +344,7 @@ function createSlidingDb(opts: {
   const otkCounts = opts.otkCounts ?? [];
   const fallbackAlgos = opts.fallbackAlgos ?? [];
   const deviceKeyChanges = opts.deviceKeyChanges ?? [];
+  const presence = opts.presence ?? [];
   const sharedRoomUsers = new Set(opts.sharedRoomUsers ?? [BOB, CAROL]);
 
   const selects: SqlCall[] = [];
@@ -672,6 +681,20 @@ function createSlidingDb(opts: {
       return memberships
         .filter((m) => m.user_id === userId && m.membership === 'join')
         .map((m) => ({ room_id: m.room_id }));
+    }
+
+    // presence rows (D1 is authoritative for currently_active / last_active_ago)
+    if (sql.includes('FROM presence') && sql.includes('IN (')) {
+      const ids = args as string[];
+      return presence
+        .filter((p) => ids.includes(p.user_id))
+        .map((p) => ({
+          user_id: p.user_id,
+          presence: p.presence,
+          status_msg: p.status_msg,
+          last_active_ts: p.last_active_ts,
+          currently_active: p.currently_active ?? 0,
+        }));
     }
 
     // presence members
@@ -2159,6 +2182,46 @@ describe('MSC3575 — extensions', () => {
       true
     );
     expect(events.some((e) => e.sender === CAROL)).toBe(true);
+  });
+
+  it('presence extension reads currently_active / last_active_ago from D1', async () => {
+    const fx = fixtureJoinedRoom();
+    const lastActiveTs = Date.now() - 5_000;
+    // Stale KV payload must not win over the stamped D1 row.
+    const cache = mockKv({
+      [`presence:${BOB}`]: JSON.stringify({ presence: 'offline', status_msg: 'stale' }),
+    });
+    const env = createEnv({
+      cache,
+      db: createSlidingDb({
+        memberships: fx.memberships,
+        rooms: fx.rooms,
+        events: fx.events,
+        state: fx.state,
+        presence: [
+          {
+            user_id: BOB,
+            presence: 'online',
+            status_msg: 'd1',
+            last_active_ts: lastActiveTs,
+            currently_active: 1,
+          },
+        ],
+      }),
+    });
+    const { body } = await postSync(MSC3575, env, {
+      lists: { all: { ranges: [[0, 0]], timeline_limit: 1 } },
+      extensions: { presence: {} },
+    });
+    const events = (body.extensions as any).presence.events as any[];
+    const bob = events.find((e) => e.sender === BOB);
+    expect(bob.content).toMatchObject({
+      presence: 'online',
+      status_msg: 'd1',
+      currently_active: true,
+    });
+    expect(bob.content.last_active_ago).toBeGreaterThanOrEqual(5_000);
+    expect(bob.content.last_active_ago).toBeLessThan(6_000);
   });
 });
 

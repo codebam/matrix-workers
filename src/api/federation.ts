@@ -97,6 +97,7 @@ async function policySignatureMissing(
   }
 }
 import { recordKeyChange } from './keys';
+import { recordPresenceChange } from './presence';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
@@ -1290,21 +1291,18 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
                   ? now - update.last_active_ago
                   : now;
                 try {
-                  await c.env.DB.prepare(`
-                    INSERT INTO presence (user_id, presence, status_msg, last_active_ts, currently_active)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                      presence = excluded.presence,
-                      status_msg = excluded.status_msg,
-                      last_active_ts = excluded.last_active_ts,
-                      currently_active = excluded.currently_active
-                  `).bind(
-                    update.user_id,
-                    update.presence,
-                    update.status_msg || null,
-                    lastActive,
-                    update.currently_active ? 1 : 0
-                  ).run();
+                  // Stamp the row with a new presence stream position in the
+                  // same D1 batch/transaction, so local /sync clients see this
+                  // EDU exactly once. recordPresenceChange degrades to the
+                  // legacy write if the stream is unavailable; any error stays
+                  // contained here and never rejects the federation transaction.
+                  await recordPresenceChange(c.env.DB, {
+                    userId: update.user_id,
+                    presence: update.presence,
+                    statusMsg: update.status_msg || null,
+                    lastActiveTs: lastActive,
+                    currentlyActive: Boolean(update.currently_active),
+                  });
                 } catch (presErr) {
                   console.warn(`[federation] Failed to update presence for ${update.user_id}:`, presErr);
                 }

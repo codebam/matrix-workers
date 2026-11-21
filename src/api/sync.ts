@@ -431,72 +431,99 @@ async function getRoomSummary(
 
 const PRESENCE_TIMEOUT_MS = 5 * 60 * 1000;
 
-// PARTIAL presence implementation for legacy /sync.
-//
-// The `presence` table stores current state only. The `stream_positions` row
-// named 'presence' exists but no code ever advances it, and there is no
-// presence-change table/column, so we cannot know which users changed since a
-// sync token. Rather than fake incremental deltas, this emits the caller's own
-// and shared-room users' CURRENT presence on initial sync only; incremental
-// syncs return no presence events. It does not cover: changes after the first
-// sync, users who stop sharing a room, or presence-derived transitions
-// (online -> unavailable after the inactivity timeout). See the report for
-// the schema change that would enable real per-token deltas.
+interface PresenceSyncRow {
+  user_id: string;
+  presence: string;
+  status_msg: string | null;
+  last_active_ts: number | null;
+  currently_active?: number | boolean | null;
+}
+
+function toPresenceEvent(row: PresenceSyncRow, now: number): PresenceEvent {
+  const lastActiveTs = row.last_active_ts ?? 0;
+  const isActive = lastActiveTs > 0 && now - lastActiveTs < PRESENCE_TIMEOUT_MS;
+  const effectivePresence: PresenceState =
+    row.presence === 'online' && !isActive ? 'unavailable' : row.presence as PresenceState;
+  // PUT and inbound EDUs both stamp currently_active on the row. Rows written
+  // before that column existed fall back to the activity heuristic.
+  const storedActive =
+    row.currently_active == null ? isActive : Boolean(row.currently_active);
+  return {
+    type: 'm.presence' as const,
+    sender: row.user_id,
+    content: {
+      presence: effectivePresence,
+      ...(row.status_msg ? { status_msg: row.status_msg } : {}),
+      last_active_ago: Math.max(0, now - lastActiveTs),
+      currently_active: storedActive && effectivePresence === 'online',
+    },
+  };
+}
+
+// Presence for legacy /sync. Initial sync (no cursor) sends the current state
+// of the caller and everyone sharing a room. Incremental sync sends only rows
+// whose stream_position is newer than the presence cursor in `since`; the
+// shared-room predicate mirrors getDeviceListChanges in this file so a user we
+// no longer share a room with never receives our presence (or vice versa).
+// event_id / origin_server_ts are not stored for presence, so they are omitted
+// rather than invented.
 /** Exported for unit tests. */
-export async function getInitialPresenceEvents(
+export async function getPresenceEventsForSync(
+  db: D1Database,
+  userId: string,
+  roomIds: string[],
+  sincePresence?: number
+): Promise<PresenceEvent[]> {
+  const now = Date.now();
+
+  if (sincePresence === undefined) {
+    const userIds = new Set<string>([userId]);
+    for (const roomId of roomIds) {
+      const members = await db.prepare(`
+        SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'
+      `).bind(roomId).all<{ user_id: string }>();
+      for (const member of members.results) userIds.add(member.user_id);
+    }
+
+    // Chunk the IN clause: large rooms can exceed SQLite's bind-variable limit.
+    const ids = [...userIds];
+    const rows: PresenceSyncRow[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      const placeholders = chunk.map(() => '?').join(',');
+      const result = await db.prepare(`
+        SELECT user_id, presence, status_msg, last_active_ts, currently_active
+        FROM presence WHERE user_id IN (${placeholders})
+      `).bind(...chunk).all<PresenceSyncRow>();
+      rows.push(...result.results);
+    }
+    return rows.map(row => toPresenceEvent(row, now));
+  }
+
+  const result = await db.prepare(`
+    SELECT p.user_id, p.presence, p.status_msg, p.last_active_ts, p.currently_active
+    FROM presence p
+    WHERE p.stream_position > ?
+      AND (
+        p.user_id = ?
+        OR EXISTS (
+          SELECT 1 FROM room_memberships rm1
+          JOIN room_memberships rm2 ON rm1.room_id = rm2.room_id
+          WHERE rm1.user_id = ? AND rm1.membership = 'join'
+            AND rm2.user_id = p.user_id AND rm2.membership = 'join'
+        )
+      )
+    ORDER BY p.stream_position ASC
+  `).bind(sincePresence, userId, userId).all<PresenceSyncRow>();
+  return result.results.map(row => toPresenceEvent(row, now));
+}
+
+/** Legacy name kept for callers/tests that only need initial presence. */
+export const getInitialPresenceEvents = (
   db: D1Database,
   userId: string,
   roomIds: string[]
-): Promise<PresenceEvent[]> {
-  const userIds = new Set<string>([userId]);
-  for (const roomId of roomIds) {
-    const members = await db.prepare(`
-      SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'
-    `).bind(roomId).all<{ user_id: string }>();
-    for (const member of members.results) userIds.add(member.user_id);
-  }
-
-  // Chunk the IN clause: large rooms can exceed SQLite's bind-variable limit.
-  const ids = [...userIds];
-  const rows: Array<{
-    user_id: string;
-    presence: string;
-    status_msg: string | null;
-    last_active_ts: number | null;
-  }> = [];
-  for (let i = 0; i < ids.length; i += 500) {
-    const chunk = ids.slice(i, i + 500);
-    const placeholders = chunk.map(() => '?').join(',');
-    const result = await db.prepare(`
-      SELECT user_id, presence, status_msg, last_active_ts
-      FROM presence WHERE user_id IN (${placeholders})
-    `).bind(...chunk).all<{
-      user_id: string;
-      presence: string;
-      status_msg: string | null;
-      last_active_ts: number | null;
-    }>();
-    rows.push(...result.results);
-  }
-
-  const now = Date.now();
-  return rows.map(row => {
-    const lastActiveTs = row.last_active_ts ?? 0;
-    const isActive = lastActiveTs > 0 && now - lastActiveTs < PRESENCE_TIMEOUT_MS;
-    const effectivePresence: PresenceState =
-      row.presence === 'online' && !isActive ? 'unavailable' : row.presence as PresenceState;
-    return {
-      type: 'm.presence' as const,
-      sender: row.user_id,
-      content: {
-        presence: effectivePresence,
-        ...(row.status_msg ? { status_msg: row.status_msg } : {}),
-        last_active_ago: Math.max(0, now - lastActiveTs),
-        currently_active: isActive && effectivePresence === 'online',
-      },
-    };
-  });
-}
+): Promise<PresenceEvent[]> => getPresenceEventsForSync(db, userId, roomIds);
 
 const app = new Hono<AppEnv>();
 
@@ -504,31 +531,43 @@ const app = new Hono<AppEnv>();
 // Parse composite sync token:
 //   "s{events}_td{to_device}"                      (legacy composite)
 //   "s{events}_td{to_device}_ad{account_data}_dk{device_keys}"  (current)
+//   "..._pr{presence}"                             (presence cursor, optional)
 //   plain number                                    (legacy)
-// The account-data and device-keys streams have their own counters (see the
-// stream_positions table); omitting their positions would compare them against
-// the events position, which redelivers their changes on every sync.
+// The account-data, device-keys and presence streams have their own counters
+// (see the stream_positions table); omitting their positions would compare
+// them against the events position, which redelivers their changes on every
+// sync. Tokens without _pr (issued before 030) are treated as presence 0: rows
+// backfilled by the migration carry position 0, so only genuinely new changes
+// are replayed once.
 /** Exported for unit tests. */
 export function parseSyncToken(token: string | undefined): {
   events: number;
   toDevice: number;
   accountData?: number;
   deviceKeys?: number;
+  presence?: number;
 } {
   if (!token) {
     return { events: 0, toDevice: 0 };
   }
 
-  // Composite format, with optional per-stream positions for account data
-  // and device keys: s84_td119_ad33_dk7
-  const match = token.match(/^s(\d+)_td(\d+)(?:_ad(\d+)_dk(\d+))?$/);
+  // Composite format, with optional per-stream positions for account data,
+  // device keys and presence: s84_td119_ad33_dk7_pr2
+  const match = token.match(/^s(\d+)_td(\d+)(?:_ad(\d+)_dk(\d+))?(?:_pr(\d+))?$/);
   if (match) {
-    const parsed: { events: number; toDevice: number; accountData?: number; deviceKeys?: number } = {
+    const parsed: {
+      events: number;
+      toDevice: number;
+      accountData?: number;
+      deviceKeys?: number;
+      presence?: number;
+    } = {
       events: parseInt(match[1]),
       toDevice: parseInt(match[2]),
     };
     if (match[3] !== undefined) parsed.accountData = parseInt(match[3]);
     if (match[4] !== undefined) parsed.deviceKeys = parseInt(match[4]);
+    if (match[5] !== undefined) parsed.presence = parseInt(match[5]);
     return parsed;
   }
 
@@ -541,21 +580,27 @@ export function parseSyncToken(token: string | undefined): {
   return { events: 0, toDevice: 0 };
 }
 
-// Build composite sync token. The account-data / device-keys suffix is only
-// emitted when either position is non-zero, so accounts that never wrote to
-// those streams keep the compact legacy format.
+// Build composite sync token. The account-data / device-keys and presence
+// suffixes are only emitted when their position is non-zero, so accounts that
+// never wrote to those streams keep the compact legacy format. `_pr` may appear
+// on its own (without `_ad`/`_dk`) to avoid churning tokens for accounts with
+// no account-data or device-key changes.
 /** Exported for unit tests. */
 export function buildSyncToken(
   eventsPos: number,
   toDevicePos: number,
   accountDataPos: number = 0,
-  deviceKeysPos: number = 0
+  deviceKeysPos: number = 0,
+  presencePos: number = 0
 ): string {
-  const base = `s${eventsPos}_td${toDevicePos}`;
-  if (accountDataPos === 0 && deviceKeysPos === 0) {
-    return base;
+  let token = `s${eventsPos}_td${toDevicePos}`;
+  if (accountDataPos !== 0 || deviceKeysPos !== 0) {
+    token += `_ad${accountDataPos}_dk${deviceKeysPos}`;
   }
-  return `${base}_ad${accountDataPos}_dk${deviceKeysPos}`;
+  if (presencePos !== 0) {
+    token += `_pr${presencePos}`;
+  }
+  return token;
 }
 
 // Read the current value of a named stream counter (see stream_positions;
@@ -598,6 +643,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     toDevice: sinceToDevice,
     accountData: sinceAccountData,
     deviceKeys: sinceDeviceKeys,
+    presence: sincePresence,
   } = parseSyncToken(since);
   // A token was supplied iff this is an incremental sync. Position values
   // alone are not enough: accounts with no room events always sit at s0, and
@@ -620,9 +666,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // `setAccountData` resolve only when their write is echoed back over sync,
   // so a token that advances past an undelivered change hangs them forever.
   // Under-advancing is safe (the change is redelivered next sync).
-  const [currentAccountDataPos, currentDeviceKeysPos] = await Promise.all([
+  const [currentAccountDataPos, currentDeviceKeysPos, currentPresencePos] = await Promise.all([
     getStreamPosition(c.env.DB, 'account_data'),
     getStreamPosition(c.env.DB, 'device_keys'),
+    getStreamPosition(c.env.DB, 'presence'),
   ]);
 
   // Track to-device position for next_batch
@@ -1057,19 +1104,19 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
   }
 
-  // Presence (partial fallback — see getInitialPresenceEvents above): only
-  // initial sync can be populated truthfully without a presence-change stream.
-  if (!hasSinceToken) {
-    const presenceEvents = await getInitialPresenceEvents(
-      c.env.DB,
-      userId,
-      Object.keys(response.rooms!.join!)
-    );
-    response.presence!.events = applyEventFilter(
-      presenceEvents,
-      withEventFormat(filter, filter?.presence)
-    );
-  }
+  // Presence: initial sync gets current state; incremental syncs get only
+  // rows stamped after the presence cursor in `since`. A token without _pr
+  // (pre-030) defaults to 0, so backfilled rows are not replayed as deltas.
+  const presenceEvents = await getPresenceEventsForSync(
+    c.env.DB,
+    userId,
+    Object.keys(response.rooms!.join!),
+    hasSinceToken ? sincePresence ?? 0 : undefined
+  );
+  response.presence!.events = applyEventFilter(
+    presenceEvents,
+    withEventFormat(filter, filter?.presence)
+  );
 
   // Check if there are any changes to return
   const hasRoomChanges = Object.keys(response.rooms!.join!).some(roomId => {
@@ -1083,8 +1130,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   const hasLeaves = Object.keys(response.rooms!.leave!).length > 0;
   const hasToDevice = response.to_device!.events.length > 0;
   const hasAccountData = response.account_data!.events.length > 0;
+  const hasPresence = response.presence!.events.length > 0;
   const hasChanges =
-    hasRoomChanges || hasInvites || hasKnocks || hasLeaves || hasToDevice || hasAccountData;
+    hasRoomChanges || hasInvites || hasKnocks || hasLeaves || hasToDevice || hasAccountData ||
+    hasPresence;
 
   // Parse timeout from query params (default 0 for no wait, max 30s)
   const timeout = Math.min(parseInt(c.req.query('timeout') || '0'), 30000);
@@ -1130,7 +1179,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       currentPosition,
       currentToDevicePos,
       currentAccountDataPos,
-      currentDeviceKeysPos
+      currentDeviceKeysPos,
+      currentPresencePos
     );
   }
 

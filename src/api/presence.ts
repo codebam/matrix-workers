@@ -19,6 +19,90 @@ const app = new Hono<AppEnv>();
 const PRESENCE_TIMEOUT = 5 * 60 * 1000; // 5 minutes - consider offline after this
 
 // ============================================
+// Presence stream helpers
+// ============================================
+
+interface PresenceRowWrite {
+  userId: string;
+  presence: string;
+  statusMsg: string | null;
+  lastActiveTs: number;
+  currentlyActive: boolean;
+}
+
+// Allocate the next presence stream position. Mirrors the account-data /
+// device-keys helpers: bump the named row, then read it back. A missing row or
+// an older deployment without stream_positions yields 0 — presence writes must
+// never fail because a stream counter is unavailable.
+async function getNextPresencePosition(db: D1Database): Promise<number> {
+  try {
+    await db.prepare(`
+      UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'presence'
+    `).run();
+    const row = await db.prepare(`
+      SELECT position FROM stream_positions WHERE stream_name = ?
+    `).bind('presence').first<{ position: number }>();
+    return row?.position ?? 1;
+  } catch {
+    return 0;
+  }
+}
+
+// Write a presence row and stamp it with a fresh stream position. D1 batches
+// run in a transaction, so bumping the counter and stamping the row commit
+// together: a client's next /sync cannot observe a position whose row was
+// never written.
+export async function recordPresenceChange(db: D1Database, row: PresenceRowWrite): Promise<void> {
+  const active = row.currentlyActive ? 1 : 0;
+  try {
+    await db.batch([
+      db.prepare(`
+        UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'presence'
+      `),
+      db.prepare(`
+        INSERT INTO presence (user_id, presence, status_msg, last_active_ts, currently_active, stream_position)
+        SELECT ?, ?, ?, ?, ?, COALESCE((SELECT position FROM stream_positions WHERE stream_name = 'presence'), 0)
+        ON CONFLICT (user_id) DO UPDATE SET
+          presence = excluded.presence,
+          status_msg = excluded.status_msg,
+          last_active_ts = excluded.last_active_ts,
+          currently_active = excluded.currently_active,
+          stream_position = excluded.stream_position
+      `).bind(row.userId, row.presence, row.statusMsg, row.lastActiveTs, active),
+    ]);
+    return;
+  } catch {
+    // Fall through: pre-030 databases (no column) and minimal test doubles
+    // without batch() must all keep working.
+  }
+
+  const position = await getNextPresencePosition(db);
+  try {
+    await db.prepare(`
+      INSERT INTO presence (user_id, presence, status_msg, last_active_ts, currently_active, stream_position)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (user_id) DO UPDATE SET
+        presence = excluded.presence,
+        status_msg = excluded.status_msg,
+        last_active_ts = excluded.last_active_ts,
+        currently_active = excluded.currently_active,
+        stream_position = excluded.stream_position
+    `).bind(row.userId, row.presence, row.statusMsg, row.lastActiveTs, active, position).run();
+  } catch {
+    // Last resort: keep the legacy unstamped write so presence itself works
+    // even when the stream is completely unavailable.
+    await db.prepare(`
+      INSERT INTO presence (user_id, presence, status_msg, last_active_ts)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (user_id) DO UPDATE SET
+        presence = excluded.presence,
+        status_msg = excluded.status_msg,
+        last_active_ts = excluded.last_active_ts
+    `).bind(row.userId, row.presence, row.statusMsg, row.lastActiveTs).run();
+  }
+}
+
+// ============================================
 // Endpoints
 // ============================================
 
@@ -53,15 +137,16 @@ app.put('/_matrix/client/v3/presence/:userId/status', requireAuth(), async (c) =
 
   const now = Date.now();
 
-  // Store presence in D1
-  await db.prepare(`
-    INSERT INTO presence (user_id, presence, status_msg, last_active_ts)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT (user_id) DO UPDATE SET
-      presence = excluded.presence,
-      status_msg = excluded.status_msg,
-      last_active_ts = excluded.last_active_ts
-  `).bind(requestingUserId, presence, status_msg || null, now).run();
+  // Store presence in D1 with a fresh stream position so incremental /sync
+  // can deliver this change exactly once. currently_active is stored too,
+  // matching the inbound-EDU path and the spec-shaped sync event.
+  await recordPresenceChange(db, {
+    userId: requestingUserId,
+    presence,
+    statusMsg: status_msg || null,
+    lastActiveTs: now,
+    currentlyActive: presence === 'online',
+  });
 
   // Write-through to KV cache for fast reads (5 minute TTL)
   await c.env.CACHE.put(
@@ -285,9 +370,21 @@ export async function updateLastActive(
 ): Promise<void> {
   const now = Date.now();
 
-  await db.prepare(`
-    UPDATE presence SET last_active_ts = ? WHERE user_id = ?
-  `).bind(now, userId).run();
+  try {
+    await db.batch([
+      db.prepare(`
+        UPDATE stream_positions SET position = position + 1 WHERE stream_name = 'presence'
+      `),
+      db.prepare(`
+        UPDATE presence SET last_active_ts = ?, stream_position = COALESCE((SELECT position FROM stream_positions WHERE stream_name = 'presence'), stream_position) WHERE user_id = ?
+      `).bind(now, userId),
+    ]);
+  } catch {
+    // Pre-030 databases / minimal test doubles: preserve the legacy write.
+    await db.prepare(`
+      UPDATE presence SET last_active_ts = ? WHERE user_id = ?
+    `).bind(now, userId).run();
+  }
 }
 
 export default app;

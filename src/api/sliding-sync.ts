@@ -10,6 +10,7 @@ import { getReceiptsForRooms } from './receipts';
 import { countNotificationsWithRules } from '../services/push-rule-evaluator';
 import { getInvitePermission } from '../services/database';
 import { getDeviceListRemovals } from './sync';
+import { getPresenceForUsers } from './presence';
 // Room cache helper available for future optimizations
 // import { getRoomMetadata, invalidateRoomCache, type RoomMetadata } from '../services/room-cache';
 
@@ -1479,17 +1480,46 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         }
       }
 
-      for (const uid of userIds) {
-        if (uid === userId) continue;
-        const presenceKey = `presence:${uid}`;
-        const presence = await cache.get(presenceKey, 'json') as any;
-        if (presence) {
-          response.extensions.presence.events!.push({
-            type: 'm.presence',
-            sender: uid,
-            content: presence,
-          });
+      // D1 is authoritative: PUT /presence and inbound m.presence EDUs stamp
+      // the row with currently_active / last_active_ts, so read it through the
+      // same helper legacy /sync uses. KV is only a fallback for cache-only
+      // entries written before the stamped row existed; those cannot express
+      // the spec fields, so derive them from last_active_ts where possible.
+      const presenceIds = [...userIds].filter(uid => uid !== userId);
+      const byUser: Record<string, {
+        presence: string;
+        status_msg?: string;
+        last_active_ago?: number;
+        currently_active?: boolean;
+      }> = {};
+      for (let i = 0; i < presenceIds.length; i += 500) {
+        Object.assign(byUser, await getPresenceForUsers(db, presenceIds.slice(i, i + 500)));
+      }
+
+      const now = Date.now();
+      for (const uid of presenceIds) {
+        let content = byUser[uid];
+        if (!content) {
+          const presence = await cache.get(`presence:${uid}`, 'json') as {
+            presence?: string;
+            status_msg?: string;
+            last_active_ts?: number;
+          } | null;
+          if (!presence?.presence) continue;
+          const lastActiveTs = typeof presence.last_active_ts === 'number' ? presence.last_active_ts : now;
+          const age = Math.max(0, now - lastActiveTs);
+          content = {
+            presence: presence.presence,
+            ...(presence.status_msg ? { status_msg: presence.status_msg } : {}),
+            last_active_ago: age,
+            currently_active: presence.presence === 'online' && age < 5 * 60 * 1000,
+          };
         }
+        response.extensions.presence.events!.push({
+          type: 'm.presence',
+          sender: uid,
+          content,
+        });
       }
     }
   }
