@@ -748,7 +748,11 @@ export async function decodeJoinRequestParam(raw: string | null): Promise<JoinRe
         protocol: fieldNum(clientInfo, 3),
         clientProtocol: fieldNum(clientInfo, 12),
       } : undefined,
-      connectionSettings: connectionSettings ? { autoSubscribe: fieldBool(connectionSettings, 1) } : undefined,
+      // ConnectionSettings.auto_subscribe is a proto3 bool: an absent field
+      // means the SDK default (true), not an explicit opt-out.
+      connectionSettings: connectionSettings ? {
+        autoSubscribe: fieldNum(connectionSettings, 1) === undefined ? undefined : fieldBool(connectionSettings, 1),
+      } : undefined,
       reconnect: fieldBool(join, 7),
       participantSid: fieldStr(join, 9),
       addTrackRequests: fieldMsgs(join, 5).map((obj) => {
@@ -810,10 +814,12 @@ interface ShimParticipant {
    * Calls can bind remote tracks into without generating a server offer.
    */
   publisherOfferSdp?: string;
-  queues: Map<string, Promise<void>>;
+  queues: Map<string, Promise<unknown>>;
   /** JSON-encoded LiveKit trickles, keyed by SignalTarget (PUBLISHER=0, SUBSCRIBER=1). */
   trickleCandidates: Map<number, TrickleCandidate[]>;
   jsonMode: boolean;
+  /** JoinRequest.ConnectionSettings.auto_subscribe; true unless explicitly disabled. */
+  autoSubscribe: boolean;
 }
 
 interface PendingTrack {
@@ -997,22 +1003,20 @@ function sendFrame(ws: WebSocket, msg: SignalResponseJson, jsonMode: boolean): v
   ws.send(jsonMode ? JSON.stringify({ [msg.message]: msg.value }) : encodeSignalResponse(msg));
 }
 
-function participantInfo(participant: ShimParticipant, state: number): ParticipantInfoJson {
+/** `receiver` is set for another client's view; the local publisher keeps its own mids. */
+function participantInfo(participant: ShimParticipant, state: number, receiver?: ShimParticipant): ParticipantInfoJson {
   return {
     sid: participant.sid,
     identity: participant.identity.identity,
     state,
     tracks: participant.tracks.map((track) => ({
-      sid: track.sid,
-      type: track.type,
-      name: track.trackName,
-      muted: track.muted,
-      width: track.width,
-      height: track.height,
-      source: track.source,
-      mimeType: track.mimeType,
-      mid: track.mid,
-      stream: track.stream,
+      ...participantTrackInfo(track),
+      // A mid belongs to the publisher's Calls session. Telling other
+      // clients about it makes the SDK treat the publication as already
+      // subscribed, so only expose mids this client actually bound.
+      mid: receiver && receiver.sid !== participant.sid
+        ? receiver.subscribedMids.get(track.sid)
+        : track.mid,
     })),
     joinedAt: participant.joinedAt,
     name: participant.identity.name,
@@ -1069,6 +1073,7 @@ export class LiveKitCallsShimSession {
       queues: new Map(),
       trickleCandidates: new Map(),
       jsonMode: false,
+      autoSubscribe: true,
     };
   }
 
@@ -1078,6 +1083,8 @@ export class LiveKitCallsShimSession {
 
   async start(joinRequest: JoinRequestJson): Promise<void> {
     const ws = this.participant.ws;
+    // LiveKit's default is autoSubscribe: true; only an explicit false opts out.
+    this.participant.autoSubscribe = joinRequest.connectionSettings?.autoSubscribe !== false;
     try {
       this.registry.add(this.participant);
     } catch (error) {
@@ -1115,6 +1122,13 @@ export class LiveKitCallsShimSession {
       }
       for (const request of joinRequest.addTrackRequests) this.handleAddTrack(request);
       if (joinRequest.publisherOffer?.sdp) await this.handleOffer(joinRequest.publisherOffer);
+      // The SDK's autoSubscribe clients never ask for existing publications:
+      // bind them into this client's recvonly placeholders now that its
+      // publisher offer SDP is known.
+      for (const other of this.registry.inRoom(this.participant.room)) {
+        if (other.sid === this.participant.sid) continue;
+        await this.bindForAutoSubscriber(this.participant, other.tracks.map((track) => track.sid));
+      }
     } catch (error) {
       this.fail(error);
     }
@@ -1149,7 +1163,7 @@ export class LiveKitCallsShimSession {
           numPublishers: others.length + 1,
         },
         participant: participantInfo(p, 1), // JOINED
-        otherParticipants: others.map((other) => participantInfo(other, other.tracks.length ? 2 : 1)),
+        otherParticipants: others.map((other) => participantInfo(other, other.tracks.length ? 2 : 1, p)),
         serverVersion: 'livekit-calls-shim',
         // JoinResponse.ice_servers = 5. Without this the browser only gathers
         // host candidates and never completes ICE with the Calls SFU.
@@ -1205,11 +1219,15 @@ export class LiveKitCallsShimSession {
     });
   }
 
-  private enqueue(key: string, task: () => Promise<void>): Promise<void> {
-    const previous = this.participant.queues.get(key) ?? Promise.resolve();
+  private enqueueFor<T>(p: ShimParticipant, key: string, task: () => Promise<T>): Promise<T> {
+    const previous = p.queues.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(task);
-    this.participant.queues.set(key, next);
+    p.queues.set(key, next);
     return next;
+  }
+
+  private enqueue(key: string, task: () => Promise<void>): Promise<void> {
+    return this.enqueueFor(this.participant, key, task);
   }
 
   private async onMessage(data: unknown): Promise<void> {
@@ -1380,67 +1398,95 @@ export class LiveKitCallsShimSession {
           value: { cid: track.cid, track: participantTrackInfo(track) },
         });
       }
-      if (published.length) this.broadcastUpdate();
+      if (published.length) {
+        this.broadcastUpdate();
+        // A new publication may arrive while another client is already in
+        // the room. With autoSubscribe the SDK will not request it, so bind
+        // it into each other client's own PC here.
+        const sids = published.map((track) => track.sid);
+        for (const other of this.registry.inRoom(p.room)) {
+          if (other.sid === p.sid) continue;
+          await this.bindForAutoSubscriber(other, sids);
+        }
+      }
       // Calls may set requiresImmediateRenegotiation on a publish; the client
       // offer/answer pair is already complete here, so only the subscriber
       // path (which receives a Calls offer) needs the follow-up exchange.
     });
   }
 
-  /**
-   * Client-driven subscription. In publisher-only mode the SDK owns the only
-   * PeerConnection and silently drops server-generated offers, so instead of
-   * forwarding a Calls offer we pull the remote track into one of the SDK's
-   * own recvonly placeholder m-sections and tell the SDK about the binding
-   * with a TrackInfo.mid in an `update` frame.
-   */
   private async handleSubscription(value: Extract<SignalRequestJson, { message: 'subscription' }>['value']): Promise<void> {
     const p = this.participant;
     if (!p.identity.canSubscribe || value.subscribe === false) return;
     for (const trackSid of value.trackSids ?? []) {
-      const found = this.registry.findTrack(trackSid);
-      if (!found || found.owner.sid === p.sid || p.subscribedMids.has(trackSid)) continue;
-      await this.enqueue('subscriber', async () => {
-        if (this.closed || !p.publisherSessionId) return;
-        const sdp = p.publisherOfferSdp;
-        if (!sdp) {
-          console.log('[livekit-shim] no publisher offer SDP to bind subscription', trackSid);
-          return;
-        }
-        // Local track mids come from Calls' answer and the already-bound
-        // placeholders are in subscribedMids; neither may be reused.
-        const claimed = new Set([...p.subscribedMids.values(), ...p.tracks.map((track) => track.mid)]);
-        const mid = findRecvMid(sdp, found.track.type === 0 ? 'audio' : 'video', claimed);
-        if (!mid) {
-          // Placeholder capacity is bounded by the SDK's offer. A failed
-          // subscription must not tear down the socket or other tracks.
-          console.log('[livekit-shim] no free recvonly placeholder for subscription', trackSid);
-          return;
-        }
-        try {
-          await addTracks(this.env, p.publisherSessionId, {
-            tracks: [{
-              location: 'remote',
-              sessionId: found.track.publisherSessionId,
-              trackName: found.track.callsTrackName,
-              mid,
-            }],
-          });
-        } catch (error) {
-          console.error('[livekit-shim] remote track bind failed:', error instanceof Error ? error.message : String(error));
-          return;
-        }
-        p.subscribedMids.set(trackSid, mid);
-        const owner = participantInfo(found.owner, 2);
-        owner.tracks = found.owner.tracks.map((track) => ({
-          ...participantTrackInfo(track),
-          // Preserve mids of tracks this client already bound; a partial
-          // update still has to describe all of the owner's publications.
-          mid: track.sid === trackSid ? mid : (p.subscribedMids.get(track.sid) ?? track.mid),
-        }));
-        this.send({ message: 'update', value: { participants: [owner] } });
-      });
+      await this.bindRemoteTrack(p, trackSid);
     }
+  }
+
+  /**
+   * Bind a published track into `p`'s single-PC recvonly placeholder. In
+   * publisher-only mode the SDK owns that PeerConnection and silently drops
+   * server-generated offers, so the Calls track is attached by mid and the
+   * binding is announced with a TrackInfo.mid in an `update` frame. `p` may be
+   * another participant: autoSubscribe clients do not send a subscription
+   * request for publications announced by the server, so the shim calls this
+   * proactively on publish and on join as well as on an explicit request.
+   */
+  private async bindRemoteTrack(p: ShimParticipant, trackSid: string): Promise<boolean> {
+    if (p.closed || !p.publisherSessionId) return false;
+    const found = this.registry.findTrack(trackSid);
+    if (!found || found.owner.sid === p.sid || p.subscribedMids.has(trackSid)) return false;
+    return await this.enqueueFor(p, 'subscriber', async () => {
+      if (p.closed || !p.publisherSessionId || p.subscribedMids.has(trackSid)) return false;
+      const sdp = p.publisherOfferSdp;
+      if (!sdp) {
+        console.log('[livekit-shim] no publisher offer SDP to bind subscription', trackSid);
+        return false;
+      }
+      // Local track mids come from Calls' answer and the already-bound
+      // placeholders are in subscribedMids; neither may be reused.
+      const claimed = new Set([...p.subscribedMids.values(), ...p.tracks.map((track) => track.mid)]);
+      const mid = findRecvMid(sdp, found.track.type === 0 ? 'audio' : 'video', claimed);
+      if (!mid) {
+        // Placeholder capacity is bounded by the SDK's offer. A failed
+        // subscription must not tear down the socket or other tracks.
+        console.log('[livekit-shim] no free recvonly placeholder for subscription', trackSid);
+        return false;
+      }
+      try {
+        const result = await addTracks(this.env, p.publisherSessionId, {
+          tracks: [{
+            location: 'remote',
+            sessionId: found.track.publisherSessionId,
+            trackName: found.track.callsTrackName,
+            mid,
+          }],
+        });
+        // Calls can answer HTTP 200 yet reject the track itself. Claiming the
+        // mid then would make the SDK wait for RTP that will never arrive.
+        const rejected = result.tracks.find((track) => track.errorCode);
+        if (rejected) {
+          console.error('[livekit-shim] remote track bind rejected:', rejected.errorCode, rejected.errorDescription);
+          return false;
+        }
+      } catch (error) {
+        console.error('[livekit-shim] remote track bind failed:', error instanceof Error ? error.message : String(error));
+        return false;
+      }
+      p.subscribedMids.set(trackSid, mid);
+      // The receiver's view only carries mids it has itself bound; the
+      // just-bound track is included automatically.
+      const owner = participantInfo(found.owner, 2, p);
+      if (!p.closed) sendFrame(p.ws, { message: 'update', value: { participants: [owner] } }, p.jsonMode);
+      return true;
+    });
+  }
+
+  /** Skip clients that opted out or have no single-PC offer to bind into. */
+  private async bindForAutoSubscriber(receiver: ShimParticipant, trackSids: string[]): Promise<void> {
+    if (receiver.closed || receiver.autoSubscribe === false || !receiver.identity.canSubscribe) return;
+    if (!receiver.publisherOfferSdp) return;
+    for (const trackSid of trackSids) await this.bindRemoteTrack(receiver, trackSid);
   }
 
   private sendCallsOffer(
@@ -1490,10 +1536,12 @@ export class LiveKitCallsShimSession {
   }
 
   private broadcastUpdate(): void {
-    const changed = participantInfo(this.participant, 2);
     for (const other of this.registry.inRoom(this.participant.room)) {
       if (other.sid === this.participant.sid) continue;
-      sendFrame(other.ws, { message: 'update', value: { participants: [changed] } }, other.jsonMode);
+      sendFrame(other.ws, {
+        message: 'update',
+        value: { participants: [participantInfo(this.participant, 2, other)] },
+      }, other.jsonMode);
     }
   }
 
@@ -1507,7 +1555,10 @@ export class LiveKitCallsShimSession {
     p.trickleCandidates.clear();
     this.registry.remove(p.sid);
     for (const other of this.registry.inRoom(p.room)) {
-      sendFrame(other.ws, { message: 'update', value: { participants: [participantInfo(p, 3)] } }, other.jsonMode);
+      sendFrame(other.ws, {
+        message: 'update',
+        value: { participants: [participantInfo(p, 3, other)] },
+      }, other.jsonMode);
     }
     const mids = p.tracks.map((track) => track.mid).filter(Boolean);
     if (p.publisherSessionId && mids.length) {
