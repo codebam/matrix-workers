@@ -43,7 +43,7 @@ import identity from './api/identity';
 import dehydratedDevice from './api/dehydrated-device';
 import delayedEvents from './api/delayed-events';
 import rendezvous from './api/rendezvous';
-// import qrLogin from './api/qr-login'; // QR feature commented out - requires MSC4108/OIDC for Element X
+import qrLogin from './api/qr-login';
 import oidcAuth from './api/oidc-auth';
 import oauth from './api/oauth';
 import { adminDashboardHtml } from './admin/dashboard';
@@ -111,8 +111,8 @@ app.get('/admin/', (c) => {
 // Admin API routes
 app.route('/', admin);
 
-// QR code login landing page - commented out, requires MSC4108/OIDC for Element X
-// app.route('/', qrLogin);
+// QR code login landing + MSC4108 compatible check/redemption routes
+app.route('/', qrLogin);
 
 // OIDC/SSO authentication
 app.route('/', oidcAuth);

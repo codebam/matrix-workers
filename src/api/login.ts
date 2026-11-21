@@ -6,7 +6,7 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { initiateIdpLogin, type IdPProvider } from './oidc-auth';
 import { createVerificationSession, sendVerificationEmail } from '../services/email';
-import { hashPassword, verifyPassword, hashToken, validatePasswordStrength } from '../utils/crypto';
+import { hashPassword, verifyPassword, hashToken, validatePasswordStrength, timingSafeEqual } from '../utils/crypto';
 import {
   formatUserId,
   generateDeviceId,
@@ -29,6 +29,43 @@ import {
 import { requireAuth, extractAccessToken } from '../middleware/auth';
 
 const app = new Hono<AppEnv>();
+
+// ---------------------------------------------------------------------------
+// Login tokens (MSC4108 QR landing + MSC4388 secure out-of-band binding)
+// ---------------------------------------------------------------------------
+
+/** Shape stored under `login_token:<sha256(token)>` in SESSIONS. */
+export interface LoginTokenRecord {
+  user_id: string;
+  expires_at: number;
+  /**
+   * Optional secure out-of-band binding. The raw verifier is derived from the
+   * QR-scanned channel and is never stored; only its SHA-256 is kept here.
+   * Both the QR check route and m.login.token redemption must present it.
+   */
+  secure_oob?: {
+    rendezvous_id: string;
+    verifier_hash: string;
+  };
+}
+
+export function isLoginTokenExpired(record: LoginTokenRecord, now: number = Date.now()): boolean {
+  return now > record.expires_at;
+}
+
+/**
+ * `null` = token has no secure-OOB binding, `true` = verifier matches,
+ * `false` = bound token presented without (or with the wrong) verifier.
+ */
+export async function matchesLoginTokenVerifier(
+  record: LoginTokenRecord,
+  verifier: unknown
+): Promise<boolean | null> {
+  if (!record.secure_oob) return null;
+  if (typeof verifier !== 'string' || verifier.length === 0 || verifier.length > 512) return false;
+  const presentedHash = await hashToken(verifier);
+  return timingSafeEqual(presentedHash, record.secure_oob.verifier_hash);
+}
 
 // The admin portal's registration toggle lives in the Admin Durable Object.
 // Enforce it here; when the binding is absent (tests) or unreadable, fall back
@@ -135,7 +172,7 @@ app.post('/_matrix/client/v3/login', async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  const { type, identifier, password, token, device_id, initial_device_display_name } = body;
+  const { type, identifier, password, token, verifier, device_id, initial_device_display_name } = body;
 
   let userId: string;
 
@@ -147,20 +184,24 @@ app.post('/_matrix/client/v3/login', async (c) => {
 
     // Look up the token in KV
     const tokenHash = await hashToken(token);
-    const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as {
-      user_id: string;
-      expires_at: number;
-    } | null;
+    const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
 
     if (!tokenData) {
       return Errors.forbidden('Invalid or expired login token').toResponse();
     }
 
     // Check expiration
-    if (Date.now() > tokenData.expires_at) {
+    if (isLoginTokenExpired(tokenData)) {
       // Clean up expired token
       await c.env.SESSIONS.delete(`login_token:${tokenHash}`);
       return Errors.forbidden('Login token has expired').toResponse();
+    }
+
+    // MSC4388 secure out-of-band: a bound token is redeemable only by the
+    // device that can present the verifier exchanged over the QR channel.
+    // Verify BEFORE burning the token so a wrong verifier stays retryable.
+    if (await matchesLoginTokenVerifier(tokenData, verifier) === false) {
+      return Errors.forbidden('Invalid QR verifier').toResponse();
     }
 
     userId = tokenData.user_id;
@@ -633,6 +674,48 @@ app.post('/_matrix/client/v3/register/msisdn/requestToken', async (c) => {
 app.post('/_matrix/client/v1/login/get_token', requireAuth(), async (c) => {
   const userId = c.get('userId');
 
+  // Optional MSC4388 secure out-of-band binding. A logged-in device creates
+  // the rendezvous channel and derives a high-entropy verifier from the QR
+  // exchange; the server stores only its hash. Requests without these fields
+  // keep the original token shape/response (plain MSC4108-style token).
+  let secureOob: LoginTokenRecord['secure_oob'];
+  const rawBody = await c.req.text();
+  if (rawBody) {
+    let parsed: { rendezvous_id?: unknown; verifier?: unknown } | null;
+    try {
+      parsed = JSON.parse(rawBody);
+    } catch {
+      return Errors.badJson().toResponse();
+    }
+    const rendezvousId = parsed?.rendezvous_id;
+    const verifier = parsed?.verifier;
+    if (rendezvousId !== undefined || verifier !== undefined) {
+      if (rendezvousId === undefined) {
+        return Errors.missingParam('rendezvous_id').toResponse();
+      }
+      if (verifier === undefined) {
+        return Errors.missingParam('verifier').toResponse();
+      }
+      if (
+        typeof rendezvousId !== 'string' ||
+        rendezvousId.length === 0 ||
+        rendezvousId.length > 255
+      ) {
+        return Errors.invalidParam(
+          'rendezvous_id',
+          'rendezvous_id must be a non-empty string of at most 255 characters'
+        ).toResponse();
+      }
+      if (typeof verifier !== 'string' || verifier.length < 8 || verifier.length > 512) {
+        return Errors.invalidParam(
+          'verifier',
+          'verifier must be a string of 8 to 512 characters'
+        ).toResponse();
+      }
+      secureOob = { rendezvous_id: rendezvousId, verifier_hash: await hashToken(verifier) };
+    }
+  }
+
   // Generate a login token
   const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
   const loginToken = btoa(String.fromCharCode(...tokenBytes))
@@ -646,12 +729,14 @@ app.post('/_matrix/client/v1/login/get_token', requireAuth(), async (c) => {
 
   // Store the token in KV with TTL
   const tokenHash = await hashToken(loginToken);
+  const record: LoginTokenRecord = {
+    user_id: userId,
+    expires_at: expiresAt,
+    ...(secureOob ? { secure_oob: secureOob } : {}),
+  };
   await c.env.SESSIONS.put(
     `login_token:${tokenHash}`,
-    JSON.stringify({
-      user_id: userId,
-      expires_at: expiresAt,
-    }),
+    JSON.stringify(record),
     {
       expirationTtl: 120, // 2 minutes in seconds
     }
@@ -660,6 +745,7 @@ app.post('/_matrix/client/v1/login/get_token', requireAuth(), async (c) => {
   return c.json({
     login_token: loginToken,
     expires_in_ms: expiresInMs,
+    ...(secureOob ? { secure_oob: true } : {}),
   });
 });
 

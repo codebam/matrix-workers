@@ -150,4 +150,167 @@ for (const prefix of PREFIXES) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// MSC4388 secure QR channel — stable v1 JSON rendezvous transport
+// ---------------------------------------------------------------------------
+//
+// The unstable byte-channel API above implements MSC3886/3906 (ETag based).
+// MSC4388 uses a JSON API with a sequence token, a client-generated txnId for
+// idempotent writes, and a 409 M_CONCURRENT_WRITE on stale writes. Both live
+// here so no new binding or schema is needed.
+
+const V1_MAX_DATA_BYTES = 4096;
+const V1_TTL_SECONDS = 300; // MSC4388: 120s..300s
+
+interface V1RendezvousSession {
+  data: string; // base64 of the UTF-8 payload
+  sequenceToken: number;
+  created: number;
+  expires: number;
+  // txnId -> resulting sequence token; lets clients safely retry a PUT.
+  txnResults: Record<string, number>;
+}
+
+const V1_PREFIXES = [
+  {
+    path: '/_matrix/client/v1/rendezvous',
+    concurrentWriteErrcode: 'M_CONCURRENT_WRITE',
+  },
+  {
+    path: '/_matrix/client/unstable/io.element.msc4388/rendezvous',
+    concurrentWriteErrcode: 'IO_ELEMENT_MSC4388_CONCURRENT_WRITE',
+  },
+];
+
+function v1Key(prefix: string, id: string): string {
+  return `rendezvous:v1:${prefix}:${id}`;
+}
+
+async function loadV1Session(c: any, prefix: string, id: string): Promise<V1RendezvousSession | null> {
+  return c.env.SESSIONS.get(v1Key(prefix, id), 'json') as Promise<V1RendezvousSession | null>;
+}
+
+function v1ExpiresIn(session: V1RendezvousSession): number {
+  return Math.max(0, session.expires - Date.now());
+}
+
+async function readV1Json(c: any): Promise<Record<string, unknown> | null> {
+  try {
+    const parsed = await c.req.json();
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function v1Utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+for (const { path: prefix, concurrentWriteErrcode } of V1_PREFIXES) {
+  // Discovery — clients use this to decide whether QR login is available.
+  app.get(prefix, (c) => c.json({ create_available: true }));
+
+  // Create a session with an initial payload (usually the empty string).
+  app.post(prefix, async (c) => {
+    const body = await readV1Json(c);
+    if (!body) return Errors.badJson().toResponse();
+    if (typeof body.data !== 'string') {
+      return Errors.missingParam('data').toResponse();
+    }
+    if (v1Utf8Bytes(body.data) > V1_MAX_DATA_BYTES) {
+      return Errors.tooLarge(`Rendezvous data exceeds ${V1_MAX_DATA_BYTES} bytes`).toResponse();
+    }
+
+    const now = Date.now();
+    const id = crypto.randomUUID();
+    const session: V1RendezvousSession = {
+      data: toBase64(new TextEncoder().encode(body.data)),
+      sequenceToken: 1,
+      created: now,
+      expires: now + V1_TTL_SECONDS * 1000,
+      txnResults: {},
+    };
+    await c.env.SESSIONS.put(v1Key(prefix, id), JSON.stringify(session), {
+      expirationTtl: V1_TTL_SECONDS,
+    });
+    return c.json({ id, sequence_token: '1', expires_in_ms: v1ExpiresIn(session) });
+  });
+
+  // Read the current payload.
+  app.get(`${prefix}/:id`, async (c) => {
+    // MSC4388: refuse unsafe top-level navigation to a rendezvous read.
+    if (c.req.header('Sec-Fetch-Mode') === 'navigate' &&
+        c.req.header('Sec-Fetch-Dest') === 'document') {
+      return Errors.forbidden('Rendezvous sessions cannot be opened as a document').toResponse();
+    }
+    const session = await loadV1Session(c, prefix, c.req.param('id'));
+    if (!session) return Errors.notFound('Unknown rendezvous session').toResponse();
+    return c.json({
+      data: new TextDecoder().decode(fromBase64(session.data)),
+      sequence_token: String(session.sequenceToken),
+      expires_in_ms: v1ExpiresIn(session),
+    });
+  });
+
+  // Compare-and-swap write. txnId is checked before the body, per MSC4388.
+  app.put(`${prefix}/:id/:txnId`, async (c) => {
+    const id = c.req.param('id');
+    const txnId = c.req.param('txnId');
+    const session = await loadV1Session(c, prefix, id);
+    if (!session) return Errors.notFound('Unknown rendezvous session').toResponse();
+
+    const recorded = session.txnResults[txnId];
+    if (recorded !== undefined) {
+      return c.json({ sequence_token: String(recorded) });
+    }
+
+    const body = await readV1Json(c);
+    if (!body) return Errors.badJson().toResponse();
+    if (typeof body.sequence_token !== 'string') {
+      return Errors.missingParam('sequence_token').toResponse();
+    }
+    if (typeof body.data !== 'string') {
+      return Errors.missingParam('data').toResponse();
+    }
+    if (v1Utf8Bytes(body.data) > V1_MAX_DATA_BYTES) {
+      return Errors.tooLarge(`Rendezvous data exceeds ${V1_MAX_DATA_BYTES} bytes`).toResponse();
+    }
+    if (body.sequence_token !== String(session.sequenceToken)) {
+      return c.json(
+        {
+          errcode: concurrentWriteErrcode,
+          error: 'The rendezvous payload was modified concurrently',
+        },
+        409
+      );
+    }
+
+    const nextToken = session.sequenceToken + 1;
+    session.data = toBase64(new TextEncoder().encode(body.data));
+    session.sequenceToken = nextToken;
+    session.expires = Date.now() + V1_TTL_SECONDS * 1000;
+    // Reject duplicate txnIds per session; keep the map bounded to the
+    // session lifetime (300s) so it cannot grow without limit.
+    if (Object.keys(session.txnResults).length >= 128) {
+      session.txnResults = {};
+    }
+    session.txnResults[txnId] = nextToken;
+    await c.env.SESSIONS.put(v1Key(prefix, id), JSON.stringify(session), {
+      expirationTtl: V1_TTL_SECONDS,
+    });
+    return c.json({ sequence_token: String(nextToken) });
+  });
+
+  // Cancel — MSC4388 returns 200 {} rather than 204.
+  app.delete(`${prefix}/:id`, async (c) => {
+    const session = await loadV1Session(c, prefix, c.req.param('id'));
+    if (!session) return Errors.notFound('Unknown rendezvous session').toResponse();
+    await c.env.SESSIONS.delete(v1Key(prefix, c.req.param('id')));
+    return c.json({});
+  });
+}
+
 export default app;

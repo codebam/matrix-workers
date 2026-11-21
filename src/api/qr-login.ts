@@ -2,8 +2,15 @@
 // When users scan a QR code, they're directed here to complete login
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppEnv } from '../types';
 import { hashToken } from '../utils/crypto';
+import { Errors } from '../utils/errors';
+import login, {
+  isLoginTokenExpired,
+  matchesLoginTokenVerifier,
+  type LoginTokenRecord,
+} from './login';
 
 const app = new Hono<AppEnv>();
 
@@ -380,14 +387,28 @@ function generateQrLandingPage(
 </html>`;
 }
 
+/**
+ * The legacy landing routes only accept the `mlt_` prefixed tokens used by
+ * the admin QR URL. The namespaced routes additionally accept the raw
+ * URL-safe base64 tokens minted by POST /_matrix/client/v1/login/get_token.
+ */
+function isQrToken(token: string, allowIssuedToken = false): boolean {
+  if (!token || token.length > 512) return false;
+  if (allowIssuedToken) return /^[A-Za-z0-9_.-]{8,}$/.test(token);
+  return token.startsWith('mlt_');
+}
+
 // Landing page for QR code login
-app.get('/login/qr/:token', async (c) => {
+async function handleLanding(
+  c: Context<AppEnv>,
+  token: string,
+  allowIssuedToken = false
+): Promise<Response> {
   // The URL embeds a live login token: never cache this response (audit 010.6).
   c.header('Cache-Control', 'no-store');
-  const token = c.req.param('token');
 
   // Validate token format
-  if (!token || !token.startsWith('mlt_')) {
+  if (!isQrToken(token, allowIssuedToken)) {
     return c.html(`<!DOCTYPE html>
 <html><head><title>Invalid Token</title>
 <style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#0f172a;color:#f1f5f9;}
@@ -398,10 +419,7 @@ h1{color:#ef4444;}</style></head>
 
   // Look up the token
   const tokenHash = await hashToken(token);
-  const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as {
-    user_id: string;
-    expires_at: number;
-  } | null;
+  const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
 
   if (!tokenData) {
     return c.html(`<!DOCTYPE html>
@@ -413,7 +431,7 @@ h1{color:#f59e0b;}</style></head>
   }
 
   // Check if expired
-  if (Date.now() > tokenData.expires_at) {
+  if (isLoginTokenExpired(tokenData)) {
     // Clean up
     await c.env.SESSIONS.delete(`login_token:${tokenHash}`);
     return c.html(`<!DOCTYPE html>
@@ -431,9 +449,12 @@ h1{color:#f59e0b;}</style></head>
     tokenData.user_id,
     tokenData.expires_at
   ));
-});
+}
 
-// API endpoint to check token validity (for JS-based login)
+app.get('/login/qr/:token', (c) => handleLanding(c, c.req.param('token') ?? ''));
+
+// API endpoint to check token validity (for JS-based login). Deliberately
+// non-consuming: m.login.token remains the single redemption path.
 app.get('/login/qr/:token/check', async (c) => {
   c.header('Cache-Control', 'no-store');
   const token = c.req.param('token');
@@ -443,16 +464,13 @@ app.get('/login/qr/:token/check', async (c) => {
   }
 
   const tokenHash = await hashToken(token);
-  const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as {
-    user_id: string;
-    expires_at: number;
-  } | null;
+  const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
 
   if (!tokenData) {
     return c.json({ valid: false, error: 'Token not found or expired' }, 404);
   }
 
-  if (Date.now() > tokenData.expires_at) {
+  if (isLoginTokenExpired(tokenData)) {
     return c.json({ valid: false, error: 'Token expired' }, 400);
   }
 
@@ -463,5 +481,117 @@ app.get('/login/qr/:token/check', async (c) => {
     expires_at: tokenData.expires_at,
   });
 });
+
+// ---------------------------------------------------------------------------
+// QR landing/check routes + secure out-of-band (MSC4388-style) verification
+// ---------------------------------------------------------------------------
+//
+// The legacy /login/qr/... routes above are kept byte-for-byte compatible for
+// existing clients. The namespaced routes below are this fork's landing/check
+// compatibility surface: MSC4108 itself uses OAuth 2.0 device authorization
+// (already implemented in oauth.ts), while MSC4388 defines the rendezvous
+// transport and the two-device HPKE/CheckCode exchange. These routes reuse
+// the same login-token KV records; no schema changes or new secrets involved.
+
+const QR_PREFIXES = [
+  '/_matrix/client/v1/login/qr',
+  '/_matrix/client/unstable/org.matrix.msc4108/login/qr',
+];
+
+async function handleCanonicalCheck(
+  c: Context<AppEnv>,
+  token: string,
+  verifier: unknown
+): Promise<Response> {
+  c.header('Cache-Control', 'no-store');
+  if (!isQrToken(token, true)) {
+    return Errors.invalidParam('token', 'Invalid token format').toResponse();
+  }
+
+  const tokenHash = await hashToken(token);
+  const record = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
+  if (!record) {
+    return Errors.notFound('Login token not found or expired').toResponse();
+  }
+  if (isLoginTokenExpired(record)) {
+    return Errors.forbidden('Login token has expired').toResponse();
+  }
+
+  // A bound token must present the verifier exchanged over the QR channel.
+  // Checking this here lets the scanning device fail fast; m.login.token and
+  // /-/login independently enforce the same binding before consuming it.
+  const verifierMatches = await matchesLoginTokenVerifier(record, verifier);
+  if (verifierMatches === false) {
+    return Errors.forbidden('Invalid QR verifier').toResponse();
+  }
+
+  return c.json({
+    valid: true,
+    user_id: record.user_id,
+    homeserver: c.env.SERVER_NAME,
+    expires_at: record.expires_at,
+    expires_in_ms: Math.max(0, record.expires_at - Date.now()),
+    secure_oob: verifierMatches === true,
+  });
+}
+
+for (const prefix of QR_PREFIXES) {
+  // Landing page (HTML). Cache-Control: no-store is set by handleLanding.
+  app.get(`${prefix}/:token`, (c) => handleLanding(c, c.req.param('token') ?? '', true));
+
+  // Non-consuming check. GET is for legacy polling; POST accepts the
+  // secure-OOB verifier in the body (never in the URL, to avoid logs).
+  app.get(`${prefix}/:token/check`, (c) =>
+    handleCanonicalCheck(c, c.req.param('token') ?? '', undefined)
+  );
+  app.post(`${prefix}/:token/check`, async (c) => {
+    let body: { verifier?: unknown } = {};
+    const raw = await c.req.text();
+    if (raw) {
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return Errors.badJson().toResponse();
+      }
+    }
+    return handleCanonicalCheck(c, c.req.param('token') ?? '', body.verifier);
+  });
+
+  // Final, single-use step: delegate to the existing m.login.token handler so
+  // token consumption, device creation and access-token minting stay in one
+  // place. Wrong/missing verifier is rejected there without burning the token.
+  app.post(`${prefix}/:token/-/login`, async (c) => {
+    const token = c.req.param('token') ?? '';
+    if (!isQrToken(token, true)) {
+      return Errors.invalidParam('token', 'Invalid token format').toResponse();
+    }
+    let body: { verifier?: unknown; device_id?: unknown; initial_device_display_name?: unknown } = {};
+    const raw = await c.req.text();
+    if (raw) {
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return Errors.badJson().toResponse();
+      }
+    }
+    return login.request(
+      `https://${c.env.SERVER_NAME}/_matrix/client/v3/login`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: 'm.login.token',
+          token,
+          ...(typeof body.verifier === 'string' ? { verifier: body.verifier } : {}),
+          ...(typeof body.device_id === 'string' ? { device_id: body.device_id } : {}),
+          ...(typeof body.initial_device_display_name === 'string'
+            ? { initial_device_display_name: body.initial_device_display_name }
+            : {}),
+        }),
+      },
+      c.env
+    );
+  });
+}
 
 export default app;
