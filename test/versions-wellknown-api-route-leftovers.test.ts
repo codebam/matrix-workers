@@ -1301,7 +1301,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-0');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-1', async () => {
     const e = env({
@@ -1320,7 +1320,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-1');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-2', async () => {
     const e = env({
@@ -1339,7 +1339,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-2');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-3', async () => {
     const e = env({
@@ -1358,7 +1358,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-3');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-4', async () => {
     const e = env({
@@ -1377,7 +1377,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-4');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-5', async () => {
     const e = env({
@@ -1396,7 +1396,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-5');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-6', async () => {
     const e = env({
@@ -1415,7 +1415,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-6');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-7', async () => {
     const e = env({
@@ -1434,7 +1434,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-7');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-8', async () => {
     const e = env({
@@ -1453,7 +1453,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-8');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-9', async () => {
     const e = env({
@@ -1472,7 +1472,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-9');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-10', async () => {
     const e = env({
@@ -1491,7 +1491,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-10');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-11', async () => {
     const e = env({
@@ -1510,7 +1510,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-11');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-12', async () => {
     const e = env({
@@ -1529,7 +1529,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-12');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-13', async () => {
     const e = env({
@@ -1548,7 +1548,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-13');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-14', async () => {
     const e = env({
@@ -1567,7 +1567,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-14');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
   it('discovery lifecycle soft-15', async () => {
     const e = env({
@@ -1586,7 +1586,7 @@ describe('versions leftovers lifecycle soft floods after #157', () => {
     const fed = await get('/_matrix/federation/v1/version', e);
     expect(fed.body.server.version).toBe('life-15');
     const vers = await get('/_matrix/client/versions', e);
-    expect(vers.body.versions.at(-1)).toBe('v1.17');
+    expect(vers.body.versions.at(-1)).toBe('v1.19');
   });
 });
 

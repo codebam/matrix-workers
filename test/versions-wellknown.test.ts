@@ -233,7 +233,7 @@ describe('versions module /.well-known/matrix/support', () => {
 });
 
 describe('versions module /_matrix/client/versions', () => {
-  it('returns the full CS API versions list ending in v1.17', async () => {
+  it('returns the full CS API versions list ending in v1.19', async () => {
     const { status, body } = await getJson('/_matrix/client/versions');
     expect(status).toBe(200);
     expect(body.versions).toEqual([
@@ -262,6 +262,8 @@ describe('versions module /_matrix/client/versions', () => {
       'v1.15',
       'v1.16',
       'v1.17',
+      'v1.18',
+      'v1.19',
     ]);
   });
 

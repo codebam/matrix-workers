@@ -12,11 +12,21 @@ import type { Env, PDU } from '../src/types';
 import { hashToken, generateSigningKeyPair } from '../src/utils/crypto';
 import { computeWireEventId } from '../src/utils/event-signing';
 
+// MSC4323 tests flip this to drive the suspended-account redaction
+// refinement without changing the middleware mock's other behavior.
+const authModeration = vi.hoisted(() => ({ suspended: false }));
+
 vi.mock('../src/middleware/auth', () => ({
   requireAuth: () => {
     return async (c: { set: (k: string, v: unknown) => void }, next: () => Promise<void>) => {
       c.set('userId', '@alice:example.com');
       c.set('deviceId', 'DEVICEA');
+      c.set(
+        'auth',
+        authModeration.suspended
+          ? { userId: '@alice:example.com', deviceId: 'DEVICEA', accessToken: 't', suspended: true }
+          : { userId: '@alice:example.com', deviceId: 'DEVICEA', accessToken: 't' }
+      );
       await next();
     };
   },
@@ -153,6 +163,8 @@ type DbOpts = {
     origin_server_ts?: number;
     unsigned?: string | null;
   }>;
+  mutualRooms?: string[];
+  mutualRoomsTotal?: number;
 };
 
 function createSqlDb(opts: DbOpts = {}) {
@@ -172,6 +184,8 @@ function createSqlDb(opts: DbOpts = {}) {
   const remoteJoinedUserIds = opts.remoteJoinedUserIds ?? [];
   const remoteTip = opts.remoteTip ?? null;
   const stateRows = opts.stateRows ?? [];
+  const mutualRooms = opts.mutualRooms ?? [];
+  const mutualRoomsTotal = opts.mutualRoomsTotal ?? mutualRooms.length;
   const inserts: SqlCall[] = [];
   const updates: SqlCall[] = [];
   const deletes: SqlCall[] = [];
@@ -275,6 +289,11 @@ function createSqlDb(opts: DbOpts = {}) {
                 return remoteTip as T;
               }
 
+              // MSC2666 mutual_rooms: total joined-room count.
+              if (sql.includes('SELECT COUNT(*) AS total FROM room_memberships a')) {
+                return { total: mutualRoomsTotal } as T;
+              }
+
               return null as T;
             },
 
@@ -335,6 +354,19 @@ function createSqlDb(opts: DbOpts = {}) {
 
               if (sql.includes('room_state rs JOIN events e')) {
                 return { results: stateRows as T[] };
+              }
+
+              // MSC2666 mutual_rooms: cursor-paginated joined-room list.
+              // args: [requester, target, fromCursor, limit]
+              if (sql.includes('SELECT a.room_id FROM room_memberships a')) {
+                const cursor = (args[2] as string) ?? '';
+                const limit = args[3] as number;
+                return {
+                  results: mutualRooms
+                    .filter((r) => r > cursor)
+                    .slice(0, limit)
+                    .map((room_id) => ({ room_id })) as T[],
+                };
               }
 
               return { results: [] as T[] };
@@ -3332,5 +3364,266 @@ describe('POST /rooms/:roomId/upgrade', () => {
     expect(types).toContain('m.room.join_rules');
     expect(types).toContain('m.room.history_visibility');
     expect(types).toContain('m.room.tombstone');
+  });
+});
+
+describe('spec v1.18/v1.19 conformance additions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  // -------------------------------------------------------------------
+  // GET /_matrix/client/v1/mutual_rooms — MSC2666, stable since v1.19
+  // -------------------------------------------------------------------
+  it('mutual_rooms: 400s without user_id', async () => {
+    const { status, body } = await request('/_matrix/client/v1/mutual_rooms');
+    expect(status).toBe(400);
+    expect(body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('mutual_rooms: 400s for own user id', async () => {
+    const { status, body } = await request(
+      `/_matrix/client/v1/mutual_rooms?user_id=${encodeURIComponent(USER)}`
+    );
+    expect(status).toBe(400);
+    expect(body).toMatchObject({ errcode: 'M_INVALID_PARAM' });
+  });
+
+  it('mutual_rooms: 400s for malformed user id', async () => {
+    const { status } = await request('/_matrix/client/v1/mutual_rooms?user_id=notanid');
+    expect(status).toBe(400);
+  });
+
+  it('mutual_rooms: 400s for malformed from token', async () => {
+    const { status } = await request(
+      `/_matrix/client/v1/mutual_rooms?user_id=${encodeURIComponent(BOB)}&from=garbage`
+    );
+    expect(status).toBe(400);
+  });
+
+  it('mutual_rooms: returns joined rooms with total count, no next_batch', async () => {
+    const db = createSqlDb({
+      mutualRooms: ['!a:example.com', '!b:example.com'],
+      mutualRoomsTotal: 2,
+    });
+    const { status, body } = await request(
+      `/_matrix/client/v1/mutual_rooms?user_id=${encodeURIComponent(BOB)}`,
+      jsonInit('GET'),
+      db
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      count: 2,
+      joined: ['!a:example.com', '!b:example.com'],
+    });
+  });
+
+  it('mutual_rooms: honors the from cursor', async () => {
+    const db = createSqlDb({
+      mutualRooms: ['!a:example.com', '!b:example.com', '!c:remote.org'],
+      mutualRoomsTotal: 3,
+    });
+    const { status, body } = await request(
+      `/_matrix/client/v1/mutual_rooms?user_id=${encodeURIComponent(BOB)}&from=${encodeURIComponent('!b:example.com')}`,
+      jsonInit('GET'),
+      db
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({
+      count: 3,
+      joined: ['!c:remote.org'],
+    });
+  });
+
+  it('mutual_rooms: unknown target user is an empty 200, not 404', async () => {
+    const db = createSqlDb({ mutualRooms: [], mutualRoomsTotal: 0 });
+    const { status, body } = await request(
+      `/_matrix/client/v1/mutual_rooms?user_id=${encodeURIComponent('@ghost:remote.org')}`,
+      jsonInit('GET'),
+      db
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ count: 0, joined: [] });
+  });
+
+  // -------------------------------------------------------------------
+  // m.room.redaction via PUT /send — MSC4169, stable since v1.18
+  // -------------------------------------------------------------------
+  it('send redaction: routes through the redaction pipeline', async () => {
+    getMembership.mockResolvedValue(joinMembership());
+    getEvent.mockResolvedValue(
+      pdu({
+        type: 'm.room.message',
+        event_id: EVENT,
+        sender: USER,
+        content: { body: 'mine', msgtype: 'm.text' },
+      })
+    );
+    const db = createSqlDb();
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.redaction/tx1`,
+      jsonInit('PUT', { redacts: EVENT, reason: 'bye' }),
+      db
+    );
+    expect(status).toBe(200);
+    expect(body).toEqual({ event_id: '$evt:example.com' });
+    expect(storeEvent.mock.calls[0][1]).toMatchObject({
+      type: 'm.room.redaction',
+      content: { redacts: EVENT, reason: 'bye' },
+      redacts: EVENT,
+      unsigned: { transaction_id: 'tx1' },
+    });
+    expect(db.updates.some((u) => u.sql.includes('redacted_because'))).toBe(true);
+  });
+
+  it('send redaction: 400 without redacts', async () => {
+    getMembership.mockResolvedValue(joinMembership());
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.redaction/tx2`,
+      jsonInit('PUT', { reason: 'no target' })
+    );
+    expect(status).toBe(400);
+    expect(body).toMatchObject({ errcode: 'M_MISSING_PARAM' });
+  });
+
+  it('send redaction: enforces redact power for other users events', async () => {
+    getMembership.mockResolvedValue(joinMembership());
+    getEvent.mockResolvedValue(
+      pdu({
+        type: 'm.room.message',
+        event_id: EVENT,
+        sender: BOB,
+        content: { body: 'x', msgtype: 'm.text' },
+      })
+    );
+    defaultState({
+      'm.room.power_levels': pdu({
+        type: 'm.room.power_levels',
+        event_id: '$pl',
+        content: { users: { [USER]: 10 }, redact: 50, users_default: 0 },
+        state_key: '',
+      }),
+    });
+    const { status } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.redaction/tx3`,
+      jsonInit('PUT', { redacts: EVENT })
+    );
+    expect(status).toBe(403);
+  });
+
+  // -------------------------------------------------------------------
+  // unsigned.replaces_state on state events — spec v1.19
+  // -------------------------------------------------------------------
+  it('state: unsigned.replaces_state carries the replaced event id', async () => {
+    getMembership.mockResolvedValue(joinMembership());
+    getRoomEvents.mockResolvedValue({ events: [], end: 0 });
+    defaultState({
+      'm.room.topic': pdu({
+        type: 'm.room.topic',
+        event_id: '$old-topic',
+        content: { topic: 'old' },
+        state_key: '',
+      }),
+    });
+    const { status } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/state/m.room.topic`,
+      jsonInit('PUT', { topic: 'new' })
+    );
+    expect(status).toBe(200);
+    const stored = storeEvent.mock.calls.at(-1)![1] as PDU;
+    expect(stored.unsigned).toMatchObject({ replaces_state: '$old-topic' });
+  });
+
+  it('state: no replaces_state when the slot was empty', async () => {
+    getMembership.mockResolvedValue(joinMembership());
+    getRoomEvents.mockResolvedValue({ events: [], end: 0 });
+    defaultState({});
+    const { status } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/state/m.room.topic`,
+      jsonInit('PUT', { topic: 'first' })
+    );
+    expect(status).toBe(200);
+    const stored = storeEvent.mock.calls.at(-1)![1] as PDU;
+    expect(stored.unsigned?.replaces_state).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------
+  // m.forget_forced_upon_leave — MSC4267, stable since v1.18
+  // -------------------------------------------------------------------
+  it('leave: auto-forgets the room (MSC4267)', async () => {
+    getMembership.mockResolvedValue(joinMembership());
+    getRoomEvents.mockResolvedValue({ events: [], end: 0 });
+    const db = createSqlDb({
+      membershipRows: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
+    });
+    const { status } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/leave`,
+      jsonInit('POST', {}),
+      db
+    );
+    expect(status).toBe(200);
+    expect(db.deletes.some((d) => d.sql.includes('DELETE FROM room_memberships'))).toBe(true);
+    expect(db.membershipRows.find((m) => m.user_id === USER)).toBeUndefined();
+  });
+
+  // -------------------------------------------------------------------
+  // MSC4323: suspended accounts may only redact their own events
+  // -------------------------------------------------------------------
+  it('redact: suspended users cannot redact other users events', async () => {
+    authModeration.suspended = true;
+    try {
+      getMembership.mockResolvedValue(joinMembership());
+      getEvent.mockResolvedValue(
+        pdu({
+          type: 'm.room.message',
+          event_id: EVENT,
+          sender: BOB,
+          content: { body: 'x', msgtype: 'm.text' },
+        })
+      );
+      // High power level: without the suspension check the redaction
+      // would be authorized — proving the 403 comes from MSC4323.
+      defaultState({
+        'm.room.power_levels': pdu({
+          type: 'm.room.power_levels',
+          event_id: '$pl',
+          content: { users: { [USER]: 100 }, redact: 50, users_default: 0 },
+          state_key: '',
+        }),
+      });
+      const { status, body } = await request(
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/redact/${EVENT_ENC}/txs`,
+        jsonInit('PUT', { reason: 'no' })
+      );
+      expect(status).toBe(403);
+      expect(body).toMatchObject({ errcode: 'M_USER_SUSPENDED' });
+      expect(storeEvent).not.toHaveBeenCalled();
+    } finally {
+      authModeration.suspended = false;
+    }
+  });
+
+  it('send redaction: suspended users can still redact their own events', async () => {
+    authModeration.suspended = true;
+    try {
+      getMembership.mockResolvedValue(joinMembership());
+      getEvent.mockResolvedValue(
+        pdu({
+          type: 'm.room.message',
+          event_id: EVENT,
+          sender: USER,
+          content: { body: 'mine', msgtype: 'm.text' },
+        })
+      );
+      defaultState({});
+      const { status } = await request(
+        `/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.redaction/txs`,
+        jsonInit('PUT', { redacts: EVENT, reason: 'cleanup' })
+      );
+      expect(status).toBe(200);
+      expect(storeEvent).toHaveBeenCalled();
+    } finally {
+      authModeration.suspended = false;
+    }
   });
 });

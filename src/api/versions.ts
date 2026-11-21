@@ -192,6 +192,8 @@ app.get('/_matrix/client/versions', (c) => {
       'v1.15',
       'v1.16',
       'v1.17',
+      'v1.18',
+      'v1.19',
     ],
     unstable_features: {
       // Authenticated media (MSC3916) is stable since v1.17; clients probe

@@ -1,7 +1,7 @@
 /**
  * Regression coverage for the four notable MSC additions:
  *  - MSC4222: /sync joined rooms carry state_after (current state).
- *  - MSC4155: invite endpoints 403 ORG.MATRIX.MSC4155.M_INVITE_BLOCKED on a
+ *  - MSC4155/MSC4380: invite endpoints 403 M_INVITE_BLOCKED on a
  *    'block' decision; 'ignore' withholds the invite from /sync.
  *  - MSC4140: delayed event create/get/send/cancel/restart/update plus the
  *    alarm dispatcher, limits and finalised-state idempotency.
@@ -378,11 +378,11 @@ describe('MSC4222 state_after in /sync', () => {
 });
 
 // ---------------------------------------------------------------------------
-// MSC4155 — invite blocking / ignoring
+// MSC4155/MSC4380 — invite blocking / ignoring
 // ---------------------------------------------------------------------------
 
 describe('MSC4155 invite filtering', () => {
-  it('POST /rooms/:id/invite 403s with ORG.MATRIX.MSC4155.M_INVITE_BLOCKED', async () => {
+  it('POST /rooms/:id/invite 403s with M_INVITE_BLOCKED', async () => {
     getInvitePermission.mockResolvedValue('block');
     const env = createEnv();
     const res = await roomsApp.request(
@@ -391,7 +391,7 @@ describe('MSC4155 invite filtering', () => {
       env
     );
     expect(res.status).toBe(403);
-    expect((await json(res)).errcode).toBe('ORG.MATRIX.MSC4155.M_INVITE_BLOCKED');
+    expect((await json(res)).errcode).toBe('M_INVITE_BLOCKED');
     expect(getInvitePermission).toHaveBeenCalledWith(env.DB, BOB, USER);
   });
 
@@ -404,7 +404,7 @@ describe('MSC4155 invite filtering', () => {
       env
     );
     expect(res.status).toBe(403);
-    expect((await json(res)).errcode).toBe('ORG.MATRIX.MSC4155.M_INVITE_BLOCKED');
+    expect((await json(res)).errcode).toBe('M_INVITE_BLOCKED');
   });
 
   it('state-endpoint invites are blocked too', async () => {
@@ -416,7 +416,7 @@ describe('MSC4155 invite filtering', () => {
       env
     );
     expect(res.status).toBe(403);
-    expect((await json(res)).errcode).toBe('ORG.MATRIX.MSC4155.M_INVITE_BLOCKED');
+    expect((await json(res)).errcode).toBe('M_INVITE_BLOCKED');
   });
 
   it('federation v2 invite 403s for a blocked inviter', async () => {
@@ -442,7 +442,7 @@ describe('MSC4155 invite filtering', () => {
       env
     );
     expect(res.status).toBe(403);
-    expect((await json(res)).errcode).toBe('ORG.MATRIX.MSC4155.M_INVITE_BLOCKED');
+    expect((await json(res)).errcode).toBe('M_INVITE_BLOCKED');
   });
 
   it("'ignore' withholds the invite from /sync but 'allow' shows it", async () => {

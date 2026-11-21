@@ -5,7 +5,7 @@ import type { Context } from 'hono';
 import type { AppEnv, Env, RoomCreateContent, RoomMemberContent, PDU } from '../types';
 import { Errors, MatrixApiError } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias, generateOpaqueId } from '../utils/ids';
+import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias, generateOpaqueId, parseUserId } from '../utils/ids';
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
 import { calculateContentHash, sha256 } from '../utils/crypto';
@@ -14,6 +14,7 @@ import { federationGet } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
 import { augmentAuthEvents, legacyWireForRoom, prepareOutboundPdu } from '../services/event-wire';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
+import { isServerAllowedInRoom } from '../services/server-acl';
 import {
   createRoom,
   getRoom,
@@ -957,6 +958,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/leave', requireAuth(), async (c) => {
   const leaveDestinations = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
   await federateLocalStateEventToRemotes(c.env, event, roomId, leaveDestinations);
 
+  // MSC4267: transparently forget the room now that the user has left.
+  await autoForgetLeftRoom(c.env, roomId, userId);
+
   return c.json({});
 });
 
@@ -1205,6 +1209,14 @@ export async function performStateEvent(
     return { error: Errors.forbidden('Not a member of this room') };
   }
 
+  // Server ACL: if the room's ACL denies OUR server, every compliant server
+  // — including us — upholds it, so local state writes are refused too.
+  // (The dedicated /leave endpoint bypasses this core, so leaving stays
+  // possible; reads are unaffected.)
+  if (!(await isServerAllowedInRoom(env.DB, roomId, env.SERVER_NAME))) {
+    return { error: Errors.forbidden("This server is denied by the room's server ACL") };
+  }
+
   // MSC4155: an invite written through the state endpoint is still an invite.
   if (eventType === 'm.room.member' && content?.membership === 'invite') {
     if ((await getInvitePermission(env.DB, stateKey, userId)) === 'block') {
@@ -1258,6 +1270,17 @@ export async function performStateEvent(
   }
   if ((existingStateEventCheck?.event_id ?? null) !== (existingStateEventNow?.event_id ?? null)) {
     return { error: Errors.conflict(`State event ${eventType}/${stateKey} changed during request; retry`) };
+  }
+
+  // Spec v1.19: client-formatted state events carry unsigned.replaces_state
+  // pointing at the event this one supersedes, so clients can diff state
+  // deltas without a full /state fetch. The conflict re-check above makes
+  // existingStateEventNow the exact event being replaced.
+  if (existingStateEventNow) {
+    event.unsigned = {
+      ...(event.unsigned ?? {}),
+      replaces_state: existingStateEventNow.event_id,
+    };
   }
 
   const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
@@ -1886,6 +1909,12 @@ export async function performSendEvent(
     return { error: Errors.forbidden('Not a member of this room') };
   }
 
+  // Server ACL: a room whose ACL denies our server must not accept local
+  // message sends either — remote participants would drop them anyway.
+  if (!(await isServerAllowedInRoom(env.DB, roomId, env.SERVER_NAME))) {
+    return { error: Errors.forbidden("This server is denied by the room's server ACL") };
+  }
+
   const eventId = await generateEventId(env.SERVER_NAME);
 
   const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
@@ -2000,6 +2029,22 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     content = await c.req.json();
   } catch {
     return Errors.badJson().toResponse();
+  }
+
+  // MSC4169 (stable since spec v1.18): redactions may also travel through
+  // the generic /send endpoint with content { redacts, reason? }. They share
+  // the /redact pipeline rather than the plain send path so the target event
+  // actually gets marked redacted.
+  if (eventType === 'm.room.redaction') {
+    if (typeof content?.redacts !== 'string' || !content.redacts) {
+      return Errors.missingParam('redacts').toResponse();
+    }
+    const result = await performRedaction(
+      c.env, roomId, userId, content.redacts, content.reason, txnId,
+      { suspended: c.get('auth')?.suspended ?? false }
+    );
+    if ('error' in result) return result.error.toResponse();
+    return c.json({ event_id: result.eventId });
   }
 
   const result = await performSendEvent(c.env, roomId, userId, eventType, content, txnId);
@@ -2295,6 +2340,65 @@ app.get('/_matrix/client/unstable/uk.half-shot.msc2666/query_mutual_rooms/:userI
   return c.json({ joined: rows.results.map(r => r.room_id) });
 });
 
+// GET /_matrix/client/v1/mutual_rooms - MSC2666 (stable since spec v1.19)
+// Rooms where both the authenticated user and ?user_id= have membership
+// 'join'. Batched by room_id cursor; `from` continues from a previous
+// response's next_batch. An unknown target user is NOT an error: the spec
+// requires an empty 200 so callers cannot probe for account existence.
+const MUTUAL_ROOMS_BATCH_SIZE = 500;
+app.get('/_matrix/client/v1/mutual_rooms', requireAuth(), async (c) => {
+  const requester = c.get('userId');
+  const target = c.req.query('user_id');
+  const from = c.req.query('from');
+
+  if (!target) {
+    return Errors.missingParam('user_id').toResponse();
+  }
+  if (target === requester) {
+    return Errors.invalidParam('user_id', 'Cannot check mutual rooms with yourself').toResponse();
+  }
+  if (!parseUserId(target)) {
+    return Errors.invalidParam('user_id', 'The user ID provided was invalid').toResponse();
+  }
+  if (from !== undefined && from !== '' && !from.startsWith('!')) {
+    return Errors.invalidParam('from', 'The from token provided was invalid').toResponse();
+  }
+
+  const countRow = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS total FROM room_memberships a
+     JOIN room_memberships b ON a.room_id = b.room_id
+     WHERE a.user_id = ? AND a.membership = 'join'
+       AND b.user_id = ? AND b.membership = 'join'`
+  ).bind(requester, target).first<{ total: number }>();
+
+  const rows = await c.env.DB.prepare(
+    `SELECT a.room_id FROM room_memberships a
+     JOIN room_memberships b ON a.room_id = b.room_id
+     WHERE a.user_id = ? AND a.membership = 'join'
+       AND b.user_id = ? AND b.membership = 'join'
+       AND a.room_id > ?
+     ORDER BY a.room_id ASC LIMIT ?`
+  ).bind(requester, target, from ?? '', MUTUAL_ROOMS_BATCH_SIZE + 1)
+    .all<{ room_id: string }>();
+
+  const hasMore = rows.results.length > MUTUAL_ROOMS_BATCH_SIZE;
+  const batch = rows.results.slice(0, MUTUAL_ROOMS_BATCH_SIZE);
+
+  const response: {
+    count: number;
+    joined: string[];
+    next_batch?: string;
+  } = {
+    count: countRow?.total ?? batch.length,
+    joined: batch.map(r => r.room_id),
+  };
+  if (hasMore && batch.length > 0) {
+    response.next_batch = batch[batch.length - 1].room_id;
+  }
+
+  return c.json(response);
+});
+
 // POST /_matrix/client/v3/rooms/:roomId/kick - Kick a user
 app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -2384,6 +2488,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/kick', requireAuth(), async (c) => {
 
   await federateLocalStateEventToRemotes(c.env, event, roomId, kickDestinations);
 
+  // MSC4267: a kicked local user has their room forgotten transparently.
+  await autoForgetLeftRoom(c.env, roomId, targetId);
+
   return c.json({});
 });
 
@@ -2470,6 +2577,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/ban', requireAuth(), async (c) => {
 
   await federateLocalStateEventToRemotes(c.env, event, roomId, banDestinations);
 
+  // MSC4267: a banned local user has their room forgotten transparently.
+  await autoForgetLeftRoom(c.env, roomId, targetId);
+
   return c.json({});
 });
 
@@ -2551,8 +2661,26 @@ app.post('/_matrix/client/v3/rooms/:roomId/unban', requireAuth(), async (c) => {
   const unbanDestinations = await getJoinedRemoteServers(c.env.DB, roomId, c.env.SERVER_NAME);
   await federateLocalStateEventToRemotes(c.env, event, roomId, unbanDestinations);
 
+  // MSC4267: the unbanned local user lands in 'leave' — forget it, matching
+  // the auto-forget behavior advertised via m.forget_forced_upon_leave.
+  await autoForgetLeftRoom(c.env, roomId, targetId);
+
   return c.json({});
 });
+
+// MSC4267 (stable since spec v1.18): with the m.forget_forced_upon_leave
+// capability advertised as enabled, the server forgets rooms the moment a
+// local user's membership ends — self-leave, kick, ban, unban and the same
+// transitions arriving over federation — exactly as if the user had called
+// /forget. Remote users are never touched: their membership rows are this
+// server's record of remote room state, not a local view preference.
+async function autoForgetLeftRoom(env: Env, roomId: string, userId: string): Promise<void> {
+  const domain = userId.includes(':') ? userId.slice(userId.indexOf(':') + 1) : '';
+  if (!domain || domain !== env.SERVER_NAME) return;
+  await env.DB.prepare(
+    `DELETE FROM room_memberships WHERE room_id = ? AND user_id = ?`
+  ).bind(roomId, userId).run();
+}
 
 // POST /_matrix/client/v3/rooms/:roomId/forget - Forget a room
 app.post('/_matrix/client/v3/rooms/:roomId/forget', requireAuth(), async (c) => {
@@ -2574,59 +2702,70 @@ app.post('/_matrix/client/v3/rooms/:roomId/forget', requireAuth(), async (c) => 
   return c.json({});
 });
 
-// PUT /_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId - Redact an event
-app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth(), async (c) => {
-  const userId = c.get('userId');
-  const roomId = c.req.param('roomId');
-  const targetEventId = c.req.param('eventId');
-  const txnId = c.req.param('txnId');
-
+// Core redaction pipeline, shared by PUT /redact and (since spec v1.18 /
+// MSC4169) by m.room.redaction events sent through the generic /send
+// endpoint. Applies the same membership, target-existence and power checks
+// in both shapes.
+async function performRedaction(
+  env: Env,
+  roomId: string,
+  userId: string,
+  targetEventId: string,
+  reason?: string,
+  txnId?: string,
+  opts?: { suspended?: boolean }
+): Promise<{ eventId: string } | { error: MatrixApiError }> {
   // Check membership
-  const membership = await getMembership(c.env.DB, roomId, userId);
+  const membership = await getMembership(env.DB, roomId, userId);
   if (!membership || membership.membership !== 'join') {
-    return Errors.forbidden('Not a member of this room').toResponse();
+    return { error: Errors.forbidden('Not a member of this room') };
+  }
+
+  // Server ACL: same self-enforcement as the other send cores.
+  if (!(await isServerAllowedInRoom(env.DB, roomId, env.SERVER_NAME))) {
+    return { error: Errors.forbidden("This server is denied by the room's server ACL") };
   }
 
   // Get the target event
-  const targetEvent = await getEvent(c.env.DB, targetEventId);
+  const targetEvent = await getEvent(env.DB, targetEventId);
   if (!targetEvent || targetEvent.room_id !== roomId) {
-    return Errors.notFound('Event not found').toResponse();
+    return { error: Errors.notFound('Event not found') };
   }
 
   // Check power levels for redaction
-  const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
+  const powerLevelsEvent = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
   const powerLevels = powerLevelsEvent?.content as any || {};
   const userPower = powerLevels.users?.[userId] ?? powerLevels.users_default ?? 0;
   const redactPower = powerLevels.redact ?? 50;
 
   // Users can redact their own messages, or need redact power level
   if (targetEvent.sender !== userId && userPower < redactPower) {
-    return Errors.forbidden('Insufficient power level to redact').toResponse();
+    return { error: Errors.forbidden('Insufficient power level to redact') };
   }
 
-  let body: any = {};
-  try {
-    body = await c.req.json();
-  } catch {
-    // Body is optional for redaction
+  // MSC4323: suspended accounts may redact only their own events. The
+  // middleware lets m.room.redaction through /send and /redact; this is
+  // the point where the target's sender is actually known.
+  if (opts?.suspended && targetEvent.sender !== userId) {
+    return { error: Errors.userSuspended() };
   }
 
   // Create redaction event
-  const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
+  const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
 
   const authEvents: string[] = [];
   if (createEvent) authEvents.push(createEvent.event_id);
   if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
   if (membership) authEvents.push(membership.eventId);
 
-  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
+  const { events: latestEvents } = await getRoomEvents(env.DB, roomId, undefined, 1);
   const prevEvents = latestEvents.map(e => e.event_id);
 
   const redactionContent: any = {
     redacts: targetEventId,
   };
-  if (body.reason) {
-    redactionContent.reason = body.reason;
+  if (reason) {
+    redactionContent.reason = reason;
   }
 
   const event: PDU = {
@@ -2643,17 +2782,40 @@ app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth()
     prev_events: prevEvents,
   };
 
-  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
+  const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
 
   // Mark the original event as redacted
-  await c.env.DB.prepare(`
+  await env.DB.prepare(`
     UPDATE events SET redacted_because = ? WHERE event_id = ?
   `).bind(eventId, targetEventId).run();
 
   // Notify room members about the redaction
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.redaction');
+  await notifyUsersOfEvent(env, roomId, eventId, 'm.room.redaction');
 
-  return c.json({ event_id: eventId });
+  return { eventId };
+}
+
+// PUT /_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId - Redact an event
+app.put('/_matrix/client/v3/rooms/:roomId/redact/:eventId/:txnId', requireAuth(), async (c) => {
+  const userId = c.get('userId');
+  const roomId = c.req.param('roomId');
+  const targetEventId = c.req.param('eventId');
+  const txnId = c.req.param('txnId');
+
+  let body: any = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    // Body is optional for redaction
+  }
+
+  const result = await performRedaction(
+    c.env, roomId, userId, targetEventId, body.reason, txnId,
+    { suspended: c.get('auth')?.suspended ?? false }
+  );
+  if ('error' in result) return result.error.toResponse();
+
+  return c.json({ event_id: result.eventId });
 });
 
 // GET /_matrix/client/v3/rooms/:roomId/context/:eventId - Get context around an event
