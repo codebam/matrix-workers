@@ -597,3 +597,23 @@ verified. Full suite green after the wave: 45,569/45,569 (351 files).
     signing key).
 
 Deploy order for this wave: migration 027 first, then wrangler deploy.
+
+Live verification of the wave (prod, version f2875b21): redacted events
+now serve `{}` content with unsigned.redacted_because over /event;
+/.well-known/matrix/policy_server bootstraps and publishes the policy
+key (server_keys key_version 4). Full self-hosted policy loop verified:
+m.room.policy (via=codebam.ca + published key) → sends are
+countersigned under `ed25519:policy_server` → wiping the content
+disables it and sends flow unsigned again.
+
+**Trap found live**: a Cloudflare route-worker cannot fetch its own
+URL (edge self-invocation protection) — the first policy ask to
+ourselves died before reaching the worker (no /sign in the tail).
+Fixed by resolving asks where `via` is SERVER_NAME in-process (same
+key, same policy as the /sign endpoint). If other servers ever become
+policy servers for our rooms, the network path handles them.
+
+**Observation, not a bug**: local-only rooms (v10 here, no remote
+members) skip wire prep entirely — no hashes/federation signatures on
+their events; only the policy countersignature appears. Signatures
+materialize when there is someone to federate with.
