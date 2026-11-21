@@ -327,47 +327,35 @@ describe('livekit-calls-shim', () => {
       shim.close();
     });
 
-    it('upgrades over HTTP and rejects unauthenticated or non-WebSocket requests', async () => {
-      const pair = new FakeSocket();
-      const serverSocket = new FakeSocket();
-      vi.stubGlobal('WebSocketPair', class {
-        constructor() {
-          return { 0: pair, 1: serverSocket } as unknown as object;
-        }
-      });
-      // Node's Response rejects 101; Workers' Response accepts it with webSocket.
-      const NodeResponse = globalThis.Response;
-      class WorkersResponse extends NodeResponse {
-        webSocket?: unknown;
-        constructor(body?: BodyInit | null, init?: ResponseInit & { webSocket?: unknown }) {
-          const { webSocket, ...rest } = init ?? {};
-          super(body, webSocket ? { ...rest, status: 200 } : rest);
-          this.webSocket = webSocket;
-        }
-      }
-      vi.stubGlobal('Response', WorkersResponse);
+    it('forwards authenticated upgrades to the room DO and rejects bad requests', async () => {
+      const doResponse = new Response(null, { status: 200 });
+      const doFetch = vi.fn(async () => doResponse);
+      const namespace = {
+        idFromName: vi.fn((name: string) => name),
+        get: vi.fn(() => ({ fetch: doFetch })),
+      } as unknown as DurableObjectNamespace;
 
       const env = makeEnv();
       const token = await generateLiveKitToken(API_KEY, API_SECRET, 'room_c', 'alice');
       const base = `https://example.org/livekit/signal/rtc/v1?access_token=${encodeURIComponent(token)}`;
-      const registry = new LiveKitShimRegistry(5, 5);
 
       const upgrade = await handleLiveKitSignalRequest(
-        new Request(base, { headers: { Upgrade: 'websocket' } }), env, { registry }
+        new Request(base, { headers: { Upgrade: 'websocket' } }), env, { namespace }
       );
-      // Workers returns 101 with a webSocket; the test shim rewrites it to 200.
-      expect(upgrade.status).toBe(200);
-      expect((upgrade as unknown as { webSocket: unknown }).webSocket).toBe(pair);
-      expect(serverSocket.sent.length).toBeGreaterThan(0);
+      expect(upgrade).toBe(doResponse);
+      expect(namespace.idFromName).toHaveBeenCalledWith('room_c');
+      expect(doFetch).toHaveBeenCalledTimes(1);
 
       const missing = await handleLiveKitSignalRequest(
         new Request('https://example.org/livekit/signal/rtc/v1', { headers: { Upgrade: 'websocket' } }),
-        env, { registry }
+        env, { namespace }
       );
       expect(missing.status).toBe(401);
+      expect(doFetch).toHaveBeenCalledTimes(1);
 
-      const plain = await handleLiveKitSignalRequest(new Request('https://example.org/livekit/signal'), env, { registry });
+      const plain = await handleLiveKitSignalRequest(new Request('https://example.org/livekit/signal'), env, { namespace });
       expect(plain.status).toBe(400);
+      expect(doFetch).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -87,6 +87,10 @@
 			{
 				"name": "DELAYED_EVENTS",
 				"class_name": "DelayedEventsDurableObject"
+			},
+			{
+				"name": "LIVEKIT_SHIM",
+				"class_name": "LiveKitShimDurableObject"
 			}
 		]
 	},
@@ -133,6 +137,12 @@
 			"tag": "v7",
 			"new_sqlite_classes": [
 				"DelayedEventsDurableObject"
+			]
+		},
+		{
+			"tag": "v8",
+			"new_sqlite_classes": [
+				"LiveKitShimDurableObject"
 			]
 		}
 	],

@@ -71,7 +71,8 @@
 			{ "name": "USER_KEYS", "class_name": "UserKeysDurableObject" },
 			{ "name": "PUSH", "class_name": "PushDurableObject" },
 			{ "name": "RATE_LIMIT", "class_name": "RateLimitDurableObject" },
-			{ "name": "DELAYED_EVENTS", "class_name": "DelayedEventsDurableObject" }
+			{ "name": "DELAYED_EVENTS", "class_name": "DelayedEventsDurableObject" },
+			{ "name": "LIVEKIT_SHIM", "class_name": "LiveKitShimDurableObject" }
 		]
 	},
 	"migrations": [
@@ -87,6 +88,12 @@
 				"PushDurableObject",
 				"RateLimitDurableObject",
 				"DelayedEventsDurableObject"
+			]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": [
+				"LiveKitShimDurableObject"
 			]
 		}
 	],

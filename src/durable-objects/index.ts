@@ -7,3 +7,4 @@ export { UserKeysDurableObject } from './UserKeysDurableObject';
 export { PushDurableObject } from './PushDurableObject';
 export { RateLimitDurableObject } from './RateLimitDurableObject';
 export { DelayedEventsDurableObject } from './DelayedEventsDurableObject';
+export { LiveKitShimDurableObject } from './LiveKitShimDO';

@@ -55,7 +55,7 @@ import { analyticsMiddleware } from './middleware/analytics';
 import { federationGet, federationPost } from './services/federation-keys';
 
 // Import Durable Objects
-export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject, DelayedEventsDurableObject } from './durable-objects';
+export { RoomDurableObject, SyncDurableObject, FederationDurableObject, CallRoomDurableObject, AdminDurableObject, UserKeysDurableObject, PushDurableObject, RateLimitDurableObject, DelayedEventsDurableObject, LiveKitShimDurableObject } from './durable-objects';
 
 // Import Workflows
 export { RoomJoinWorkflow, PushNotificationWorkflow, FederationCatchupWorkflow, MediaCleanupWorkflow, StateCompactionWorkflow } from './workflows';

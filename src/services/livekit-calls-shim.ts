@@ -17,9 +17,11 @@
 // (WrappedJoinRequest, optionally gzip compressed), and the JWT is in
 // `access_token`.
 //
-// Deliberate gaps: data channels, simulcast layers, E2EE/SIF trailer,
-// recording/egress, ICE trickle forwarding, reconnect/resume, and cross-isolate
-// room state. See the report for details.
+// Room state lives in LiveKitShimDurableObject (one instance per Matrix room);
+// the Worker only verifies the JWT and forwards the upgrade to that DO, which
+// owns every participant socket. Deliberate gaps: data channels, simulcast
+// layers, E2EE/SIF trailer, recording/egress, ICE trickle forwarding, and
+// reconnect/resume. See the report for details.
 
 import type { Env } from '../types';
 import {
@@ -633,7 +635,9 @@ export async function decodeJoinRequestParam(raw: string | null): Promise<JoinRe
 }
 
 // ---------------------------------------------------------------------------
-// Registry with hard caps. State is per Worker isolate; see report.
+// Registry with hard caps. Each LiveKitShimDurableObject owns exactly one of
+// these, so room state is shared by every Worker isolate that forwards a
+// signaling upgrade to the same DO.
 // ---------------------------------------------------------------------------
 
 interface ShimParticipant {
@@ -725,8 +729,6 @@ export class LiveKitShimRegistry {
   }
 }
 
-const defaultRegistry = new LiveKitShimRegistry();
-
 // ---------------------------------------------------------------------------
 // SDP helpers
 // ---------------------------------------------------------------------------
@@ -758,7 +760,8 @@ export function inferMimeType(sdp: string, mid?: string, type = 1): string {
 // ---------------------------------------------------------------------------
 
 export interface ShimOptions {
-  registry?: LiveKitShimRegistry;
+  /** Room-scoped registry; supplied by the DO, never by the Worker isolate. */
+  registry: LiveKitShimRegistry;
   maxTracksPerParticipant?: number;
   now?: () => number;
   /** Server protocol advertised to clients; 17 avoids negotiated data channels. */
@@ -808,9 +811,9 @@ export class LiveKitCallsShimSession {
     private readonly env: Env,
     identity: LiveKitIdentity,
     ws: WebSocket,
-    options: ShimOptions = {}
+    options: ShimOptions
   ) {
-    this.registry = options.registry ?? defaultRegistry;
+    this.registry = options.registry;
     this.maxTracks = options.maxTracksPerParticipant ?? DEFAULT_MAX_TRACKS_PER_PARTICIPANT;
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.serverProtocol = options.serverProtocol ?? 17;
@@ -1138,9 +1141,9 @@ function participantTrackInfo(track: PublishedTrack): TrackInfoJson {
 // HTTP upgrade entry point
 // ---------------------------------------------------------------------------
 
-export interface HandleOptions extends ShimOptions {
-  /** Injectable for tests; defaults to the installed WebCrypto/WebSocket globals. */
-  makeSession?: (env: Env, identity: LiveKitIdentity, ws: WebSocket, options: ShimOptions) => LiveKitCallsShimSession;
+export interface HandleOptions {
+  /** Injectable for tests; defaults to `env.LIVEKIT_SHIM`. */
+  namespace?: DurableObjectNamespace;
 }
 
 /**
@@ -1148,6 +1151,11 @@ export interface HandleOptions extends ShimOptions {
  * both `/livekit/signal/rtc/v1` (current SDK) and `/livekit/signal/rtc`
  * (v0 path) are covered. Requires Upgrade: websocket, a valid LiveKit JWT in
  * `access_token`, and optional base64url `join_request`.
+ *
+ * The Worker verifies credentials, then forwards the *unmodified* upgrade
+ * request to the room's Durable Object and returns its 101 response verbatim.
+ * The DO accepts the server socket and owns the registry and all broadcasts;
+ * no signaling state is kept in the Worker isolate.
  */
 export async function handleLiveKitSignalRequest(
   request: Request,
@@ -1165,28 +1173,19 @@ export async function handleLiveKitSignalRequest(
     ?? request.headers.get('Authorization')?.replace(/^Bearer\s+/i, '');
   if (!token) return Response.json({ error: 'Missing access_token' }, { status: 401 });
 
-  let identity: LiveKitIdentity;
-  let joinRequest: JoinRequestJson;
+  let room: string;
   try {
-    identity = await verifyLiveKitJwt(token, env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET);
-    joinRequest = await decodeJoinRequestParam(url.searchParams.get('join_request'));
+    const identity = await verifyLiveKitJwt(token, env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET);
+    room = identity.room;
+    // Reject malformed join requests here as before; the DO decodes them too.
+    await decodeJoinRequestParam(url.searchParams.get('join_request'));
   } catch (error) {
     return Response.json({ error: error instanceof Error ? error.message : 'Invalid credentials' }, { status: 401 });
   }
 
-  const pair = new WebSocketPair();
-  const shimOptions: ShimOptions = {
-    registry: options.registry,
-    maxTracksPerParticipant: options.maxTracksPerParticipant,
-    now: options.now,
-    serverProtocol: options.serverProtocol,
-  };
-  const makeSession = options.makeSession
-    ?? ((e, id, ws, opts) => new LiveKitCallsShimSession(e, id, ws, opts));
-  const session = makeSession(env, identity, pair[1], shimOptions);
-  // Start before returning the 101 so the client sees the join response first.
-  await session.start(joinRequest);
-  return new Response(null, { status: 101, webSocket: pair[0] });
+  const namespace = options.namespace ?? env.LIVEKIT_SHIM;
+  if (!namespace) return Response.json({ error: 'LiveKit shim DO not configured' }, { status: 503 });
+  return await namespace.get(namespace.idFromName(room)).fetch(request);
 }
 
 /** Exposed so the route can advertise the capability in discovery responses. */

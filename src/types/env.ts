@@ -78,6 +78,9 @@ export interface Env {
   // Durable Object for call signaling
   CALL_ROOMS?: DurableObjectNamespace;
 
+  // One Durable Object per room, owning LiveKit-compat signaling sockets and state.
+  LIVEKIT_SHIM: DurableObjectNamespace;
+
   // Workers VPC Service binding for LiveKit
   LIVEKIT_API: Fetcher;
 
