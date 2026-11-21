@@ -2947,7 +2947,7 @@ export const adminDashboardHtml = (serverName: string) => `
             <td><input type="checkbox" class="user-checkbox" data-user-id="\${escapeAttr(u.user_id)}" onchange="toggleUserSelection('\${escapeAttr(u.user_id)}', this)"></td>
             <td style="font-size: 13px;">\${escapeHtml(u.user_id)}</td>
             <td>\${escapeHtml(u.display_name || '-')}</td>
-            <td><span class="badge \${u.is_deactivated ? 'badge-danger' : 'badge-success'}">\${u.is_deactivated ? 'Deactivated' : 'Active'}</span></td>
+            <td><span class="badge \${u.locked ? 'badge-danger' : u.suspended ? 'badge-warning' : u.is_deactivated ? 'badge-danger' : 'badge-success'}">\${u.locked ? 'Locked' : u.suspended ? 'Suspended' : u.is_deactivated ? 'Deactivated' : 'Active'}</span></td>
             <td><span class="badge \${u.admin ? 'badge-warning' : 'badge-info'}">\${u.admin ? 'Admin' : 'User'}</span></td>
             <td>\${formatDate(u.created_at)}</td>
             <td class="actions">
