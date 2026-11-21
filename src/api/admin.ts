@@ -1916,10 +1916,47 @@ app.post('/admin/api/users/:userId/login-token', requireAuth(), requireAdmin, as
 // Identity Provider (IdP) Management Endpoints
 // ============================================
 
+/** Validate the explicitly configured endpoints of a non-OIDC (OAuth 2.0) provider. */
+function validateOAuth2Endpoints(endpoints: {
+  authorization_endpoint?: string | null;
+  token_endpoint?: string | null;
+  userinfo_endpoint?: string | null;
+  emails_endpoint?: string | null;
+}): string | null {
+  const required: Array<[string, string | null | undefined]> = [
+    ['authorization_endpoint', endpoints.authorization_endpoint],
+    ['token_endpoint', endpoints.token_endpoint],
+    ['userinfo_endpoint', endpoints.userinfo_endpoint],
+  ];
+  for (const [field, value] of required) {
+    if (!value || typeof value !== 'string') {
+      return `${field} is required for OAuth 2.0 providers`;
+    }
+    try {
+      new URL(value);
+    } catch {
+      return `${field} must be a valid URL`;
+    }
+  }
+  if (endpoints.emails_endpoint) {
+    try {
+      new URL(endpoints.emails_endpoint);
+    } catch {
+      return 'emails_endpoint must be a valid URL';
+    }
+  }
+  return null;
+}
+
 interface IdPProvider {
   id: string;
   name: string;
   issuer_url: string;
+  provider_type: string;
+  authorization_endpoint: string | null;
+  token_endpoint: string | null;
+  userinfo_endpoint: string | null;
+  emails_endpoint: string | null;
   client_id: string;
   client_secret_encrypted: string;
   scopes: string;
@@ -1937,7 +1974,9 @@ app.get('/admin/api/idp/providers', requireAuth(), requireAdmin, async (c) => {
   const db = c.env.DB;
 
   const result = await db.prepare(`
-    SELECT id, name, issuer_url, client_id, scopes, enabled, auto_create_users,
+    SELECT id, name, issuer_url, client_id, scopes, provider_type,
+           authorization_endpoint, token_endpoint, userinfo_endpoint, emails_endpoint,
+           enabled, auto_create_users,
            username_claim, display_order, icon_url, created_at, updated_at
     FROM idp_providers
     ORDER BY display_order ASC, name ASC
@@ -1971,22 +2010,42 @@ app.post('/admin/api/idp/providers', requireAuth(), requireAdmin, async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  const { name, issuer_url, client_id, client_secret, scopes, auto_create_users, username_claim, icon_url } = body;
+  const {
+    name, issuer_url, client_id, client_secret, scopes, auto_create_users, username_claim, icon_url,
+    provider_type, authorization_endpoint, token_endpoint, userinfo_endpoint, emails_endpoint,
+  } = body;
+
+  // OIDC remains the default; a non-OIDC provider must declare its type explicitly.
+  const effectiveProviderType = provider_type || 'oidc';
+  if (effectiveProviderType !== 'oidc' && effectiveProviderType !== 'oauth2') {
+    return c.json({ errcode: 'M_INVALID_PARAM', error: 'provider_type must be either oidc or oauth2' }, 400);
+  }
+  const isOAuth2 = effectiveProviderType === 'oauth2';
 
   // Validate required fields
   if (!name || !issuer_url || !client_id || !client_secret) {
     return Errors.missingParam('name, issuer_url, client_id, and client_secret are required').toResponse();
   }
 
-  // Validate issuer URL by fetching discovery document
-  try {
-    await fetchOIDCDiscovery(issuer_url);
-  } catch (err) {
-    console.error('[admin] OIDC discovery fetch failed:', err);
-    return c.json({
-      errcode: 'M_INVALID_PARAM',
-      error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
-    }, 400);
+  if (isOAuth2) {
+    // GitHub has no discovery document, so validate the configured endpoints directly.
+    const endpointError = validateOAuth2Endpoints({
+      authorization_endpoint, token_endpoint, userinfo_endpoint, emails_endpoint,
+    });
+    if (endpointError) {
+      return c.json({ errcode: 'M_INVALID_PARAM', error: endpointError }, 400);
+    }
+  } else {
+    // Validate issuer URL by fetching discovery document
+    try {
+      await fetchOIDCDiscovery(issuer_url);
+    } catch (err) {
+      console.error('[admin] OIDC discovery fetch failed:', err);
+      return c.json({
+        errcode: 'M_INVALID_PARAM',
+        error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
+      }, 400);
+    }
   }
 
   // Generate ID and encrypt secret
@@ -1996,20 +2055,26 @@ app.post('/admin/api/idp/providers', requireAuth(), requireAdmin, async (c) => {
   try {
     await db.prepare(`
       INSERT INTO idp_providers (id, name, issuer_url, client_id, client_secret_encrypted, scopes,
-                                  enabled, auto_create_users, username_claim, icon_url, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)
+                                  enabled, auto_create_users, username_claim, icon_url, created_at, updated_at,
+                                  provider_type, authorization_endpoint, token_endpoint, userinfo_endpoint, emails_endpoint)
+      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       id,
       name,
       issuer_url.replace(/\/$/, ''), // Normalize URL
       client_id,
       encryptedSecret,
-      scopes || 'openid profile email',
+      scopes || (isOAuth2 ? 'read:user user:email' : 'openid profile email'),
       auto_create_users !== false ? 1 : 0,
-      username_claim || 'email',
+      username_claim || (isOAuth2 ? 'preferred_username' : 'email'),
       icon_url || null,
       Date.now(),
-      Date.now()
+      Date.now(),
+      effectiveProviderType,
+      authorization_endpoint || null,
+      token_endpoint || null,
+      userinfo_endpoint || null,
+      emails_endpoint || null
     ).run();
 
     return c.json({
@@ -2029,7 +2094,9 @@ app.get('/admin/api/idp/providers/:id', requireAuth(), requireAdmin, async (c) =
   const db = c.env.DB;
 
   const provider = await db.prepare(`
-    SELECT id, name, issuer_url, client_id, scopes, enabled, auto_create_users,
+    SELECT id, name, issuer_url, client_id, scopes, provider_type,
+           authorization_endpoint, token_endpoint, userinfo_endpoint, emails_endpoint,
+           enabled, auto_create_users,
            username_claim, display_order, icon_url, created_at, updated_at
     FROM idp_providers WHERE id = ?
   `).bind(id).first<Omit<IdPProvider, 'client_secret_encrypted'>>();
@@ -2076,10 +2143,17 @@ app.put('/admin/api/idp/providers/:id', requireAuth(), requireAdmin, async (c) =
   }
 
   // Check provider exists
-  const existing = await db.prepare('SELECT id FROM idp_providers WHERE id = ?').bind(id).first();
+  const existing = await db.prepare('SELECT id, provider_type FROM idp_providers WHERE id = ?')
+    .bind(id).first<{ id: string; provider_type: string }>();
   if (!existing) {
     return Errors.notFound('Identity provider not found').toResponse();
   }
+
+  const effectiveProviderType = body.provider_type ?? existing.provider_type ?? 'oidc';
+  if (effectiveProviderType !== 'oidc' && effectiveProviderType !== 'oauth2') {
+    return c.json({ errcode: 'M_INVALID_PARAM', error: 'provider_type must be either oidc or oauth2' }, 400);
+  }
+  const isOAuth2 = effectiveProviderType === 'oauth2';
 
   const updates: string[] = [];
   const values: any[] = [];
@@ -2089,15 +2163,24 @@ app.put('/admin/api/idp/providers/:id', requireAuth(), requireAdmin, async (c) =
     values.push(body.name);
   }
   if (body.issuer_url !== undefined) {
-    // Validate new issuer URL
-    try {
-      await fetchOIDCDiscovery(body.issuer_url);
-    } catch (err) {
-      console.error('[admin] OIDC discovery fetch failed on update:', err);
-      return c.json({
-        errcode: 'M_INVALID_PARAM',
-        error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
-      }, 400);
+    if (isOAuth2) {
+      // OAuth 2.0 issuers (e.g. github.com) have no discovery document.
+      try {
+        new URL(body.issuer_url);
+      } catch {
+        return c.json({ errcode: 'M_INVALID_PARAM', error: 'issuer_url must be a valid URL' }, 400);
+      }
+    } else {
+      // Validate new issuer URL
+      try {
+        await fetchOIDCDiscovery(body.issuer_url);
+      } catch (err) {
+        console.error('[admin] OIDC discovery fetch failed on update:', err);
+        return c.json({
+          errcode: 'M_INVALID_PARAM',
+          error: 'Failed to fetch OIDC discovery from issuer. Check the issuer URL is correct and accessible.',
+        }, 400);
+      }
     }
     updates.push('issuer_url = ?');
     values.push(body.issuer_url.replace(/\/$/, ''));
@@ -2134,6 +2217,26 @@ app.put('/admin/api/idp/providers/:id', requireAuth(), requireAdmin, async (c) =
   if (body.icon_url !== undefined) {
     updates.push('icon_url = ?');
     values.push(body.icon_url || null);
+  }
+  if (body.provider_type !== undefined) {
+    updates.push('provider_type = ?');
+    values.push(effectiveProviderType);
+  }
+  if (body.authorization_endpoint !== undefined) {
+    updates.push('authorization_endpoint = ?');
+    values.push(body.authorization_endpoint || null);
+  }
+  if (body.token_endpoint !== undefined) {
+    updates.push('token_endpoint = ?');
+    values.push(body.token_endpoint || null);
+  }
+  if (body.userinfo_endpoint !== undefined) {
+    updates.push('userinfo_endpoint = ?');
+    values.push(body.userinfo_endpoint || null);
+  }
+  if (body.emails_endpoint !== undefined) {
+    updates.push('emails_endpoint = ?');
+    values.push(body.emails_endpoint || null);
   }
 
   if (updates.length === 0) {
@@ -2187,18 +2290,50 @@ app.post('/admin/api/idp/providers/:id/test', requireAuth(), requireAdmin, async
   const db = c.env.DB;
 
   const provider = await db.prepare(`
-    SELECT issuer_url FROM idp_providers WHERE id = ?
-  `).bind(id).first<{ issuer_url: string }>();
+    SELECT issuer_url, provider_type, authorization_endpoint, token_endpoint,
+           userinfo_endpoint, emails_endpoint
+    FROM idp_providers WHERE id = ?
+  `).bind(id).first<{
+    issuer_url: string;
+    provider_type: string;
+    authorization_endpoint: string | null;
+    token_endpoint: string | null;
+    userinfo_endpoint: string | null;
+    emails_endpoint: string | null;
+  }>();
 
   if (!provider) {
     return Errors.notFound('Identity provider not found').toResponse();
   }
 
+  const isOAuth2 = (provider.provider_type ?? 'oidc') === 'oauth2';
+
   try {
+    if (isOAuth2) {
+      // GitHub has no discovery document — verify the configured endpoints instead.
+      const endpointError = validateOAuth2Endpoints({
+        authorization_endpoint: provider.authorization_endpoint,
+        token_endpoint: provider.token_endpoint,
+        userinfo_endpoint: provider.userinfo_endpoint,
+        emails_endpoint: provider.emails_endpoint,
+      });
+      if (endpointError) {
+        return c.json({ success: false, error: endpointError }, 400);
+      }
+      const endpoints_found = ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint'];
+      if (provider.emails_endpoint) endpoints_found.push('emails_endpoint');
+      return c.json({
+        success: true,
+        message: 'Connection successful',
+        endpoints_found,
+      });
+    }
+
     const discovery = await fetchOIDCDiscovery(provider.issuer_url);
     return c.json({
       success: true,
       message: 'Connection successful',
+      endpoints_found: ['authorization_endpoint', 'token_endpoint', 'userinfo_endpoint', 'jwks_uri'],
       discovery: {
         issuer: discovery.issuer,
         authorization_endpoint: discovery.authorization_endpoint,
