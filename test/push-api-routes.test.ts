@@ -394,15 +394,37 @@ function createPushDb(opts: {
                 return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
 
+              if (sql.includes('UPDATE push_rules SET priority = priority + 1')) {
+                updates.push({ sql, args });
+                const [userId, kind, lower, upper] = args as [string, string, number, number];
+                for (const r of rules) {
+                  if (
+                    r.user_id === userId &&
+                    r.kind === kind &&
+                    r.priority > lower &&
+                    r.priority < upper
+                  ) {
+                    r.priority += 1;
+                  }
+                }
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+
               if (sql.includes('UPDATE push_rules SET priority = priority - 1')) {
                 updates.push({ sql, args });
-                const [userId, kind, boundary] = args as [string, string, number];
+                const [userId, kind, boundary, lower] = args as [
+                  string,
+                  string,
+                  number,
+                  number | undefined,
+                ];
                 const strict = sql.includes('priority < ?');
                 for (const r of rules) {
                   if (
                     r.user_id === userId &&
                     r.kind === kind &&
-                    (strict ? r.priority < boundary : r.priority <= boundary)
+                    (strict ? r.priority < boundary : r.priority <= boundary) &&
+                    (lower === undefined || r.priority > lower)
                   ) {
                     r.priority -= 1;
                   }
@@ -4576,5 +4598,173 @@ describe('push leftovers after #131 — notifications pagination leftovers', () 
       ['$c', '$b']
     );
     expect(res.body.next_token).toBe('2');
+  });
+});
+
+describe('pushrules before/after relative to hardcoded default rules', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const SLOT = 1_000_000; // first default's derived effective priority is -SLOT
+
+  it('before=.m.rule.master inserts immediately ahead of master in GET order', async () => {
+    const db = createPushDb({ rules: [seedRule({ rule_id: 'older.custom', priority: 0 })] });
+    const put = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/new.before.master?before=.m.rule.master',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(put.status).toBe(200);
+    expect(db.rules.find((r) => r.rule_id === 'new.before.master')!.priority).toBe(-SLOT + 1);
+    expect(db.rules.find((r) => r.rule_id === 'older.custom')!.priority).toBe(1);
+
+    const get = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const ids = get.body.override.map((r: { rule_id: string }) => r.rule_id);
+    expect(ids.indexOf('new.before.master')).toBe(ids.indexOf('.m.rule.master') - 1);
+    expect(ids.indexOf('.m.rule.master')).toBeLessThan(ids.indexOf('.m.rule.suppress_notices'));
+    expect(ids.indexOf('older.custom')).toBeLessThan(ids.indexOf('new.before.master'));
+  });
+
+  it('after=.m.rule.master inserts immediately behind master in GET order', async () => {
+    const db = createPushDb();
+    const put = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/new.after.master?after=.m.rule.master',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(put.status).toBe(200);
+    expect(db.rules.find((r) => r.rule_id === 'new.after.master')!.priority).toBe(-SLOT - 1);
+
+    const get = await request(db, '/_matrix/client/v3/pushrules', authGet());
+    const ids = get.body.global.override.map((r: { rule_id: string }) => r.rule_id);
+    expect(ids.indexOf('new.after.master')).toBe(ids.indexOf('.m.rule.master') + 1);
+    expect(ids.indexOf('new.after.master')).toBe(ids.indexOf('.m.rule.suppress_notices') - 1);
+  });
+
+  it('before and after .m.rule.suppress_edits place customs on either side', async () => {
+    const db = createPushDb();
+    expect(
+      (
+        await request(
+          db,
+          '/_matrix/client/v3/pushrules/global/override/before.edits?before=.m.rule.suppress_edits',
+          jsonInit('PUT', { actions: ['notify'] })
+        )
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await request(
+          db,
+          '/_matrix/client/v3/pushrules/global/override/after.edits?after=.m.rule.suppress_edits',
+          jsonInit('PUT', { actions: ['dont_notify'] })
+        )
+      ).status
+    ).toBe(200);
+    expect(db.rules.find((r) => r.rule_id === 'before.edits')!.priority).toBe(-5 * SLOT + 1);
+    expect(db.rules.find((r) => r.rule_id === 'after.edits')!.priority).toBe(-5 * SLOT - 1);
+
+    const get = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const ids = get.body.override.map((r: { rule_id: string }) => r.rule_id);
+    expect(ids.indexOf('before.edits')).toBe(ids.indexOf('.m.rule.suppress_edits') - 1);
+    expect(ids.indexOf('after.edits')).toBe(ids.indexOf('.m.rule.suppress_edits') + 1);
+    expect(ids.indexOf('after.edits')).toBe(ids.indexOf('.m.rule.is_user_mention') - 1);
+  });
+
+  it('repeated after= on the same default keeps the newest rule adjacent', async () => {
+    const db = createPushDb();
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/first.after?after=.m.rule.master',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/second.after?after=.m.rule.master',
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    expect(db.rules.find((r) => r.rule_id === 'first.after')!.priority).toBe(-SLOT - 2);
+    expect(db.rules.find((r) => r.rule_id === 'second.after')!.priority).toBe(-SLOT - 1);
+
+    const get = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const ids = get.body.override.map((r: { rule_id: string }) => r.rule_id);
+    expect(ids.slice(0, 4)).toEqual([
+      '.m.rule.master',
+      'second.after',
+      'first.after',
+      '.m.rule.suppress_notices',
+    ]);
+  });
+
+  it('an overridden default row still uses its canonical slot and stays disabled', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: '.m.rule.master',
+          kind: 'override',
+          priority: 0,
+          enabled: 0,
+          actions: JSON.stringify(['dont_notify']),
+          conditions: null,
+        }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/custom.around.master?before=.m.rule.master',
+      jsonInit('PUT', {
+        actions: ['notify'],
+        conditions: [{ kind: 'contains_display_name' }],
+      })
+    );
+    const get = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const master = get.body.override.find((r: { rule_id: string }) => r.rule_id === '.m.rule.master');
+    expect(master).toMatchObject({ enabled: false, default: true, actions: ['dont_notify'] });
+    const ids = get.body.override.map((r: { rule_id: string }) => r.rule_id);
+    expect(ids.indexOf('custom.around.master')).toBe(ids.indexOf('.m.rule.master') - 1);
+
+    // A later partial update keeps the new rule's fields and its default neighbour.
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/custom.around.master/actions',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    const after = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const updated = after.body.override.find(
+      (r: { rule_id: string }) => r.rule_id === 'custom.around.master'
+    );
+    expect(updated).toMatchObject({
+      enabled: true,
+      actions: ['dont_notify'],
+      conditions: [{ kind: 'contains_display_name' }],
+    });
+    const afterIds = after.body.override.map((r: { rule_id: string }) => r.rule_id);
+    expect(afterIds.indexOf('custom.around.master')).toBe(afterIds.indexOf('.m.rule.master') - 1);
+  });
+
+  it('per-room rules keep before/after ordering in the room list', async () => {
+    const db = createPushDb();
+    const a = `/_matrix/client/v3/pushrules/global/room/${encodeURIComponent(ROOM)}`;
+    const b = '/_matrix/client/v3/pushrules/global/room/!other:example.com';
+    await request(db, a, jsonInit('PUT', { actions: ['notify'] }));
+    await request(db, `${b}?before=${encodeURIComponent(ROOM)}`, jsonInit('PUT', { actions: ['dont_notify'] }));
+    const get = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(get.body.room.map((r: { rule_id: string }) => r.rule_id)).toEqual([
+      '!other:example.com',
+      ROOM,
+    ]);
+  });
+
+  it('unknown before/after names still append, including default ids in the room kind', async () => {
+    const db = createPushDb();
+    vi.spyOn(Date, 'now').mockReturnValue(1_900_000_000_000);
+    const res = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/room/${encodeURIComponent(ROOM)}?before=.m.rule.master`,
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rules.find((r) => r.rule_id === ROOM)!.priority).toBe(1_900_000_000_000);
+    const get = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    expect(get.body.room.map((r: { rule_id: string }) => r.rule_id)).toEqual([ROOM]);
   });
 });

@@ -225,6 +225,32 @@ const DEFAULT_UNDERRIDE_RULES: PushRule[] = [
 ];
 
 // ============================================
+// Effective priority for default rules
+// ============================================
+
+// Defaults are not persisted, so their precedence is derived from the same
+// canonical order that GET /pushrules emits. Each default owns a wide slot;
+// customs positioned with before/after take the integer immediately inside
+// the neighbouring slot. No schema change or default-row writes are needed.
+const DEFAULT_PRIORITY_SPACING = 1_000_000;
+
+const DEFAULT_RULE_IDS: Record<string, readonly string[]> = {
+  override: DEFAULT_OVERRIDE_RULES.map(rule => rule.rule_id),
+  content: DEFAULT_CONTENT_RULES.map(rule => rule.rule_id),
+  room: [],
+  sender: [],
+  underride: DEFAULT_UNDERRIDE_RULES.map(rule => rule.rule_id),
+};
+
+/** Effective (descending) priority of a hardcoded default rule, if any. */
+function getDefaultRulePriority(kind: string, ruleId: string): number | undefined {
+  const ids = DEFAULT_RULE_IDS[kind];
+  if (!ids) return undefined;
+  const index = ids.indexOf(ruleId);
+  return index < 0 ? undefined : -(index + 1) * DEFAULT_PRIORITY_SPACING;
+}
+
+// ============================================
 // Helper Functions
 // ============================================
 
@@ -278,7 +304,7 @@ async function getUserPushRules(db: D1Database, userId: string): Promise<{
 }> {
   // Get custom rules from database (using existing schema: conditions, actions columns)
   const customRules = await db.prepare(`
-    SELECT kind, rule_id, conditions, actions, enabled FROM push_rules
+    SELECT kind, rule_id, conditions, actions, enabled, priority FROM push_rules
     WHERE user_id = ?
     ORDER BY priority ASC
   `).bind(userId).all<{
@@ -287,13 +313,31 @@ async function getUserPushRules(db: D1Database, userId: string): Promise<{
     conditions: string | null;
     actions: string;
     enabled: number;
+    priority?: number;
   }>();
 
-  // Start with defaults
-  const rules = getDefaultRulesForUser(userId);
+  const defaults = getDefaultRulesForUser(userId);
+  const kindNames = ['override', 'content', 'room', 'sender', 'underride'] as const;
+  type RuleKind = (typeof kindNames)[number];
 
-  // Apply custom rules (override defaults or add new)
-  for (const row of customRules.results) {
+  // Default rules and custom rules share one precedence scale: defaults use
+  // their derived slot, customs use their stored priority. sequence=-1 marks
+  // a default so an equal priority still puts customs ahead (legacy unshift).
+  const ordered = {} as Record<RuleKind, Array<{
+    rule: PushRule;
+    priority: number;
+    sequence: number;
+  }>>;
+  for (const kind of kindNames) {
+    ordered[kind] = defaults[kind].map((rule) => ({
+      rule,
+      priority: getDefaultRulePriority(kind, rule.rule_id) ?? 0,
+      sequence: -1,
+    }));
+  }
+
+  // Apply custom rules (override defaults in place or add new ones)
+  customRules.results.forEach((row, index) => {
     let conditions: PushCondition[] | undefined;
     let actions: any[];
 
@@ -317,17 +361,24 @@ async function getUserPushRules(db: D1Database, userId: string): Promise<{
       conditions,
     };
 
-    const kindRules = rules[row.kind as keyof typeof rules];
-    if (kindRules) {
-      const existingIndex = kindRules.findIndex(r => r.rule_id === row.rule_id);
-      if (existingIndex >= 0) {
-        // Override existing rule
-        kindRules[existingIndex] = { ...kindRules[existingIndex], ...ruleData };
+    const entries = ordered[row.kind as RuleKind];
+    if (entries) {
+      const existing = entries.find(e => e.sequence === -1 && e.rule.rule_id === row.rule_id);
+      if (existing) {
+        // Override an existing default without moving it from its slot.
+        existing.rule = { ...existing.rule, ...ruleData };
       } else {
-        // Add new rule
-        kindRules.unshift(ruleData);
+        // Equal priorities keep the legacy reverse SELECT-order emission.
+        entries.push({ rule: ruleData, priority: row.priority ?? 0, sequence: index });
       }
     }
+  });
+
+  const rules = {} as Record<RuleKind, PushRule[]>;
+  for (const kind of kindNames) {
+    rules[kind] = [...ordered[kind]]
+      .sort((a, b) => b.priority - a.priority || b.sequence - a.sequence)
+      .map(e => e.rule);
   }
 
   return { global: rules };
@@ -558,10 +609,15 @@ app.get('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), asyn
 });
 
 /**
- * Resolve a new rule's priority from before/after. Custom rules are emitted in
- * descending priority order (they are unshifted in SELECT priority ASC order),
- * so "before" takes the reference priority and "after" takes the next lower
- * one; the reference rule and the rules following it are shifted down.
+ * Resolve a new rule's priority from before/after. Emission order is descending
+ * priority, with defaults on their derived effective-priority slots.
+ *
+ * - Custom reference: keep the original behaviour (shift the reference and its
+ *   followers down; "before" takes its priority, "after" the next lower one).
+ * - Default reference: shift only the customs in that default's slot gap and
+ *   take the integer immediately before/after the default's slot boundary, so
+ *   the new rule is adjacent in GET /pushrules without storing a default row.
+ * - Unknown reference: legacy append fallback (Date.now()).
  */
 async function resolveRulePriority(
   db: D1Database,
@@ -570,35 +626,69 @@ async function resolveRulePriority(
   before?: string,
   after?: string
 ): Promise<number> {
-  if (!before && !after) return 0;
-
   const referenceId = before || after;
+  if (!referenceId) return 0;
+
   const existing = await db.prepare(`
     SELECT rule_id, priority FROM push_rules
     WHERE user_id = ? AND kind = ?
     ORDER BY priority ASC
   `).bind(userId, kind).all<{ rule_id: string; priority: number }>();
 
-  const reference = existing.results.find(r => r.rule_id === referenceId);
-  if (!reference) {
+  // A persisted override row for a default (e.g. from PUT .../enabled) still
+  // refers to the default's canonical position, not its override row priority.
+  const defaultPriority = getDefaultRulePriority(kind, referenceId);
+  const reference = defaultPriority === undefined
+    ? existing.results.find(r => r.rule_id === referenceId)
+    : undefined;
+
+  if (!reference && defaultPriority === undefined) {
     // Unknown rule id: fall back to appending at the end of the list.
     return Date.now();
   }
 
-  const referencePriority = reference.priority ?? 0;
-  if (before) {
+  if (reference) {
+    const referencePriority = reference.priority ?? 0;
+    if (before) {
+      await db.prepare(`
+        UPDATE push_rules SET priority = priority - 1
+        WHERE user_id = ? AND kind = ? AND priority <= ?
+      `).bind(userId, kind, referencePriority).run();
+      return referencePriority;
+    }
+
     await db.prepare(`
       UPDATE push_rules SET priority = priority - 1
-      WHERE user_id = ? AND kind = ? AND priority <= ?
+      WHERE user_id = ? AND kind = ? AND priority < ?
     `).bind(userId, kind, referencePriority).run();
-    return referencePriority;
+    return referencePriority - 1;
+  }
+
+  if (defaultPriority === undefined) return Date.now(); // unreachable: custom refs returned above
+
+  const ids = DEFAULT_RULE_IDS[kind] ?? [];
+  const index = ids.indexOf(referenceId);
+  // Finite sentinels: D1 bindings cannot carry Infinity.
+  const upperBound = index <= 0
+    ? Number.MAX_SAFE_INTEGER
+    : -(index) * DEFAULT_PRIORITY_SPACING;
+  const lowerBound = index >= ids.length - 1
+    ? Number.MIN_SAFE_INTEGER
+    : -(index + 2) * DEFAULT_PRIORITY_SPACING;
+
+  if (before) {
+    await db.prepare(`
+      UPDATE push_rules SET priority = priority + 1
+      WHERE user_id = ? AND kind = ? AND priority > ? AND priority < ?
+    `).bind(userId, kind, defaultPriority, upperBound).run();
+    return defaultPriority + 1;
   }
 
   await db.prepare(`
     UPDATE push_rules SET priority = priority - 1
-    WHERE user_id = ? AND kind = ? AND priority < ?
-  `).bind(userId, kind, referencePriority).run();
-  return referencePriority - 1;
+    WHERE user_id = ? AND kind = ? AND priority < ? AND priority > ?
+  `).bind(userId, kind, defaultPriority, lowerBound).run();
+  return defaultPriority - 1;
 }
 
 // PUT /_matrix/client/v3/pushrules/:scope/:kind/:ruleId - Create/update rule
