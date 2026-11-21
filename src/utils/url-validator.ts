@@ -129,7 +129,11 @@ function isBlockedIPv6(ip: string): boolean {
  * Check if a hostname is blocked
  */
 function isBlockedHostname(hostname: string): boolean {
-  const lower = hostname.toLowerCase();
+  // A single trailing dot denotes a fully-qualified domain name, which is
+  // DNS-equivalent to the bare hostname. Strip it so it cannot evade the
+  // denylist (e.g. "localhost." must match the "localhost" entry).
+  const withoutTrailingDot = hostname.endsWith('.') ? hostname.slice(0, -1) : hostname;
+  const lower = withoutTrailingDot.toLowerCase();
 
   // Check exact matches
   if (BLOCKED_HOSTNAMES.includes(lower)) {
