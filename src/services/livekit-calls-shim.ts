@@ -29,13 +29,31 @@
 import type { Env } from '../types';
 import {
   addTracks,
+  answerDataChannelTransport,
   closeTracks,
+  CloudflareCallsError,
   createSession,
   establishDataChannelTransport,
   renegotiate,
   type SessionDescription,
   type TrackObject,
 } from './cloudflare-calls';
+
+/**
+ * Retry a Calls REST call once when the backend reports a transient 5xx; the
+ * SFU occasionally answers `internal_error` on renegotiations, and a single
+ * blip should not kill a live session.
+ */
+async function withCallsRetry<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (error) {
+    if (error instanceof CloudflareCallsError && error.statusCode >= 500) {
+      return await call();
+    }
+    throw error;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Public limits and errors
@@ -51,9 +69,14 @@ export const DEFAULT_MAX_TRACKS_PER_PARTICIPANT = 4;
 export const MAX_SDP_BYTES = 128_000;
 /** Default ICE server advertised to LiveKit clients (Cloudflare's public STUN). */
 export const DEFAULT_LIVEKIT_STUN_URLS = 'stun:stun.cloudflare.com:3478';
-/** LiveKit ping fields are seconds; the SDK multiplies them by 1000. */
+/**
+ * LiveKit ping fields are seconds; the SDK multiplies them by 1000. The
+ * interval must stay below the timeout: the client arms the pong deadline from
+ * the last server message, so a quiet gap longer than the timeout reconnects
+ * the signal socket before the first ping is even due.
+ */
 export const DEFAULT_SHIM_PING_TIMEOUT_SECONDS = 15;
-export const DEFAULT_SHIM_PING_INTERVAL_SECONDS = 30;
+export const DEFAULT_SHIM_PING_INTERVAL_SECONDS = 10;
 /**
  * LiveKit's JS SDK trickles candidates after sending an offer/answer, but
  * Cloudflare Calls requires gathered SDP in its REST `sessionDescription`.
@@ -771,6 +794,15 @@ interface ShimParticipant {
   /** Resolves once the initial subscriber answer has been accepted by Calls (or on close). */
   subscriberReady: Promise<void>;
   resolveSubscriberReady: () => void;
+  /**
+   * Cached SDP answer for the trackless publisher transport. The SDK always
+   * renegotiates once right after the first answer (creating its in-band data
+   * channels fires negotiationneeded while the initial offer is pending), and
+   * Calls' datachannels/establish accepts only the first establishment per
+   * session — a second one returns 400 decoding_error, which must not kill
+   * the whole session.
+   */
+  publisherTransportAnswer?: string;
   queues: Map<string, Promise<void>>;
   /** JSON-encoded LiveKit trickles, keyed by SignalTarget (PUBLISHER=0, SUBSCRIBER=1). */
   trickleCandidates: Map<number, TrickleCandidate[]>;
@@ -873,6 +905,34 @@ export function inferMimeType(sdp: string, mid?: string, type = 1): string {
   return `${section.kind}/${(encoding ?? (section.kind === 'audio' ? 'opus' : 'vp8')).toLowerCase()}`;
 }
 
+/**
+ * First send-capable m-line of `kind` whose mid is not already claimed, in
+ * section order. SDP defaults a section without a direction attribute to
+ * sendrecv, so only explicit recvonly/inactive sections are excluded.
+ */
+export function findSendMid(sdp: string, kind: 'audio' | 'video', claimed: Set<string>): string | undefined {
+  let sectionKind = '';
+  let mid: string | undefined;
+  let sendCapable = false;
+  const consider = (): string | undefined => (mid && sendCapable && !claimed.has(mid) ? mid : undefined);
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith('m=')) {
+      const found = consider();
+      if (found) return found;
+      sectionKind = line.slice(2).split(' ')[0] ?? '';
+      mid = undefined;
+      sendCapable = sectionKind === kind;
+    } else if (line.startsWith('a=mid:')) {
+      mid = line.slice(6).trim();
+    } else if (line.startsWith('a=recvonly') || line.startsWith('a=inactive')) {
+      sendCapable = false;
+    } else if (line.startsWith('a=sendonly') || line.startsWith('a=sendrecv')) {
+      if (sectionKind === kind) sendCapable = true;
+    }
+  }
+  return consider();
+}
+
 // ---------------------------------------------------------------------------
 // WebSocket terminator
 // ---------------------------------------------------------------------------
@@ -918,6 +978,13 @@ function participantInfo(participant: ShimParticipant, state: number): Participa
     joinedAt: participant.joinedAt,
     name: participant.identity.name,
     isPublisher: true,
+    // The SDK refuses to publish without an explicit permission grant in the
+    // JoinResponse, so mirror each participant's verified JWT grants here.
+    permission: {
+      canSubscribe: participant.identity.canSubscribe,
+      canPublish: participant.identity.canPublish,
+      canPublishData: participant.identity.canPublishData,
+    },
   };
 }
 
@@ -980,6 +1047,9 @@ export class LiveKitCallsShimSession {
     }
     ws.accept();
     this.participant.jsonMode = false;
+    if (joinRequest.reconnect) {
+      console.log('[livekit-shim] reconnect join for', this.participant.identity.identity);
+    }
     ws.addEventListener('message', (event: MessageEvent) => {
       void this.onMessage(event.data);
     });
@@ -994,9 +1064,9 @@ export class LiveKitCallsShimSession {
       // this they only learn of each other when a track is published or the
       // session closes, so a call with muted participants appears 1:1.
       this.broadcastUpdate();
-      // With subscriberPrimary=false the SDK creates a subscriber PC but waits
-      // for the server to drive negotiation. Calls sends an SFU offer via
-      // datachannels/establish, so start that before any subscription arrives.
+      // Publisher-only topology: the SDK drives the single PC from its own
+      // offers, which Calls answers. The subscriber transport offer kept for
+      // protocol compatibility is dropped by the SDK's single-PC mode.
       // A bare upgrade without JoinRequest is a legacy socket with no PC to
       // drive, so it keeps the original publisher-only session count.
       if (joinRequest.hasJoinRequest !== false) {
@@ -1045,7 +1115,10 @@ export class LiveKitCallsShimSession {
         // JoinResponse.ice_servers = 5. Without this the browser only gathers
         // host candidates and never completes ICE with the Calls SFU.
         iceServers: [{ urls: this.stunUrls }],
-        subscriberPrimary: false, // SDK still starts publisher negotiation on join
+        // Stay in publisher-only topology: Calls offers cannot be answered
+        // (see handleLiveKitSignalRequest), so a server-driven subscriber PC
+        // would never complete; publishing negotiates the single PC instead.
+        subscriberPrimary: false,
         // Seconds, not milliseconds: livekit-client multiplies both by 1000.
         pingTimeout: DEFAULT_SHIM_PING_TIMEOUT_SECONDS,
         pingInterval: DEFAULT_SHIM_PING_INTERVAL_SECONDS,
@@ -1191,19 +1264,38 @@ export class LiveKitCallsShimSession {
     const p = this.participant;
     await this.enqueue('publisher', async () => {
       const pending = [...p.pending.values()];
-      const tracks: TrackObject[] = pending.map((track) => ({ location: 'local', trackName: track.trackName }));
+      // Calls rejects a local track without the mid of its own m-section
+      // (HTTP 406 "Missing mid in track"), so map each pending track to the
+      // first unclaimed send-capable m-line of matching kind. The SDK adds
+      // one sendonly section per new track, in pending order.
+      const claimedMids = new Set(p.tracks.map((published) => published.mid));
+      const tracks: TrackObject[] = pending.map((track) => {
+        const mid = findSendMid(gatheredSdp, track.type === 0 ? 'audio' : 'video', claimedMids);
+        if (mid) claimedMids.add(mid);
+        return mid
+          ? { location: 'local', trackName: track.trackName, mid }
+          : { location: 'local', trackName: track.trackName };
+      });
       if (tracks.length === 0) {
-        // The SDK sends a trackless initial publisher offer on join. Calls
-        // rejects tracks/new with an empty list, so answer it as a bare
-        // data-channel transport instead.
-        const answer = await establishDataChannelTransport(this.env, p.publisherSessionId, {
-          type: 'offer',
-          sdp: gatheredSdp,
-        });
-        if (answer.type !== 'answer' || !answer.sdp) {
-          throw new Error('Calls did not answer the initial publisher offer');
+        // The SDK sends a trackless initial publisher offer on join, then a
+        // second one once the first answer lands (its in-band data channels
+        // fire negotiationneeded during the pending initial offer). Calls
+        // rejects tracks/new with an empty list, and datachannels/establish
+        // only accepts the first establishment per session, so renegotiation
+        // offers are answered from the cached first answer.
+        let answerSdp = p.publisherTransportAnswer;
+        if (!answerSdp) {
+          const answer = await establishDataChannelTransport(this.env, p.publisherSessionId, {
+            type: 'offer',
+            sdp: gatheredSdp,
+          });
+          if (answer.type !== 'answer' || !answer.sdp) {
+            throw new Error('Calls did not answer the initial publisher offer');
+          }
+          answerSdp = answer.sdp;
+          p.publisherTransportAnswer = answerSdp;
         }
-        this.send({ message: 'answer', value: { type: 'answer', sdp: answer.sdp, id: sd.id } });
+        this.send({ message: 'answer', value: { type: 'answer', sdp: answerSdp, id: sd.id } });
         return;
       }
       const response = await addTracks(this.env, p.publisherSessionId, {
@@ -1301,11 +1393,18 @@ export class LiveKitCallsShimSession {
     if ((sd.sdp ?? '').length > MAX_SDP_BYTES) throw new ShimCapacityError('SDP too large');
     p.pendingOffers.delete(sd.id!);
     const gatheredSdp = await this.gatherTrickleCandidates(1, sd.sdp ?? ''); // SignalTarget.SUBSCRIBER
+    const isInitialExchange = p.pendingInitialOfferId === sd.id;
     await this.enqueue('subscriber', async () => {
-      const response = await renegotiate(this.env, p.subscriberSessionId!, {
-        sessionDescription: { type: 'answer', sdp: gatheredSdp } as SessionDescription,
-      });
-      const isInitialExchange = p.pendingInitialOfferId === sd.id;
+      // The initial transport offer came from datachannels/establish, and Calls
+      // rejects /renegotiate for it; submit the answer through establish too.
+      const response = isInitialExchange
+        ? await withCallsRetry(() => answerDataChannelTransport(this.env, p.subscriberSessionId!, {
+            type: 'answer',
+            sdp: gatheredSdp,
+          }))
+        : await withCallsRetry(() => renegotiate(this.env, p.subscriberSessionId!, {
+            sessionDescription: { type: 'answer', sdp: gatheredSdp } as SessionDescription,
+          }));
       if (response.sessionDescription?.type === 'offer') {
         // A follow-up offer keeps the subscription gate closed until it too is
         // answered; the initial exchange may produce one in Calls.
@@ -1386,6 +1485,12 @@ export interface HandleOptions {
  * request to the room's Durable Object and returns its 101 response verbatim.
  * The DO accepts the server socket and owns the registry and all broadcasts;
  * no signaling state is kept in the Worker isolate.
+ *
+ * Note: the SDK's v0 path would force dual-PC subscriber-primary mode, but
+ * Calls has no endpoint that accepts the client's answer to a
+ * datachannels/establish transport offer (both /renegotiate and establish
+ * reject it), so the v0 flow cannot complete behind Calls and the v1
+ * publisher-only topology stays.
  */
 export async function handleLiveKitSignalRequest(
   request: Request,

@@ -77,6 +77,14 @@ export class LiveKitShimDurableObject implements DurableObject {
     } catch (error) {
       return Response.json({ error: error instanceof Error ? error.message : 'Invalid credentials' }, { status: 401 });
     }
+    // The SDK's v0 path (which this shim forces by 404ing /rtc/v1) joins
+    // without a join_request blob but with SDK query markers. Treat those as
+    // full joins so the subscriber offer is still sent; only a truly bare
+    // upgrade stays on the legacy publisher-only path.
+    if (joinRequest.hasJoinRequest === false
+      && (url.searchParams.has('auto_subscribe') || url.searchParams.has('sdk'))) {
+      joinRequest = { ...joinRequest, hasJoinRequest: true };
+    }
 
     const pair = new WebSocketPair();
     const session = new LiveKitCallsShimSession(this.env, identity, pair[1], {

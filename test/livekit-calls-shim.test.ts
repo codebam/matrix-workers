@@ -8,6 +8,7 @@ import {
   DEFAULT_SHIM_PING_INTERVAL_SECONDS,
   DEFAULT_SHIM_PING_TIMEOUT_SECONDS,
   decodePb,
+  findSendMid,
   handleLiveKitSignalRequest,
   inferMimeType,
   injectTrickleCandidates,
@@ -46,6 +47,11 @@ const SUBSCRIBER_OFFER_SDP = OFFER_SDP.replace('a=mid:0', 'a=mid:1').replace('o=
 const INITIAL_OFFER_SDP = [
   'v=0', 'o=- 3 3 IN IP4 127.0.0.1', 's=-', 't=0 0',
   'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'a=mid:0', '',
+].join('\r\n');
+const OFFER_AV_SDP = [
+  'v=0', 'o=- 0 0 IN IP4 127.0.0.1', 's=-', 't=0 0',
+  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:0', 'a=sendonly', 'a=rtpmap:111 opus/48000/2', '',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:1', 'a=sendonly', 'a=rtpmap:96 VP8/90000', '',
 ].join('\r\n');
 
 // --- minimal protobuf encoder for test-side SignalRequest frames ------------
@@ -211,13 +217,15 @@ async function answerInitialOffer(ws: FakeSocket, calls: CallsCall[]): Promise<n
   const initial = sentFrames(ws, 3)[0]!;
   const id = n(initial.body, 3)!;
   ws.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, id)));
-  await vi.waitFor(() => expect(calls.some((call) => call.url.includes('/renegotiate'))).toBe(true));
+  await vi.waitFor(() => expect(calls.some((call) => call.url.includes('/datachannels/establish')
+    && call.body.sessionDescription?.type === 'answer')).toBe(true));
   return id;
 }
 
-function installCallsFetch(options: { failDatachannels?: boolean } = {}): { calls: CallsCall[]; restore: () => void } {
+function installCallsFetch(options: { failDatachannels?: boolean; failSubscriberAnswerOnce?: boolean } = {}): { calls: CallsCall[]; restore: () => void } {
   const calls: CallsCall[] = [];
   let sessionCounter = 0;
+  let answerFailed = false;
   const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? 'GET';
@@ -235,11 +243,21 @@ function installCallsFetch(options: { failDatachannels?: boolean } = {}): { call
           errorDescription: 'Datachannels unavailable',
         }), { status: 406, headers: { 'Content-Type': 'application/json' } });
       }
+      const submitted = body.sessionDescription as { type?: string } | undefined;
+      if (submitted?.type === 'answer' && options.failSubscriberAnswerOnce && !answerFailed) {
+        answerFailed = true;
+        return new Response(JSON.stringify({
+          errorCode: 'internal_error',
+          errorDescription: 'Backend error',
+        }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
       return Response.json({
-        sessionDescription: body.sessionDescription
-          ? { type: 'answer', sdp: ANSWER_SDP }
-          : { type: 'offer', sdp: INITIAL_OFFER_SDP },
-        requiresImmediateRenegotiation: !body.sessionDescription,
+        sessionDescription: submitted?.type === 'answer'
+          ? undefined
+          : submitted
+            ? { type: 'answer', sdp: ANSWER_SDP }
+            : { type: 'offer', sdp: INITIAL_OFFER_SDP },
+        requiresImmediateRenegotiation: !submitted,
         dataChannel: { location: 'remote', dataChannelName: 'server-events', id: 0 },
       });
     }
@@ -385,6 +403,12 @@ describe('livekit-calls-shim', () => {
       expect(join.field).toBe(1); // SignalResponse.join
       expect(s(msgs(join.body, 1)[0]!, 2)).toBe('room_b');
       expect(n(join.body, 6)).toBe(0); // subscriberPrimary = false
+      const self = msgs(join.body, 2)[0]!;
+      const permission = msgs(self, 11)[0]!;
+      // The SDK refuses to publish without an explicit JoinResponse grant.
+      expect(n(permission, 1)).toBe(1); // canSubscribe
+      expect(n(permission, 2)).toBe(1); // canPublish
+      expect(n(permission, 3)).toBe(1); // canPublishData
       shim.close();
     });
 
@@ -467,7 +491,8 @@ describe('livekit-calls-shim', () => {
       expect(tracksCall.method).toBe('POST');
       expect(tracksCall.body).toMatchObject({
         sessionDescription: { type: 'offer', sdp: OFFER_SDP },
-        tracks: [{ location: 'local', trackName: 'camera' }],
+        // Calls 406s without the mid of the track's own m-section.
+        tracks: [{ location: 'local', trackName: 'camera', mid: '0' }],
       });
 
       const answer = lastSent(ws, 2)!;
@@ -516,11 +541,11 @@ describe('livekit-calls-shim', () => {
       });
       await shim.start({
         addTrackRequests: [{ cid: 'cid-join', name: 'mic', type: 0, source: 2 }],
-        publisherOffer: { type: 'offer', sdp: OFFER_SDP, id: 1 },
+        publisherOffer: { type: 'offer', sdp: OFFER_AV_SDP, id: 1 },
       });
       await vi.waitFor(() => expect(localTracksCall(callsFetch.calls)).toBeDefined());
       const tracksCall = localTracksCall(callsFetch.calls)!;
-      expect(tracksCall.body.tracks).toEqual([{ location: 'local', trackName: 'mic' }]);
+      expect(tracksCall.body.tracks).toEqual([{ location: 'local', trackName: 'mic', mid: '0' }]);
       shim.close();
     });
 
@@ -545,6 +570,34 @@ describe('livekit-calls-shim', () => {
       const answer = sentFrames(ws, 2).find((frame) => s(frame.body, 1) === 'answer')!;
       expect(s(answer.body, 2)).toBe(ANSWER_SDP);
       expect(n(answer.body, 3)).toBe(7);
+      shim.close();
+    });
+
+    it('answers the SDK follow-up renegotiation offer from the cached answer without another Calls call', async () => {
+      const ws = new FakeSocket();
+      const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_trackless2'), ws.asWebSocket(), {
+        registry: new LiveKitShimRegistry(5, 5),
+      });
+      await shim.start({
+        addTrackRequests: [],
+        publisherOffer: { type: 'offer', sdp: OFFER_SDP, id: 7 },
+      });
+      await vi.waitFor(() => expect(sentFrames(ws, 2).find((frame) => s(frame.body, 1) === 'answer')).toBeDefined());
+
+      // The SDK renegotiates immediately after applying the first answer.
+      ws.receive(requestFrame(1, sdBody('offer', OFFER_SDP, 8)));
+      await vi.waitFor(() => expect(sentFrames(ws, 2).filter((frame) => s(frame.body, 1) === 'answer')).toHaveLength(2));
+
+      const establishCalls = callsFetch.calls.filter((call) => call.url.includes('/datachannels/establish')
+        && call.body.sessionDescription);
+      expect(establishCalls).toHaveLength(1);
+      expect(callsFetch.calls.some((call) => call.url.includes('/tracks/new')
+        && (call.body.tracks as unknown[]).length === 0)).toBe(false);
+
+      const answers = sentFrames(ws, 2).filter((frame) => s(frame.body, 1) === 'answer');
+      expect(s(answers[1]!.body, 2)).toBe(ANSWER_SDP);
+      expect(n(answers[1]!.body, 3)).toBe(8);
+      expect(ws.closeCode).toBeUndefined();
       shim.close();
     });
 
@@ -610,12 +663,35 @@ describe('livekit-calls-shim', () => {
       expect(offerId).toBeGreaterThan(0);
 
       subscriberWs.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, offerId)));
-      await vi.waitFor(() => expect(callsFetch.calls.filter((call) => call.url.includes('/renegotiate'))).toHaveLength(2));
+      await vi.waitFor(() => expect(callsFetch.calls.filter((call) => call.url.includes('/renegotiate'))).toHaveLength(1));
       const renegotiate = callsFetch.calls.filter((call) => call.url.includes('/renegotiate')).at(-1)!;
       expect(renegotiate.method).toBe('PUT');
       expect(renegotiate.body).toEqual({ sessionDescription: { type: 'answer', sdp: ANSWER_SDP } });
       publisher.close();
       subscriber.close();
+    });
+
+    it('retries once when Calls reports a transient 5xx on the initial subscriber answer', async () => {
+      callsFetch.restore();
+      callsFetch = installCallsFetch({ failSubscriberAnswerOnce: true });
+      const ws = new FakeSocket();
+      const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_retry5xx'), ws.asWebSocket(), {
+        registry: new LiveKitShimRegistry(5, 5),
+      });
+      await shim.start({ addTrackRequests: [] });
+
+      const offer = sentFrames(ws, 3)[0]!;
+      expect(s(offer.body, 1)).toBe('offer');
+      const offerId = n(offer.body, 3)!;
+      ws.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, offerId)));
+
+      await vi.waitFor(() => {
+        const answers = callsFetch.calls.filter((call) => call.url.includes('/datachannels/establish')
+          && call.body.sessionDescription?.type === 'answer');
+        expect(answers).toHaveLength(2);
+      });
+      expect(ws.closeCode).toBeUndefined();
+      shim.close();
     });
 
     it('starts the subscriber PC with one Calls offer, applies its answer, and reuses that session for subscriptions', async () => {
@@ -652,13 +728,17 @@ describe('livekit-calls-shim', () => {
       // A transport-only offer has no LiveKit track mapping (SessionDescription.mid_to_track_id = 4).
       expect(initial.body.get(4)).toBeUndefined();
 
-      // The client answer is submitted to Calls on that same subscriber session.
+      // The client answer is submitted through the establish endpoint; Calls
+      // rejects /renegotiate for a datachannel transport offer.
       const initialId = n(initial.body, 3)!;
       subscriberWs.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, initialId)));
-      await vi.waitFor(() => expect(callsFetch.calls.filter((call) => call.url.includes('/renegotiate'))).toHaveLength(1));
-      const initialRenegotiate = callsFetch.calls.filter((call) => call.url.includes('/renegotiate')).at(-1)!;
-      expect(initialRenegotiate.url).toContain('/sessions/sess-4/renegotiate');
-      expect(initialRenegotiate.body).toEqual({ sessionDescription: { type: 'answer', sdp: ANSWER_SDP } });
+      const establishAnswers = () => callsFetch.calls.filter((call) => call.url.includes('/datachannels/establish')
+        && call.body.sessionDescription?.type === 'answer');
+      await vi.waitFor(() => expect(establishAnswers()).toHaveLength(1));
+      const initialAnswer = establishAnswers()[0]!;
+      expect(initialAnswer.url).toContain('/sessions/sess-4/datachannels/establish');
+      expect(initialAnswer.body.sessionDescription).toEqual({ type: 'answer', sdp: ANSWER_SDP });
+      expect(callsFetch.calls.some((call) => call.url.includes('/renegotiate'))).toBe(false);
 
       // A later subscription reuses sess-4: it adds one new offer (new id),
       // never a second subscriber session or a duplicate initial offer.
@@ -703,7 +783,7 @@ describe('livekit-calls-shim', () => {
         sdpMid: '0',
         sdpMLineIndex: 0,
       }), 1)));
-      await vi.waitFor(() => expect(callsFetch.calls.filter((call) => call.url.includes('/renegotiate'))).toHaveLength(2));
+      await vi.waitFor(() => expect(callsFetch.calls.filter((call) => call.url.includes('/renegotiate'))).toHaveLength(1));
       const renegotiate = callsFetch.calls.filter((call) => call.url.includes('/renegotiate')).at(-1)!;
       expect((renegotiate.body.sessionDescription as { sdp: string }).sdp).toContain(SRFLX_CANDIDATE);
       publisher.close();
@@ -900,6 +980,17 @@ describe('livekit-calls-shim', () => {
       const audio = OFFER_SDP.replace('m=video 9 UDP/TLS/RTP/SAVPF 96', 'm=audio 9 UDP/TLS/RTP/SAVPF 111')
         .replace('a=rtpmap:96 VP8/90000', 'a=rtpmap:111 opus/48000/2');
       expect(inferMimeType(audio, '0', 0)).toBe('audio/opus');
+    });
+
+    it('maps pending tracks to unclaimed send-capable m-lines', () => {
+      const sdp = [
+        'v=0', 'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:0', 'a=recvonly',
+        'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:1', 'a=sendonly',
+        'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:2', '',
+      ].join('\r\n');
+      expect(findSendMid(sdp, 'video', new Set())).toBe('1');
+      expect(findSendMid(sdp, 'video', new Set(['1']))).toBe('2');
+      expect(findSendMid(sdp, 'audio', new Set())).toBeUndefined();
     });
 
     it('decodes JSON-mode SignalRequests', async () => {

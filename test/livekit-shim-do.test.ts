@@ -213,6 +213,29 @@ describe('LiveKitShimDurableObject', () => {
     expect(callsFetch.calls.filter((call) => call.url.endsWith('/sessions/new'))).toHaveLength(3);
   });
 
+  it('treats SDK v0 joins without a join_request as full joins', async () => {
+    const instances = new Map<string, LiveKitShimDurableObject>();
+    const storages = new Map<string, ReturnType<typeof makeStorage>>();
+    const env = makeEnv({} as DurableObjectNamespace);
+    const { namespace } = makeNamespace(instances, storages, env);
+
+    // The v0 path (forced by the shim's /rtc/v1 404) sends only query markers.
+    const token = await generateLiveKitToken(API_KEY, API_SECRET, 'room_v0', '@dave:example.org');
+    const request = new Request(
+      `https://example.org/livekit/signal/rtc?access_token=${encodeURIComponent(token)}`
+        + '&auto_subscribe=1&sdk=js&version=2.25.0&protocol=18&client_protocol=3',
+      { headers: { Upgrade: 'websocket' } }
+    );
+    await handleLiveKitSignalRequest(request, env, { namespace });
+
+    const join = joinIdentities(pairs[0]!.server.sent[0]);
+    expect(join.self).toBe('@dave:example.org');
+    // A full join opens the subscriber transport: publisher and subscriber
+    // sessions plus the subscriber's datachannel establish.
+    expect(callsFetch.calls.filter((call) => call.url.endsWith('/sessions/new'))).toHaveLength(2);
+    expect(callsFetch.calls.some((call) => call.url.includes('/datachannels/establish'))).toBe(true);
+  });
+
   it('enforces per-room and global caps in the DO before creating Calls sessions', async () => {
     const instances = new Map<string, LiveKitShimDurableObject>();
     const storages = new Map<string, ReturnType<typeof makeStorage>>();

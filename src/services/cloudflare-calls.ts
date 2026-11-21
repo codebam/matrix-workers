@@ -165,9 +165,40 @@ export async function establishDataChannelTransport(
   sessionId: string,
   offer?: SessionDescription
 ): Promise<SessionDescription> {
+  const response = await establishDataChannel(env, sessionId, offer);
+  if (!response.sessionDescription) {
+    throw new CloudflareCallsError(
+      offer ? 'No answer received from SFU' : 'No offer received from SFU',
+      offer ? 'NO_ANSWER' : 'NO_OFFER',
+      500
+    );
+  }
+  return response.sessionDescription;
+}
+
+/**
+ * Submit the client's answer to the transport offer that
+ * datachannels/establish produced. Calls rejects /renegotiate for this
+ * exchange (HTTP 500 internal_error), so the answer goes back through the
+ * establish endpoint itself. The response normally carries no
+ * sessionDescription; a non-empty one is a follow-up offer.
+ */
+export async function answerDataChannelTransport(
+  env: Env,
+  sessionId: string,
+  answer: SessionDescription
+): Promise<EstablishDataChannelsResponse> {
+  return establishDataChannel(env, sessionId, answer);
+}
+
+async function establishDataChannel(
+  env: Env,
+  sessionId: string,
+  sessionDescription?: SessionDescription
+): Promise<EstablishDataChannelsResponse> {
   const request: EstablishDataChannelsRequest = {
     dataChannel: { location: 'remote', dataChannelName: 'server-events' },
-    ...(offer ? { sessionDescription: offer } : {}),
+    ...(sessionDescription ? { sessionDescription } : {}),
   };
   const response = await callsRequest<EstablishDataChannelsResponse>(
     env,
@@ -183,14 +214,7 @@ export async function establishDataChannelTransport(
       400
     );
   }
-  if (!response.sessionDescription) {
-    throw new CloudflareCallsError(
-      offer ? 'No answer received from SFU' : 'No offer received from SFU',
-      offer ? 'NO_ANSWER' : 'NO_OFFER',
-      500
-    );
-  }
-  return response.sessionDescription;
+  return response;
 }
 
 /**
