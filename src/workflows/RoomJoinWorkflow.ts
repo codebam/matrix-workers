@@ -25,6 +25,14 @@ import {
   getMembership,
 } from '../services/database';
 import { getServerSigningKey, federationGet, federationPut } from '../services/federation-keys';
+import { getRoomVersion } from '../services/room-versions';
+import { applyEventRedaction } from '../services/event-redaction';
+import {
+  askPolicyServerSignature,
+  attachPolicySignature,
+  eventExemptFromPolicy,
+  getRoomPolicyServer,
+} from '../services/policy-server';
 import { validateRemoteJoinTemplate } from './join-template-validation';
 
 // Room versions this homeserver can participate in. make_join must advertise
@@ -132,6 +140,26 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           },
           timeout: 30000,
         }, async () => {
+          // MSC4284 (spec v1.18): if the room's state (already known to us
+          // from a previous join or a partial state sync) names a policy
+          // server, ask it to countersign our join — residents reject
+          // unsigned joins in policy rooms. A refusal fails the join here
+          // instead of three doomed send_join attempts. Fresh first joins
+          // cannot know the room's policy state yet; the resident's
+          // send_join rejection is the failure signal for those.
+          const policy = await getRoomPolicyServer(this.env.DB, roomId);
+          if (policy && !eventExemptFromPolicy(joinEventData as unknown as { type?: unknown; state_key?: unknown })) {
+            const asked = await askPolicyServerSignature(
+              this.env, policy, joinEventData as unknown as Record<string, unknown>
+            );
+            if ('signature' in asked) {
+              attachPolicySignature(
+                joinEventData as unknown as Record<string, unknown>, policy.via, asked.signature
+              );
+            } else {
+              throw new Error(`policy server refused the join: ${asked.error}`);
+            }
+          }
           return await this.sendJoinRequest(chosenServer ?? remoteServer, roomId, joinEventData);
         })) as { auth_chain?: any[]; state?: any[]; event?: any };
       }
@@ -578,6 +606,31 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           membership === 'knock'
         ) {
           await updateMembership(this.env.DB, roomId, evStateKey, membership, String(normalized.event_id));
+        }
+      }
+
+      // Inbound redactions in backfilled history prune the target's
+      // client view too, mirroring the live transaction path.
+      if (ev.type === 'm.room.redaction') {
+        const behavior = getRoomVersion(String(roomVersion ?? '10'));
+        const targetId = behavior?.updatedRedactionRules
+          ? (ev.content as { redacts?: unknown } | undefined)?.redacts
+          : (ev as { redacts?: unknown }).redacts;
+        if (typeof targetId === 'string' && targetId) {
+          await applyEventRedaction(
+            this.env.DB,
+            roomId,
+            String(roomVersion ?? '10'),
+            {
+              eventId: String(normalized.event_id),
+              sender: String(ev.sender ?? ''),
+              originServerTs: Number(ev.origin_server_ts ?? Date.now()),
+              content: (ev.content ?? {}) as Record<string, unknown>,
+            },
+            targetId
+          ).catch((pruneErr) => {
+            console.warn('[RoomJoinWorkflow] backfilled redaction prune failed:', pruneErr);
+          });
         }
       }
     } catch (storeErr) {

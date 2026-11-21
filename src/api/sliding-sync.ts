@@ -766,7 +766,7 @@ async function getInviteRoomData(
 
   for (const eventType of strippedStateTypes) {
     let query = `
-      SELECT e.event_type, e.state_key, e.content, e.sender
+      SELECT e.event_type, e.state_key, e.content, e.sender, e.redacted_content
       FROM room_state rs
       JOIN events e ON rs.event_id = e.event_id
       WHERE rs.room_id = ? AND rs.event_type = ?
@@ -786,7 +786,8 @@ async function getInviteRoomData(
         inviteState.push({
           type: event.event_type,
           state_key: event.state_key,
-          content: JSON.parse(event.content),
+          // Redacted events serve their pruned content.
+          content: JSON.parse(event.redacted_content ?? event.content),
           sender: event.sender,
         });
       } catch { /* ignore parse errors */ }

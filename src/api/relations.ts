@@ -52,7 +52,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId', requireAuth(), as
 
   // Query relations
   let query = `
-    SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
+    SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
     FROM events e
     WHERE e.room_id = ? AND e.relates_to_event_id = ?
   `;
@@ -76,6 +76,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId', requireAuth(), as
     sender: string;
     origin_server_ts: number;
     content: string;
+    redacted_content?: string | null;
   }>();
 
   const hasMore = results.results.length > limit;
@@ -84,7 +85,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId', requireAuth(), as
     type: e.event_type,
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
-    content: JSON.parse(e.content),
+    content: JSON.parse(e.redacted_content ?? e.content),
     room_id: roomId,
   }));
 
@@ -122,7 +123,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType', requireA
 
   // Query relations by type
   const results = await db.prepare(`
-    SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
+    SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
     FROM events e
     WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
@@ -133,6 +134,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType', requireA
     sender: string;
     origin_server_ts: number;
     content: string;
+    redacted_content?: string | null;
   }>();
 
   const hasMore = results.results.length > limit;
@@ -141,7 +143,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType', requireA
     type: e.event_type,
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
-    content: JSON.parse(e.content),
+    content: JSON.parse(e.redacted_content ?? e.content),
     room_id: roomId,
   }));
 
@@ -179,7 +181,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType/:eventType
 
   // Query relations by type and event type
   const results = await db.prepare(`
-    SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
+    SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
     FROM events e
     WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ? AND e.event_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
@@ -190,6 +192,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType/:eventType
     sender: string;
     origin_server_ts: number;
     content: string;
+    redacted_content?: string | null;
   }>();
 
   const hasMore = results.results.length > limit;
@@ -198,7 +201,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType/:eventType
     type: e.event_type,
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
-    content: JSON.parse(e.content),
+    content: JSON.parse(e.redacted_content ?? e.content),
     room_id: roomId,
   }));
 
@@ -233,7 +236,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
 
   // Find thread roots (events that have replies with m.thread relation)
   let query = `
-    SELECT DISTINCT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content
+    SELECT DISTINCT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
     FROM events e
     WHERE e.room_id = ? AND e.event_id IN (
       SELECT DISTINCT relates_to_event_id FROM events
@@ -258,6 +261,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
     sender: string;
     origin_server_ts: number;
     content: string;
+    redacted_content?: string | null;
   }>();
 
   const threads = results.results.map(e => ({
@@ -265,7 +269,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
     type: e.event_type,
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
-    content: JSON.parse(e.content),
+    content: JSON.parse(e.redacted_content ?? e.content),
     room_id: roomId,
   }));
 

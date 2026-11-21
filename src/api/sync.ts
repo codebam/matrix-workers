@@ -668,11 +668,19 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       continue;
     }
 
+    // Redacted state events serve their pruned content in stripped state.
+    const redactedRows = await c.env.DB.prepare(
+      `SELECT event_id, redacted_content FROM events WHERE room_id = ? AND redacted_content IS NOT NULL`
+    ).bind(roomId).all<{ event_id: string; redacted_content: string }>();
+    const prunedContent = new Map(
+      redactedRows.results.map(r => [r.event_id, JSON.parse(r.redacted_content)] as const)
+    );
+
     // Strip state for invited rooms
     let strippedState = state.map(event => ({
       type: event.type,
       state_key: event.state_key!,
-      content: event.content,
+      content: prunedContent.get(event.event_id) ?? event.content,
       sender: event.sender,
     }));
 
