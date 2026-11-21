@@ -68,10 +68,23 @@ function asRow(id: string, roomRegex: string): AsRow {
   };
 }
 
-function createDb(opts: { appservices?: AsRow[]; roomVersion?: string; remoteMember?: boolean } = {}) {
+type ToDeviceRow = {
+  recipient_user_id: string;
+  sender_user_id: string;
+  event_type: string;
+  content: string;
+};
+
+function createDb(opts: {
+  appservices?: AsRow[];
+  roomVersion?: string;
+  remoteMember?: boolean;
+  toDevice?: ToDeviceRow[];
+} = {}) {
   const appservices = opts.appservices ?? [];
   const roomVersion = opts.roomVersion ?? '10';
   const remoteMember = opts.remoteMember ?? false;
+  const toDevice = opts.toDevice ?? [];
   let stream = 10;
   let txnCounter = 0;
   const transactions: Array<{ id: number; asId: string; events: string }> = [];
@@ -145,6 +158,9 @@ function createDb(opts: { appservices?: AsRow[]; roomVersion?: string; remoteMem
         if (sql.includes('FROM room_state rs')) {
           return { results: stateEvents as T[] };
         }
+        if (sql.includes('FROM to_device_messages')) {
+          return { results: toDevice as T[] };
+        }
         return { results: [] as T[] };
       },
       async run() {
@@ -182,11 +198,29 @@ function createDb(opts: { appservices?: AsRow[]; roomVersion?: string; remoteMem
 
 type Db = ReturnType<typeof createDb>;
 
-function envFor(db: Db): Env {
+function envFor(db: Db, ephemeralState: {
+  typing?: string[];
+  receipts?: Record<string, Record<string, Record<string, { ts: number }>>>;
+} = {}): Env {
   return {
     SERVER_NAME: SERVER,
     DB: db as unknown as D1Database,
     CACHE: { get: async () => null, put: async () => {}, delete: async () => {} } as unknown as KVNamespace,
+    ROOMS: {
+      idFromName: (n: string) => n,
+      get: () => ({
+        fetch: async (request: Request) => {
+          const path = new URL(request.url).pathname;
+          if (path === '/typing') {
+            return Response.json({ user_ids: ephemeralState.typing ?? [] });
+          }
+          if (path === '/receipts') {
+            return Response.json({ receipts: ephemeralState.receipts ?? {} });
+          }
+          return new Response('not found', { status: 404 });
+        },
+      }),
+    } as unknown as Env['ROOMS'],
     SYNC: {
       idFromName: (n: string) => n,
       get: () => ({ fetch: async () => new Response('{}') }),
@@ -249,9 +283,77 @@ describe('fanoutEventToAppServices (service)', () => {
     expect(url).toBe('https://interested.example.com/_matrix/app/v1/transactions/1');
     expect(init.method).toBe('PUT');
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer hs-interested');
-    expect(JSON.parse(String(init.body))).toEqual({ events: [EVENT] });
+    expect(JSON.parse(String(init.body))).toEqual({
+      events: [EVENT],
+      ephemeral: [],
+      to_device: [],
+    });
     expect(db.transactions).toHaveLength(1);
     expect(db.sentUpdates).toHaveLength(1);
+  });
+
+  it('includes typing, public receipts and namespace-matched to_device messages', async () => {
+    const bot = '@_bridge_bot:example.com';
+    const bridge = {
+      ...asRow('bridge', '^!r:example\\.com$'),
+      namespaces: JSON.stringify({
+        users: [{ exclusive: true, regex: '^@_bridge_.*:example\\.com$' }],
+        rooms: [{ exclusive: false, regex: '^!r:example\\.com$' }],
+        aliases: [],
+      }),
+    };
+    const db = createDb({
+      appservices: [bridge],
+      toDevice: [
+        {
+          recipient_user_id: bot,
+          sender_user_id: ALICE,
+          event_type: 'm.room_key',
+          content: JSON.stringify({ algorithm: 'm.megolm.v1.aes-sha2' }),
+        },
+        {
+          recipient_user_id: '@alice:example.com',
+          sender_user_id: ALICE,
+          event_type: 'm.room_key',
+          content: JSON.stringify({ algorithm: 'not-for-the-bridge' }),
+        },
+      ],
+    });
+    const env = envFor(db, {
+      typing: [ALICE, bot],
+      receipts: {
+        '$evt': {
+          'm.read': { [ALICE]: { ts: 123 } },
+          'm.read.private': { [ALICE]: { ts: 456 } },
+        },
+      },
+    });
+
+    await fanoutEventToAppServices(env, EVENT);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const sent = JSON.parse(String(init.body)) as {
+      events: unknown[];
+      ephemeral: Array<Record<string, unknown>>;
+      to_device: Array<Record<string, unknown>>;
+    };
+    expect(sent.events).toEqual([EVENT]);
+    expect(sent.ephemeral).toEqual([
+      { type: 'm.typing', room_id: ROOM, content: { user_ids: [ALICE, bot] } },
+      {
+        type: 'm.receipt',
+        room_id: ROOM,
+        content: { '$evt': { 'm.read': { [ALICE]: { ts: 123 } } } },
+      },
+    ]);
+    expect(sent.to_device).toEqual([
+      {
+        type: 'm.room_key',
+        sender: ALICE,
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      },
+    ]);
   });
 
   it('does nothing when no appservices are registered', async () => {

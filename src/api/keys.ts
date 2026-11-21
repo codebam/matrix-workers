@@ -562,6 +562,7 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
             `).bind(Date.now(), userId, deviceId, key.keyId).run();
 
             oneTimeKeys[userId][deviceId] = {
+              ...oneTimeKeys[userId][deviceId],
               [key.keyId]: key.keyData,
             };
             foundKey = true;
@@ -587,6 +588,7 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
             `).bind(Date.now(), otk.id).run();
 
             oneTimeKeys[userId][deviceId] = {
+              ...oneTimeKeys[userId][deviceId],
               [otk.key_id]: JSON.parse(otk.key_data),
             };
             foundKey = true;
@@ -612,6 +614,7 @@ app.post('/_matrix/client/v3/keys/claim', requireAuth(), async (c) => {
 
             const keyData = JSON.parse(fallback.key_data);
             oneTimeKeys[userId][deviceId] = {
+              ...oneTimeKeys[userId][deviceId],
               [fallback.key_id]: {
                 ...keyData,
                 fallback: true,

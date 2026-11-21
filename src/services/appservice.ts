@@ -177,11 +177,18 @@ export function getInterestedAppServices(
   return interested;
 }
 
+/** Optional sections collected for an application-service transaction. */
+export interface AppServiceTransactionSections {
+  ephemeral?: Record<string, unknown>[];
+  to_device?: Record<string, unknown>[];
+}
+
 /** Send transaction to an app service */
 export async function sendAppServiceTransaction(
   db: D1Database,
   appservice: AppServiceRegistration,
-  events: Record<string, unknown>[]
+  events: Record<string, unknown>[],
+  sections: AppServiceTransactionSections = {}
 ): Promise<boolean> {
   // Store the transaction
   const txnResult = await db.prepare(
@@ -190,6 +197,13 @@ export async function sendAppServiceTransaction(
   ).bind(appservice.id, JSON.stringify(events), Date.now()).run();
 
   const txnId = txnResult.meta.last_row_id;
+  // The Application Service API allows empty ephemeral/to_device arrays, and
+  // real bridges tolerate (and often expect) the keys to be present.
+  const body = {
+    events,
+    ephemeral: sections.ephemeral ?? [],
+    to_device: sections.to_device ?? [],
+  };
 
   try {
     const response = await fetch(`${appservice.url}/_matrix/app/v1/transactions/${txnId}`, {
@@ -198,7 +212,7 @@ export async function sendAppServiceTransaction(
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${appservice.hs_token}`,
       },
-      body: JSON.stringify({ events }),
+      body: JSON.stringify(body),
       // A hung bridge must not hold the originating request open forever.
       signal: AbortSignal.timeout(10_000),
     });

@@ -75,6 +75,24 @@ export function addMediaSecurityHeaders(headers: Headers): void {
   headers.set('X-Frame-Options', 'DENY');
 }
 
+/** All thumbnail responses must be inline and carry the media security headers. */
+function thumbnailHeaders(contentType: string, generated?: boolean): Headers {
+  const headers = new Headers();
+  headers.set('Content-Type', contentType);
+  headers.set('Content-Disposition', 'inline');
+  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+  if (generated !== undefined) {
+    headers.set('X-Thumbnail-Generated', generated ? 'true' : 'false');
+  }
+  addMediaSecurityHeaders(headers);
+  return headers;
+}
+
+/** Matrix `allow_remote=false` disables remote-origin fetches (cached media is still served). */
+export function parseAllowRemote(raw: string | undefined): boolean {
+  return raw !== 'false' && raw !== '0';
+}
+
 // Helper to decode HTML entities (only decode once to prevent double-decoding attacks)
 /** Exported for unit tests. */
 export function decodeHtmlEntities(text: string): string {
@@ -304,7 +322,8 @@ export function parseFederationMediaMultipart(
 export async function fetchRemoteMedia(
   env: MediaEnv,
   serverName: string,
-  mediaId: string
+  mediaId: string,
+  allowRemote = true
 ): Promise<RemoteMedia | null> {
   const cacheKey = `remote_media_${serverName}_${mediaId}`;
 
@@ -320,6 +339,9 @@ export async function fetchRemoteMedia(
   } catch {
     // cache reads are best-effort
   }
+
+  // allow_remote=false: local/cached media only, never contact the origin.
+  if (!allowRemote) return null;
 
   try {
     const response = await federationGet(
@@ -390,23 +412,23 @@ async function serveRemoteThumbnail(
   mediaId: string,
   width: number,
   height: number,
-  method: string
+  method: string,
+  allowRemote = true
 ): Promise<Response> {
   const thumbnailKey = `thumb_remote_${serverName}_${mediaId}_${width}x${height}_${method}`;
 
   try {
     const existing = await env.MEDIA.get(thumbnailKey);
     if (existing) {
-      const headers = new Headers();
-      headers.set('Content-Type', 'image/jpeg');
-      headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-      return new Response(existing.body, { headers });
+      return new Response(existing.body, { headers: thumbnailHeaders('image/jpeg') });
     }
   } catch {
     // best-effort cache read
   }
 
-  try {
+  // The internal resize fetch would itself trigger a remote fetch; with
+  // allow_remote=false, go straight to the cached-or-404 fallback instead.
+  if (allowRemote) try {
     const downloadUrl = `https://${env.SERVER_NAME}/_matrix/media/v3/download/${serverName}/${mediaId}`;
     const resized = await fetch(downloadUrl, {
       cf: {
@@ -429,21 +451,18 @@ async function serveRemoteThumbnail(
       } catch {
         // best-effort cache write
       }
-      const headers = new Headers();
-      headers.set('Content-Type', 'image/jpeg');
-      headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-      headers.set('X-Thumbnail-Generated', 'true');
-      return new Response(thumbBody, { headers });
+      return new Response(thumbBody, { headers: thumbnailHeaders('image/jpeg', true) });
     }
   } catch (resizeErr) {
     console.warn('[media] Remote thumbnail resize failed:', resizeErr);
   }
 
-  const remote = await fetchRemoteMedia(env, serverName, mediaId);
+  const remote = await fetchRemoteMedia(env, serverName, mediaId, allowRemote);
   if (!remote) {
     return Errors.notFound('Remote media not found').toResponse();
   }
   const response = serveRemoteMedia(remote);
+  response.headers.set('Content-Disposition', 'inline');
   response.headers.set('X-Thumbnail-Generated', 'false');
   return response;
 }
@@ -452,9 +471,10 @@ async function serveRemoteThumbnail(
 app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
-    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId, allowRemote);
     if (!remote) {
       return Errors.notFound('Remote media not found').toResponse();
     }
@@ -488,9 +508,10 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
   const requestedFilename = c.req.param('filename');
+  const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
-    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId, allowRemote);
     if (!remote) {
       return Errors.notFound('Remote media not found').toResponse();
     }
@@ -524,9 +545,10 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   const width = clampThumbnailDimension(c.req.query('width'));
   const height = clampThumbnailDimension(c.req.query('height'));
   const method = c.req.query('method') || 'scale';
+  const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
-    return serveRemoteThumbnail(c.env, serverName, mediaId, width, height, method);
+    return serveRemoteThumbnail(c.env, serverName, mediaId, width, height, method, allowRemote);
   }
 
   // Get media metadata
@@ -546,10 +568,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   const existingThumb = await c.env.MEDIA.get(thumbnailKey);
 
   if (existingThumb) {
-    const headers = new Headers();
-    headers.set('Content-Type', 'image/jpeg');
-    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return new Response(existingThumb.body, { headers });
+    return new Response(existingThumb.body, { headers: thumbnailHeaders('image/jpeg') });
   }
 
   // Get original
@@ -560,10 +579,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
 
   // If not an image, return original
   if (!isImage) {
-    const headers = new Headers();
-    headers.set('Content-Type', metadata.content_type);
-    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return new Response(object.body, { headers });
+    return new Response(object.body, { headers: thumbnailHeaders(metadata.content_type) });
   }
 
   // Use Cloudflare Image Resizing via cf.image on fetch
@@ -588,11 +604,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
         httpMetadata: { contentType: 'image/jpeg' },
       });
 
-      const headers = new Headers();
-      headers.set('Content-Type', 'image/jpeg');
-      headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-      headers.set('X-Thumbnail-Generated', 'true');
-      return new Response(thumbBody, { headers });
+      return new Response(thumbBody, { headers: thumbnailHeaders('image/jpeg', true) });
     }
   } catch (resizeErr) {
     // Image Resizing may not be available on Free plan - fall back to original
@@ -600,12 +612,7 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   }
 
   // Fallback: return original
-  const headers = new Headers();
-  headers.set('Content-Type', metadata.content_type);
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  headers.set('X-Thumbnail-Generated', 'false');
-
-  return new Response(object.body, { headers });
+  return new Response(object.body, { headers: thumbnailHeaders(metadata.content_type, false) });
 });
 
 // GET /_matrix/media/v3/preview_url - Get URL preview
@@ -851,9 +858,10 @@ app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), a
 app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(), async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
-    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId, allowRemote);
     if (!remote) {
       return Errors.notFound('Remote media not found').toResponse();
     }
@@ -885,9 +893,10 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
   const requestedFilename = c.req.param('filename');
+  const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
-    const remote = await fetchRemoteMedia(c.env, serverName, mediaId);
+    const remote = await fetchRemoteMedia(c.env, serverName, mediaId, allowRemote);
     if (!remote) {
       return Errors.notFound('Remote media not found').toResponse();
     }
@@ -919,9 +928,10 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
   const width = clampThumbnailDimension(c.req.query('width'));
   const height = clampThumbnailDimension(c.req.query('height'));
   const method = c.req.query('method') || 'scale';
+  const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
-    return serveRemoteThumbnail(c.env, serverName, mediaId, width, height, method);
+    return serveRemoteThumbnail(c.env, serverName, mediaId, width, height, method, allowRemote);
   }
 
   // Get media metadata
@@ -940,10 +950,7 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
   const existingThumb = await c.env.MEDIA.get(thumbnailKey);
 
   if (existingThumb) {
-    const headers = new Headers();
-    headers.set('Content-Type', 'image/jpeg');
-    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-    return new Response(existingThumb.body, { headers });
+    return new Response(existingThumb.body, { headers: thumbnailHeaders('image/jpeg') });
   }
 
   const object = await c.env.MEDIA.get(mediaId);
@@ -973,25 +980,16 @@ app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth()
           httpMetadata: { contentType: 'image/jpeg' },
         });
 
-        const resHeaders = new Headers();
-        resHeaders.set('Content-Type', 'image/jpeg');
-        resHeaders.set('Cache-Control', 'public, max-age=31536000, immutable');
-        resHeaders.set('X-Thumbnail-Generated', 'true');
-        return new Response(thumbBody, { headers: resHeaders });
+        return new Response(thumbBody, { headers: thumbnailHeaders('image/jpeg', true) });
       }
     } catch (resizeErr) {
       console.warn('[media] Image resize failed:', resizeErr);
     }
   }
 
-  const headers = new Headers();
-  headers.set('Content-Type', metadata.content_type);
-  headers.set('Cache-Control', 'public, max-age=31536000, immutable');
-  if (isImage) {
-    headers.set('X-Thumbnail-Generated', 'false');
-  }
-
-  return new Response(object.body, { headers });
+  return new Response(object.body, {
+    headers: thumbnailHeaders(metadata.content_type, isImage ? false : undefined),
+  });
 });
 
 // GET /_matrix/client/v1/media/preview_url - Authenticated URL preview

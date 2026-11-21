@@ -1206,6 +1206,52 @@ describe('keys POST /keys/claim', () => {
     );
   });
 
+  it('returns both keys when two algorithms are claimed in one request', async () => {
+    const otkKv = mockKv({
+      [`otk:${BOB}:${DEVICE_B}`]: JSON.stringify({
+        signed_curve25519: [
+          { keyId: 'signed_curve25519:K1', keyData: { key: 'k1' }, claimed: false },
+        ],
+      }),
+    });
+    const db = createKeysDb({
+      otks: [
+        {
+          id: 9,
+          user_id: BOB,
+          device_id: DEVICE,
+          algorithm: 'curve25519',
+          key_id: 'curve25519:K2',
+          key_data: JSON.stringify({ key: 'k2' }),
+          claimed: 0,
+        },
+      ],
+    });
+    const env = createEnv({ oneTimeKeysKv: otkKv, db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/keys/claim',
+      jsonInit('POST', {
+        one_time_keys: {
+          [BOB]: {
+            [DEVICE_B]: 'signed_curve25519',
+            [DEVICE]: 'curve25519',
+          },
+        },
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      one_time_keys: {
+        [BOB]: {
+          [DEVICE_B]: { 'signed_curve25519:K1': { key: 'k1' } },
+          [DEVICE]: { 'curve25519:K2': { key: 'k2' } },
+        },
+      },
+      failures: {},
+    });
+  });
+
   it('falls back to D1 legacy OTKs when KV has none unclaimed', async () => {
     const db = createKeysDb({
       otks: [
