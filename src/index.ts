@@ -37,6 +37,7 @@ import serverNotices from './api/server-notices';
 import report from './api/report';
 import calls from './api/calls';
 import rtc from './api/rtc';
+import { handleLiveKitSignalRequest } from './services/livekit-calls-shim';
 import appservice from './api/appservice';
 import thirdparty from './api/thirdparty';
 import identity from './api/identity';
@@ -157,6 +158,12 @@ app.route('/', calls);
 
 // MatrixRTC (LiveKit) JWT service for Element X calls
 app.route('/', rtc);
+
+// Experimental opt-in: LiveKit-compatible signaling terminated by the Cloudflare Calls shim.
+// Inactive unless LIVEKIT_URL is pointed at wss://<SERVER_NAME>/livekit/signal.
+// Limited to unencrypted A/V in a single Worker isolate — see livekit-calls-shim.ts.
+app.all('/livekit/signal', (c) => handleLiveKitSignalRequest(c.req.raw, c.env));
+app.all('/livekit/signal/*', (c) => handleLiveKitSignalRequest(c.req.raw, c.env));
 
 // Application Service API
 app.route('/', appservice);
