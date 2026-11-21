@@ -895,6 +895,268 @@ describe('telegram image bridging', () => {
   });
 });
 
+describe('telegram animated sticker bridging', () => {
+  const bridge = { id: 'tgb1', bot_user_id: TG_BOT, room_id: ROOM, chat_id: '4711', tg_token: '111111111:AAAA', webhook_secret: 's3cret', last_update_id: 0, enabled: 1, created_at: 1 };
+  const sender = { id: 7, first_name: 'Ivan', username: 'ivan' };
+  const chat = { id: 4711, type: 'private' };
+  const WEBM_BYTES = new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x9f, 0x42]).buffer;
+  const WEBP_BYTES = new Uint8Array([0x52, 0x49, 0x46, 0x46, 0x0a, 0x00]).buffer;
+  const TGS_BYTES = new Uint8Array([0x1f, 0x8b, 0x08, 0x00, 0x01, 0x02]).buffer;
+
+  /** getFile/file mock keyed by Telegram file_id; unknown ids fail the download. */
+  function stickerFetch(files: Record<string, { bytes: ArrayBuffer; mime: string }>) {
+    const paths = new Map<string, string>();
+    return async (url: string, init: RequestInit) => {
+      if (String(url).includes('/getFile')) {
+        const { file_id } = JSON.parse(init.body as string) as { file_id: string };
+        if (!files[file_id]) return Response.json({ ok: false, description: 'unknown file' });
+        const path = `files/${file_id}`;
+        paths.set(path, file_id);
+        return Response.json({ ok: true, result: { file_path: path } });
+      }
+      if (String(url).includes('/file/bot')) {
+        const urlString = String(url);
+        const marker = '/file/bot';
+        // Drop the bot token segment; the rest is Telegram's file_path.
+        const path = urlString.slice(urlString.indexOf(marker) + marker.length).replace(/^[^/]*\//, '');
+        const file = files[paths.get(path) ?? ''];
+        if (!file) return new Response('missing', { status: 404 });
+        return new Response(file.bytes, { headers: { 'Content-Type': file.mime } });
+      }
+      return Response.json({ ok: true });
+    };
+  }
+
+  function storedBytes(env: Env, url: unknown): Uint8Array {
+    const mediaId = String(url).split('/')[3];
+    const stored = (env as any).__r2.store.get(mediaId);
+    expect(stored).toBeTruthy();
+    return new Uint8Array(stored.body);
+  }
+
+  it('video stickers become m.sticker events with video/webm info and a mapping row', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(stickerFetch({ vstk: { bytes: WEBM_BYTES, mime: 'video/webm' } }));
+    performSendEvent.mockImplementationOnce(async () => ({ eventId: '$webm:example.com', originServerTs: 1 }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 500,
+      message: {
+        message_id: 60, from: sender, chat,
+        sticker: {
+          file_id: 'vstk', is_video: true, mime_type: 'video/webm',
+          file_name: 'sticker.webm', width: 480, height: 480,
+          file_size: WEBM_BYTES.byteLength, emoji: '🐶',
+        },
+      },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, roomId, sentBy, type, content] = performSendEvent.mock.calls[0];
+    expect(roomId).toBe(ROOM);
+    expect(sentBy).toBe(TG_BOT);
+    expect(type).toBe('m.sticker');
+    expect(content.msgtype).toBeUndefined();
+    expect(content.body).toBe('[TG] Ivan (@ivan): sticker.webm');
+    expect(content.emoji).toBe('🐶');
+    expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
+    expect(content.info).toMatchObject({
+      mimetype: 'video/webm', size: WEBM_BYTES.byteLength, w: 480, h: 480,
+    });
+    expect(storedBytes(env, content.url)).toEqual(new Uint8Array(WEBM_BYTES));
+    expect((env.DB as any).mediaRows[0]).toMatchObject({
+      user_id: TG_BOT, content_type: 'video/webm', filename: 'sticker.webm',
+    });
+    expect((env.DB as any).messageMap).toEqual([
+      expect.objectContaining({
+        chat_id: '4711', telegram_message_id: 60, room_id: ROOM,
+        matrix_event_id: '$webm:example.com', sender: TG_BOT,
+        body: '[TG] Ivan (@ivan): sticker.webm',
+      }),
+    ]);
+  });
+
+  it('video stickers still carry video/webm when the file host reports octet-stream', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(stickerFetch({ vstk: { bytes: WEBM_BYTES, mime: 'application/octet-stream' } }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 501,
+      message: {
+        message_id: 61, from: sender, chat,
+        sticker: { file_id: 'vstk', is_video: true, file_size: WEBM_BYTES.byteLength },
+      },
+    });
+    const content = performSendEvent.mock.calls[0][4];
+    expect(performSendEvent.mock.calls[0][3]).toBe('m.sticker');
+    expect(content.info.mimetype).toBe('video/webm');
+    expect(content.body).toBe('[TG] Ivan (@ivan): sticker.webm');
+  });
+
+  it('lottie stickers with a thumbnail send the static webp preview as m.sticker', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(stickerFetch({
+      lthumb: { bytes: WEBP_BYTES, mime: 'image/webp' },
+      lstk: { bytes: TGS_BYTES, mime: 'application/gzip' },
+    }));
+    performSendEvent.mockImplementationOnce(async () => ({ eventId: '$lottie:example.com', originServerTs: 1 }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 502,
+      message: {
+        message_id: 62, from: sender, chat,
+        sticker: {
+          file_id: 'lstk', is_animated: true, is_video: false, emoji: '🐱',
+          width: 512, height: 512, file_size: TGS_BYTES.byteLength,
+          thumbnail: { file_id: 'lthumb', width: 128, height: 128, file_size: WEBP_BYTES.byteLength },
+        },
+      },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, , sentBy, type, content] = performSendEvent.mock.calls[0];
+    expect(sentBy).toBe(TG_BOT);
+    expect(type).toBe('m.sticker');
+    expect(content.body).toBe('[TG] Ivan (@ivan): 🐱');
+    expect(content.emoji).toBe('🐱');
+    expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
+    expect(content.info).toMatchObject({
+      mimetype: 'image/webp', size: WEBP_BYTES.byteLength, w: 128, h: 128,
+    });
+    expect(storedBytes(env, content.url)).toEqual(new Uint8Array(WEBP_BYTES));
+    // Only the thumbnail was fetched — the .tgs bytes are never downloaded
+    // when a usable preview exists.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(JSON.parse((fetchMock.mock.calls[0] as any)[1].body).file_id).toBe('lthumb');
+    expect((env.DB as any).messageMap[0]).toMatchObject({
+      telegram_message_id: 62, matrix_event_id: '$lottie:example.com',
+      body: '[TG] Ivan (@ivan): 🐱',
+    });
+  });
+
+  it('lottie stickers without a thumbnail send the .tgs bytes as m.file', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(stickerFetch({ lstk: { bytes: TGS_BYTES, mime: 'application/gzip' } }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 503,
+      message: {
+        message_id: 63, from: sender, chat,
+        sticker: { file_id: 'lstk', is_animated: true, emoji: '🎉', file_size: TGS_BYTES.byteLength },
+      },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, , sentBy, type, content] = performSendEvent.mock.calls[0];
+    expect(sentBy).toBe(TG_BOT);
+    expect(type).toBe('m.room.message');
+    expect(content.msgtype).toBe('m.file');
+    expect(content.body).toBe('[TG] Ivan (@ivan): 🎉.tgs');
+    expect(content.filename).toBe('🎉.tgs');
+    expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
+    expect(content.info).toMatchObject({
+      mimetype: 'application/gzip', size: TGS_BYTES.byteLength,
+    });
+    expect(storedBytes(env, content.url)).toEqual(new Uint8Array(TGS_BYTES));
+    expect((env.DB as any).mediaRows[0]).toMatchObject({
+      content_type: 'application/gzip', filename: '🎉.tgs',
+    });
+    // The file fallback is mapped too, so replies to it work.
+    expect((env.DB as any).messageMap[0]).toMatchObject({
+      telegram_message_id: 63, body: '[TG] Ivan (@ivan): 🎉.tgs',
+    });
+  });
+
+  it('a failed thumbnail download falls back to the .tgs file, not a placeholder', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(stickerFetch({ lstk: { bytes: TGS_BYTES, mime: 'application/octet-stream' } }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 504,
+      message: {
+        message_id: 64, from: sender, chat,
+        sticker: {
+          file_id: 'lstk', is_animated: true,
+          thumbnail: { file_id: 'missing-thumb', width: 128, height: 128 },
+        },
+      },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, , , type, content] = performSendEvent.mock.calls[0];
+    expect(type).toBe('m.room.message');
+    expect(content.msgtype).toBe('m.file');
+    expect(content.filename).toBe('sticker.tgs');
+    expect(content.body).toBe('[TG] Ivan (@ivan): sticker.tgs');
+    expect(content.info.mimetype).toBe('application/gzip');
+    expect(storedBytes(env, content.url)).toEqual(new Uint8Array(TGS_BYTES));
+  });
+
+  it('oversized stickers stay placeholders and never download', async () => {
+    const env = makeEnv();
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 505,
+      message: {
+        message_id: 65, from: sender, chat,
+        sticker: { file_id: 'huge', is_video: true, file_size: 25 * 1024 * 1024 },
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    expect(performSendEvent.mock.calls[0][3]).toBe('m.room.message');
+    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan (@ivan): [telegram sticker]');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect((env.DB as any).mediaRows).toHaveLength(0);
+  });
+
+  it('a lottie whose thumbnail and .tgs downloads both fail falls back to the placeholder', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(async () => Response.json({ ok: false, description: 'nope' }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 506,
+      message: {
+        message_id: 66, from: sender, chat,
+        sticker: {
+          file_id: 'lstk', is_animated: true,
+          thumbnail: { file_id: 'lthumb', width: 128, height: 128 },
+        },
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan (@ivan): [telegram sticker]');
+    expect((env.DB as any).mediaRows).toHaveLength(0);
+    // Even the placeholder is routed through the mapping hook.
+    expect((env.DB as any).messageMap[0]).toMatchObject({ telegram_message_id: 66 });
+  });
+
+  it('a reply to a bridged video sticker renders the rich reply', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(stickerFetch({ vstk: { bytes: WEBM_BYTES, mime: 'video/webm' } }));
+    performSendEvent.mockImplementationOnce(async () => ({ eventId: '$sticker:example.com', originServerTs: 1 }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 507,
+      message: {
+        message_id: 67, from: sender, chat,
+        sticker: { file_id: 'vstk', is_video: true, file_size: WEBM_BYTES.byteLength },
+      },
+    });
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 508,
+      message: {
+        message_id: 68, from: sender, chat, text: 'love it',
+        reply_to_message: { message_id: 67 },
+      },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(2);
+    const content = performSendEvent.mock.calls[1][4];
+    expect(content['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$sticker:example.com' } });
+    expect(content.body).toBe(
+      '> <@tgbot:example.com> [TG] Ivan (@ivan): sticker.webm\n[TG] Ivan (@ivan): love it'
+    );
+    expect(content.formatted_body).toContain(
+      'href="https://matrix.to/#/!room:example.com/$sticker:example.com"'
+    );
+    expect((env.DB as any).messageMap[1]).toMatchObject({
+      telegram_message_id: 68, body: '[TG] Ivan (@ivan): love it',
+    });
+  });
+});
+
 describe('telegram formatting relay', () => {
   const bridge = { id: 'tgb1', bot_user_id: TG_BOT, room_id: ROOM, chat_id: '4711', tg_token: '111111111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', webhook_secret: 's3cret', last_update_id: 0, enabled: 1, created_at: 1 };
 

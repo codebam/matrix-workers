@@ -370,6 +370,12 @@ interface TgSticker {
   file_size?: number;
   mime_type?: string;
   emoji?: string;
+  /** Bot API flags: .tgs (animated) vs webm (video) vs static webp. */
+  is_animated?: boolean;
+  is_video?: boolean;
+  /** Static preview a Lottie sticker ships with (usually webp). */
+  thumbnail?: TgPhotoSize;
+  file_name?: string;
 }
 
 interface TelegramUpdate {
@@ -388,7 +394,7 @@ interface TelegramUpdate {
     caption_entities?: unknown;
     photo?: unknown;
     document?: unknown;
-    sticker?: unknown;
+    sticker?: TgSticker;
     voice?: unknown;
     audio?: unknown;
     video?: unknown;
@@ -406,8 +412,8 @@ interface TgImage {
 
 /** Pull the relayable image out of a Telegram message, if it has one.
  *  Photos come as a size ladder (pick the largest); documents only when
- *  image-typed; stickers only in the static webp form — animated .tgs and
- *  video stickers stay placeholders. */
+ *  image-typed; stickers as static webp or video/webm. Animated .tgs
+ *  stickers need a preview/file fallback and are handled separately. */
 function extractTgImage(msg: NonNullable<TelegramUpdate['message']>): TgImage | null {
   if (Array.isArray(msg.photo) && msg.photo.length > 0) {
     const sizes = msg.photo as TgPhotoSize[];
@@ -433,7 +439,20 @@ function extractTgImage(msg: NonNullable<TelegramUpdate['message']>): TgImage | 
       sticker: false,
     };
   }
-  const st = msg.sticker as TgSticker | undefined;
+  const st = msg.sticker;
+  // Lottie (.tgs) bytes cannot be rendered here; the caller sends the
+  // thumbnail preview or the downloadable file instead.
+  if (st && st.is_animated === true && st.is_video !== true) return null;
+  if (st && (st.is_video === true || st.mime_type === 'video/webm')) {
+    return {
+      file: st,
+      mime: 'video/webm',
+      filename: st.file_name && st.file_name ? st.file_name : 'sticker.webm',
+      width: st.width,
+      height: st.height,
+      sticker: true,
+    };
+  }
   if (st && st.mime_type === 'image/webp') {
     return {
       file: st,
@@ -649,6 +668,73 @@ async function sendBridgedMessage(
   );
 }
 
+/** Lottie stickers are gzipped JSON: Workers have no renderer, so send the
+ *  static thumbnail as a preview sticker when there is one. Otherwise (or
+ *  if the preview download fails) ship the .tgs bytes as a downloadable
+ *  m.file so the message stays useful instead of becoming a bare
+ *  placeholder. Returns false to let the caller fall back to the
+ *  placeholder; never throws. */
+async function sendLottieSticker(
+  env: Env,
+  bridge: TelegramBridgeRow,
+  msg: NonNullable<TelegramUpdate['message']>,
+  st: TgSticker,
+  senderName: string
+): Promise<boolean> {
+  const label = typeof st.emoji === 'string' && st.emoji ? st.emoji : 'sticker';
+  try {
+    if (st.thumbnail?.file_id) {
+      const thumb = await downloadTelegramFile(bridge.tg_token, st.thumbnail, 'image/webp');
+      if (thumb) {
+        const media: ResolvedMedia = {
+          bytes: thumb.bytes,
+          contentType: 'image/webp',
+          filename: 'sticker.webp',
+        };
+        const mediaId = await storeBridgeMedia(env, bridge.bot_user_id, media);
+        if (mediaId) {
+          const info: Record<string, unknown> = {
+            mimetype: 'image/webp',
+            size: media.bytes.byteLength,
+          };
+          if (st.thumbnail.width) info.w = st.thumbnail.width;
+          if (st.thumbnail.height) info.h = st.thumbnail.height;
+          const content: Record<string, unknown> = {
+            body: `[TG] ${senderName}: ${msg.caption ?? label}`,
+            url: `mxc://${env.SERVER_NAME}/${mediaId}`,
+            info,
+          };
+          if (typeof st.emoji === 'string') content.emoji = st.emoji;
+          await sendBridgedMessage(env, bridge, msg, 'm.sticker', content);
+          return true;
+        }
+      }
+    }
+
+    const tgs = await downloadTelegramFile(bridge.tg_token, st, 'application/gzip');
+    if (!tgs) return false;
+    const filename = `${label}.tgs`;
+    const media: ResolvedMedia = {
+      bytes: tgs.bytes,
+      contentType: 'application/gzip',
+      filename,
+    };
+    const mediaId = await storeBridgeMedia(env, bridge.bot_user_id, media);
+    if (!mediaId) return false;
+    await sendBridgedMessage(env, bridge, msg, 'm.room.message', {
+      msgtype: 'm.file',
+      body: `[TG] ${senderName}: ${msg.caption ?? filename}`,
+      url: `mxc://${env.SERVER_NAME}/${mediaId}`,
+      filename,
+      info: { mimetype: 'application/gzip', size: media.bytes.byteLength },
+    });
+    return true;
+  } catch (err) {
+    console.warn('[telegram-bridge] Lottie sticker delivery failed:', err);
+    return false;
+  }
+}
+
 /**
  * Process one webhook update. Returns true when handled (Telegram expects a
  * 200 so it stops retrying — we also 200 on unknown/duplicate updates).
@@ -677,36 +763,47 @@ export async function processTelegramUpdate(
       ? `${msg.from.first_name}${msg.from.username ? ` (@${msg.from.username})` : ''}`
       : 'telegram user';
 
-    // Images are downloaded from Telegram, stored in our media repo, and
-    // posted as m.image / m.sticker events carrying the mxc URI. Failure at
-    // any step falls through to the placeholder text below, so the room
-    // still hears about the image instead of losing it.
+    // Images and video stickers are downloaded from Telegram, stored in our
+    // media repo, and posted as m.image / m.sticker events carrying the mxc
+    // URI. Lottie stickers get a preview sticker or a downloadable .tgs.
+    // Failure at any step falls through to the placeholder text below, so
+    // the room still hears about the media instead of losing it.
     if (typeof msg.text !== 'string' || msg.text.length === 0) {
-      const img = extractTgImage(msg);
-      if (img) {
-        const media = await downloadTelegramFile(bridge.tg_token, img.file, img.mime);
-        const mediaId = media ? await storeBridgeMedia(env, bridge.bot_user_id, { ...media, filename: img.filename }) : null;
-        if (media && mediaId) {
-          const caption = `[TG] ${senderName}: ${msg.caption ?? img.filename}`;
-          const info: Record<string, unknown> = {
-            mimetype: media.contentType,
-            size: media.bytes.byteLength,
-          };
-          if (img.width) info.w = img.width;
-          if (img.height) info.h = img.height;
-          const eventType = img.sticker ? 'm.sticker' : 'm.room.message';
-          const content: Record<string, unknown> = {
-            body: caption,
-            url: `mxc://${env.SERVER_NAME}/${mediaId}`,
-            info,
-          };
-          if (!img.sticker) {
-            content.msgtype = 'm.image';
-          } else if (typeof (msg.sticker as TgSticker | undefined)?.emoji === 'string') {
-            content.emoji = (msg.sticker as TgSticker).emoji;
+      const st = msg.sticker;
+      if (st && st.is_animated === true && st.is_video !== true) {
+        if (await sendLottieSticker(env, bridge, msg, st, senderName)) return true;
+      } else {
+        const img = extractTgImage(msg);
+        if (img) {
+          const downloaded = await downloadTelegramFile(bridge.tg_token, img.file, img.mime);
+          // A sticker's kind is declared by Bot API; Telegram can serve the
+          // bytes as octet-stream or with a generic MIME, so trust it.
+          const media = downloaded && img.sticker
+            ? { ...downloaded, contentType: img.mime }
+            : downloaded;
+          const mediaId = media ? await storeBridgeMedia(env, bridge.bot_user_id, { ...media, filename: img.filename }) : null;
+          if (media && mediaId) {
+            const caption = `[TG] ${senderName}: ${msg.caption ?? img.filename}`;
+            const info: Record<string, unknown> = {
+              mimetype: media.contentType,
+              size: media.bytes.byteLength,
+            };
+            if (img.width) info.w = img.width;
+            if (img.height) info.h = img.height;
+            const eventType = img.sticker ? 'm.sticker' : 'm.room.message';
+            const content: Record<string, unknown> = {
+              body: caption,
+              url: `mxc://${env.SERVER_NAME}/${mediaId}`,
+              info,
+            };
+            if (!img.sticker) {
+              content.msgtype = 'm.image';
+            } else if (typeof st?.emoji === 'string') {
+              content.emoji = st.emoji;
+            }
+            await sendBridgedMessage(env, bridge, msg, eventType, content);
+            return true;
           }
-          await sendBridgedMessage(env, bridge, msg, eventType, content);
-          return true;
         }
       }
     }
