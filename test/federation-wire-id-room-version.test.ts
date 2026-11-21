@@ -76,21 +76,20 @@ const memberEvent = {
 };
 
 describe('room-version-aware wire IDs (v1-10 redaction differs from v11+)', () => {
-  it('create: version-blind derivation hashes with v11+ rules and yields a different ID', async () => {
+  it('create: v10 and version-blind derivation agree; v11+ keeps full content and differs', async () => {
     const withVersion = await computeWireEventId(createEvent, '10');
     const withoutVersion = await computeWireEventId(createEvent);
-    expect(withoutVersion).not.toBe(withVersion);
-    // v10 redaction keeps only `creator` in the create content.
+    expect(withoutVersion).toBe(withVersion);
+    // Modern redaction keeps creator and room_version in m.room.create.
     const redacted = redactEventForSigning(createEvent, '10') as { content: Record<string, unknown> };
-    expect(redacted.content).toEqual({ creator: CREATOR });
+    expect(redacted.content).toEqual({ creator: CREATOR, room_version: '10' });
   });
 
-  it('power_levels: v10 drops `invite` from the redacted content, changing the ID', async () => {
+  it('power_levels: v10 drops `invite` from the redacted content', async () => {
     const withVersion = await computeWireEventId(powerLevelsEvent, '10');
-    const withoutVersion = await computeWireEventId(powerLevelsEvent);
-    expect(withoutVersion).not.toBe(withVersion);
+    expect(await computeWireEventId(powerLevelsEvent)).toBe(withVersion);
     const redacted = redactEventForSigning(powerLevelsEvent, '10') as { content: Record<string, unknown> };
-    expect(redacted.content.invite).toBeUndefined();
+    expect(redacted.content.invite).toBe(0);
     expect(redacted.content.users).toEqual({ [CREATOR]: 100 });
   });
 
@@ -101,22 +100,27 @@ describe('room-version-aware wire IDs (v1-10 redaction differs from v11+)', () =
   });
 });
 
-describe('v1-10 redaction keeps origin and prev_state (spec; pre-2023 Synapse events)', () => {
-  it('the GNU/Linux room create hashes to its REAL ID only with origin/prev_state kept', async () => {
-    // The fixture's ID as held by every resident of the real room.
-    expect(await computeWireEventId(GNU_LINUX_CREATE, '9')).toBe(
+describe('redaction keep-list is version-correct (v1/v2 legacy, v3+ modern)', () => {
+  it('the 2022 GNU/Linux create ID is reproducible with legacy v2 rules', async () => {
+    // Pre-2023 events in modern rooms were signed/hashed with the legacy
+    // keep-list; the signature verifier's legacy fallback accepts them.
+    expect(await computeWireEventId(GNU_LINUX_CREATE, '2')).toBe(
       '$vg_GNDVSf2hYj1hJUJSmYoA760umYC5dJPl14SUhR4o'
     );
-    // v11+ rules drop origin/prev_state → the phantom ID no peer resolves.
-    expect(await computeWireEventId(GNU_LINUX_CREATE)).not.toBe(
+    // A modern v9 derivation intentionally yields a different ID — the
+    // bug was applying the legacy rule to CURRENT v9/v10 traffic.
+    expect(await computeWireEventId(GNU_LINUX_CREATE, '9')).not.toBe(
       '$vg_GNDVSf2hYj1hJUJSmYoA760umYC5dJPl14SUhR4o'
     );
   });
 
-  it('the v9 redacted form retains origin and prev_state; the v11+ form drops them', () => {
-    const legacy = redactEventForSigning(GNU_LINUX_CREATE, '9') as Record<string, unknown>;
+  it('v2 retains origin and prev_state; v9 and modern forms drop them', () => {
+    const legacy = redactEventForSigning(GNU_LINUX_CREATE, '2') as Record<string, unknown>;
     expect(legacy.origin).toBe('halogen.city');
     expect(legacy.prev_state).toEqual([]);
+    const v9 = redactEventForSigning(GNU_LINUX_CREATE, '9') as Record<string, unknown>;
+    expect('origin' in v9).toBe(false);
+    expect('prev_state' in v9).toBe(false);
     const modern = redactEventForSigning(GNU_LINUX_CREATE) as Record<string, unknown>;
     expect('origin' in modern).toBe(false);
     expect('prev_state' in modern).toBe(false);

@@ -81,7 +81,12 @@ const CONTENT_KEEP_ALL_V11 = new Set(['m.room.create']);
 
 function isLegacyRedaction(roomVersion: string | undefined): boolean {
   const num = parseInt(roomVersion ?? '', 10);
-  return Number.isFinite(num) && num <= 10;
+  // Only room versions 1 and 2 use the legacy redaction keep-list (with
+  // `origin` and `prev_state`). From v3 onwards those fields are stripped;
+  // keeping them breaks signatures from modern Synapse on v3-v10 rooms.
+  // Pre-2023 events that still use the old shape are handled by the
+  // legacy-form fallback in federation-verify.ts.
+  return Number.isFinite(num) && num <= 2;
 }
 
 /**

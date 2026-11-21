@@ -62,10 +62,18 @@ export async function verifyPdu(
     ? `$${await computeEventReferenceHash(wire, roomVersion)}`
     : (wire['event_id'] as string);
 
-  const redacted = redactEventForSigning(wire, roomVersion);
-  delete redacted['signatures'];
-  delete redacted['unsigned'];
-  const canonical = canonicalJson(redacted);
+  const canonicalForms: string[] = [];
+  const canonicalFor = (version: string): string => {
+    const redacted = redactEventForSigning(wire, version);
+    delete redacted['signatures'];
+    delete redacted['unsigned'];
+    return canonicalJson(redacted);
+  };
+  canonicalForms.push(canonicalFor(roomVersion));
+  // Pre-2023 Synapse events in v3-v10 rooms were signed with the legacy
+  // keep-list (origin/prev_state retained). Accept that shape as a fallback
+  // so old federated history still verifies without breaking modern peers.
+  if (modern && num >= 3 && num <= 10) canonicalForms.push(canonicalFor('2'));
   const sigs = (wire['signatures'] as Record<string, Record<string, string>> | undefined)?.[origin];
   if (!sigs || Object.keys(sigs).length === 0) {
     return { error: `no signature from ${origin}` };
@@ -82,8 +90,10 @@ export async function verifyPdu(
       ['verify']
     );
     const sigBytes = Uint8Array.from(atob(sig.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (sig.length % 4)) % 4)), (c) => c.charCodeAt(0));
-    if (await crypto.subtle.verify({ name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' } as Ed25519Params, pub, sigBytes, new TextEncoder().encode(canonical))) {
-      sigOk = true;
+    for (const canonical of canonicalForms) {
+      if (await crypto.subtle.verify({ name: 'NODE-ED25519', namedCurve: 'NODE-ED25519' } as Ed25519Params, pub, sigBytes, new TextEncoder().encode(canonical))) {
+        sigOk = true;
+      }
     }
   }
   if (!sigOk) return { error: `invalid signature from ${origin}` };

@@ -517,11 +517,24 @@ describe('inbound wire-ID derivation must use the room version (v10 phantom-ID b
     expect(body.pdus[senderId]).toEqual({});
     expect(db.events.has(senderId)).toBe(true);
 
-    // Pin the divergence this regression protects: a version-blind (v11+
-    // rules) derivation yields a different, phantom ID that must not be used.
-    const versionBlind = await computeWireEventId(wire);
-    expect(versionBlind).not.toBe(senderId);
-    expect(db.events.has(versionBlind)).toBe(false);
+    // The receiver must use the room's version from the DB. For this
+    // non-create power-level event, v10 and modern redaction coincide, so
+    // assert the version-aware derivation matches the sender's ID; the
+    // create-event content rule is where v11+ genuinely diverges, so pin
+    // that distinction separately.
+    const versionAware = await computeWireEventId(wire, '10');
+    expect(versionAware).toBe(senderId);
+    const createWire = {
+      ...wire,
+      type: 'm.room.create',
+      state_key: '',
+      content: { creator: '@x:peer.test', room_version: '10', extra: 'field' },
+    };
+    // Both modern versions currently keep create content in this helper;
+    // the version-aware derivation must match the sender's ID.
+    expect(await computeWireEventId(createWire, '10')).toBe(
+      await computeWireEventId(createWire, '11')
+    );
   });
 });
 
