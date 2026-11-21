@@ -201,6 +201,15 @@ function createSqlDb(opts: DbOpts = {}) {
                 return { count: memberCount } as T;
               }
 
+              // Redaction prune (applyEventRedaction): plausible target row.
+              if (sql.includes('SELECT event_type, content, unsigned FROM events WHERE event_id = ?')) {
+                return {
+                  event_type: 'm.room.message',
+                  content: JSON.stringify({ body: 'prune me', msgtype: 'm.text' }),
+                  unsigned: null,
+                } as T;
+              }
+
               if (sql.includes('SELECT user_id FROM access_tokens WHERE token_hash = ?')) {
                 const hash = args[0] as string;
                 const row = accessTokens.find((t) => t.token_hash === hash);

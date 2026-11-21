@@ -148,6 +148,14 @@ function createSqlDb(opts: DbOpts = {}) {
           return {
             async first<T>() {
               selects.push({ sql, args });
+              // Redaction prune (applyEventRedaction): plausible target row.
+              if (sql.includes('SELECT event_type, content, unsigned FROM events WHERE event_id = ?')) {
+                return {
+                  event_type: 'm.room.message',
+                  content: JSON.stringify({ body: 'prune me', msgtype: 'm.text' }),
+                  unsigned: null,
+                } as T;
+              }
               return null as T;
             },
             async all<T>() {

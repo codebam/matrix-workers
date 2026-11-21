@@ -195,6 +195,14 @@ function createSqlDb(opts: DbOpts = {}) {
                 streamPosition += n;
                 return { position: streamPosition } as T;
               }
+              // Redaction prune (applyEventRedaction): plausible target row.
+              if (sql.includes('SELECT event_type, content, unsigned FROM events WHERE event_id = ?')) {
+                return {
+                  event_type: 'm.room.message',
+                  content: JSON.stringify({ body: 'prune me', msgtype: 'm.text' }),
+                  unsigned: null,
+                } as T;
+              }
               return null as T;
             },
             async all<T>() {
@@ -3036,7 +3044,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-1`, async () => {
@@ -3069,7 +3077,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-2`, async () => {
@@ -3102,7 +3110,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-3`, async () => {
@@ -3135,7 +3143,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-4`, async () => {
@@ -3168,7 +3176,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-5`, async () => {
@@ -3201,7 +3209,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-6`, async () => {
@@ -3234,7 +3242,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-7`, async () => {
@@ -3267,7 +3275,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-8`, async () => {
@@ -3300,7 +3308,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-9`, async () => {
@@ -3333,7 +3341,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-10`, async () => {
@@ -3366,7 +3374,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`distinct events parallel redact soft-11`, async () => {
@@ -3399,7 +3407,7 @@ describe('race dual-event redact isolation after #211', () => {
     expect(b.status).toBe(200);
     const redacts = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(redacts.length).toBe(2);
-    const targets = redacts.map((u) => u.args[1]);
+    const targets = redacts.map((u) => u.args[3]);
     expect(targets.sort()).toEqual([EVENT, EVENT2].sort());
   });
   it(`redacted_because UPDATE fail mid concurrent soft-0`, async () => {
@@ -5957,7 +5965,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`redact reason bind contract soft-1`, async () => {
     getMembership.mockResolvedValue(joinMembership());
@@ -5984,7 +5992,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`redact reason bind contract soft-2`, async () => {
     getMembership.mockResolvedValue(joinMembership());
@@ -6011,7 +6019,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`redact reason bind contract soft-3`, async () => {
     getMembership.mockResolvedValue(joinMembership());
@@ -6038,7 +6046,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`redact reason bind contract soft-4`, async () => {
     getMembership.mockResolvedValue(joinMembership());
@@ -6065,7 +6073,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`redact reason bind contract soft-5`, async () => {
     getMembership.mockResolvedValue(joinMembership());
@@ -6092,7 +6100,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`redact reason bind contract soft-6`, async () => {
     getMembership.mockResolvedValue(joinMembership());
@@ -6119,7 +6127,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`redact reason bind contract soft-7`, async () => {
     getMembership.mockResolvedValue(joinMembership());
@@ -6146,7 +6154,7 @@ describe('PL/redact lifecycle + bind contracts after #211', () => {
     expect((stored.content as { reason?: string }).reason).toBe(reason);
     const updates = db.updates.filter((u) => u.sql.includes('redacted_because'));
     expect(updates.length).toBe(1);
-    expect(updates[0].args[1]).toBe(EVENT);
+    expect(updates[0].args[3]).toBe(EVENT);
   });
   it(`notify failure soft concurrent soft-0`, async () => {
     getMembership.mockResolvedValue(joinMembership());

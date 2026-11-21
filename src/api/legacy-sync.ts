@@ -41,6 +41,7 @@ interface StoredEventRow {
   event_type: string;
   state_key: string | null;
   content: string;
+  redacted_content?: string | null;
   origin_server_ts: number;
   unsigned: string | null;
   stream_ordering: number;
@@ -49,7 +50,9 @@ interface StoredEventRow {
 function toClientEvent(row: StoredEventRow): ClientEvent {
   const event: ClientEvent = {
     type: row.event_type,
-    content: JSON.parse(row.content),
+    // Redacted events serve their pruned content (stored when the
+    // redaction landed); the original stays in `content` for federation.
+    content: JSON.parse(row.redacted_content ?? row.content),
     sender: row.sender,
     origin_server_ts: row.origin_server_ts,
     event_id: row.event_id,
@@ -61,7 +64,7 @@ function toClientEvent(row: StoredEventRow): ClientEvent {
 }
 
 const EVENT_COLUMNS =
-  'event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned, stream_ordering';
+  'event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned, redacted_content, stream_ordering';
 
 // Newest-first page of a room's timeline (legacy /messages direction 'b').
 async function getRoomTimeline(

@@ -571,6 +571,7 @@ export async function getRoomEvents(
     auth_events: string;
     prev_events: string;
     stream_ordering: number;
+    redacted_content?: string | null;
   }>();
 
   const events = result.results.map(r => ({
@@ -579,7 +580,10 @@ export async function getRoomEvents(
     sender: r.sender,
     type: r.event_type,
     state_key: r.state_key ?? undefined,
-    content: JSON.parse(r.content),
+    // Redacted events serve their pruned content (SELECT * carries
+    // redacted_content); send cores only use event_id/depth, so this is
+    // safe for prev_events resolution too.
+    content: JSON.parse(r.redacted_content ?? r.content),
     origin_server_ts: r.origin_server_ts,
     unsigned: r.unsigned ? JSON.parse(r.unsigned) : undefined,
     depth: r.depth,
@@ -839,7 +843,7 @@ export async function getEventsSince(
 ): Promise<PDU[]> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events
+     origin_server_ts, unsigned, depth, auth_events, prev_events, redacted_content
      FROM events
      WHERE room_id = ? AND stream_ordering > ?
      ORDER BY stream_ordering ASC
@@ -856,6 +860,7 @@ export async function getEventsSince(
     depth: number;
     auth_events: string;
     prev_events: string;
+    redacted_content?: string | null;
   }>();
 
   return result.results.map(r => ({
@@ -864,7 +869,9 @@ export async function getEventsSince(
     sender: r.sender,
     type: r.event_type,
     state_key: r.state_key ?? undefined,
-    content: JSON.parse(r.content),
+    // Redacted events serve their pruned content; the original column
+    // remains for federation (hashes/signatures are computed over it).
+    content: JSON.parse(r.redacted_content ?? r.content),
     origin_server_ts: r.origin_server_ts,
     unsigned: r.unsigned ? JSON.parse(r.unsigned) : undefined,
     depth: r.depth,

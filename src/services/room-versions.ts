@@ -214,18 +214,10 @@ export function getSupportedRoomVersions(): Record<string, 'stable' | 'unstable'
 }
 
 /** Keys to preserve during redaction, per spec. Version-dependent. */
-export function getRedactionAllowedKeys(
-  eventType: string,
-  roomVersion: RoomVersionBehavior
-): string[] {
-  // Keys always preserved for all event types
-  const baseKeys = [
-    'event_id', 'type', 'room_id', 'sender', 'state_key',
-    'hashes', 'signatures', 'depth', 'prev_events', 'auth_events',
-    'origin_server_ts',
-  ];
-
-  // Content keys preserved per event type
+// Content keys preserved by redaction, per event type and room-version
+// behavior. Shared by the signing redaction algorithm (top-level keep list)
+// and the client-facing redacted-content computation.
+function redactionContentKeys(eventType: string, roomVersion: RoomVersionBehavior): string[] {
   const contentKeys: Record<string, string[]> = {
     'm.room.member': ['membership', 'join_authorised_via_users_server'],
     'm.room.create': ['creator'],
@@ -250,5 +242,40 @@ export function getRedactionAllowedKeys(
     contentKeys['m.room.redaction'] = ['redacts'];
   }
 
-  return [...baseKeys, ...(contentKeys[eventType] || [])];
+  return contentKeys[eventType] || [];
+}
+
+export function getRedactionAllowedKeys(
+  eventType: string,
+  roomVersion: RoomVersionBehavior
+): string[] {
+  // Keys always preserved for all event types
+  const baseKeys = [
+    'event_id', 'type', 'room_id', 'sender', 'state_key',
+    'hashes', 'signatures', 'depth', 'prev_events', 'auth_events',
+    'origin_server_ts',
+  ];
+
+  return [...baseKeys, ...redactionContentKeys(eventType, roomVersion)];
+}
+
+// The content a client should see for an event that has been redacted:
+// only the per-type keys the redaction rules preserve. The original content
+// stays in `content` for federation (hashes/signatures are over it); the
+// pruned copy is stored alongside when a redaction lands.
+export function computeRedactedContent(
+  eventType: string,
+  content: unknown,
+  roomVersion: string
+): Record<string, unknown> {
+  const behavior = getRoomVersion(roomVersion || '10');
+  if (!behavior || !content || typeof content !== 'object') return {};
+  const keys = redactionContentKeys(eventType, behavior);
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    if (key in (content as Record<string, unknown>)) {
+      out[key] = (content as Record<string, unknown>)[key];
+    }
+  }
+  return out;
 }

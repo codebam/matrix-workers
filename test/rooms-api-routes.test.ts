@@ -290,6 +290,16 @@ function createSqlDb(opts: DbOpts = {}) {
               }
 
               // MSC2666 mutual_rooms: total joined-room count.
+              // Redaction prune (applyEventRedaction): serve a plausible
+              // target row so the pipeline runs to its UPDATE.
+              if (sql.includes('SELECT event_type, content, unsigned FROM events WHERE event_id = ?')) {
+                return {
+                  event_type: 'm.room.message',
+                  content: JSON.stringify({ body: 'prune me', msgtype: 'm.text' }),
+                  unsigned: null,
+                } as T;
+              }
+
               if (sql.includes('SELECT COUNT(*) AS total FROM room_memberships a')) {
                 return { total: mutualRoomsTotal } as T;
               }

@@ -574,7 +574,7 @@ async function getRoomData(
     let bindParams: any[];
     if (needsAll) {
       stateQuery = `
-        SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned
+        SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned, e.redacted_content
         FROM room_state rs
         JOIN events e ON rs.event_id = e.event_id
         WHERE rs.room_id = ?
@@ -582,7 +582,7 @@ async function getRoomData(
       bindParams = [roomId];
     } else {
       stateQuery = `
-        SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned
+        SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.unsigned, e.redacted_content
         FROM room_state rs
         JOIN events e ON rs.event_id = e.event_id
         WHERE rs.room_id = ? AND (${orClauses.join(' OR ')})
@@ -599,7 +599,7 @@ async function getRoomData(
         result.required_state.push({
           type: event.event_type,
           state_key: event.state_key,
-          content: JSON.parse(event.content),
+          content: JSON.parse(event.redacted_content ?? event.content),
           sender: event.sender,
           origin_server_ts: event.origin_server_ts,
           event_id: event.event_id,
@@ -611,7 +611,7 @@ async function getRoomData(
 
   // MSC4222: state_after = the current room state (after the timeline window).
   const afterRows = await db.prepare(`
-    SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts
+    SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.redacted_content
     FROM room_state rs JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ?
   `).bind(roomId).all();
@@ -621,7 +621,7 @@ async function getRoomData(
       result.state_after.push({
         type: e.event_type,
         state_key: e.state_key,
-        content: JSON.parse(e.content),
+        content: JSON.parse(e.redacted_content ?? e.content),
         sender: e.sender,
         origin_server_ts: e.origin_server_ts,
         event_id: e.event_id,
@@ -643,7 +643,7 @@ async function getRoomData(
     if (isIncremental) {
       // Incremental: get events since the last sync position
       timelineQuery = `
-        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering
+        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering, redacted_content
         FROM events
         WHERE room_id = ? AND stream_ordering > ?
         ORDER BY stream_ordering ASC
@@ -654,7 +654,7 @@ async function getRoomData(
       // Initial: get the most recent events. Negative stream_ordering marks
       // state-snapshot rows — never timeline material.
       timelineQuery = `
-        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering
+        SELECT event_id, event_type, state_key, content, sender, origin_server_ts, unsigned, depth, stream_ordering, redacted_content
         FROM events
         WHERE room_id = ? AND stream_ordering > 0
         ORDER BY stream_ordering DESC
@@ -681,7 +681,7 @@ async function getRoomData(
           event_id: event.event_id,
           sender: event.sender,
           origin_server_ts: event.origin_server_ts,
-          content: JSON.parse(event.content),
+          content: JSON.parse(event.redacted_content ?? event.content),
           state_key: event.state_key || undefined,
           unsigned: event.unsigned ? JSON.parse(event.unsigned) : undefined,
         };
