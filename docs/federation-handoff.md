@@ -485,3 +485,61 @@ Verification: browser-driven FluffyChat flow now reaches our
 submitting credentials and completing the code+PKCE exchange — needs the
 user's password; if the dart SDK rejects the id_token at the final step,
 check kid against the JWKS and the nonce pass-through first.
+
+## Spec v1.18/v1.19 conformance wave (2026-11-20, session 10)
+
+Brought the server from spec v1.17 to v1.19 conformance, plus the
+v1.18/v1.19 deltas the earlier sessions had not yet covered. Full suite
+green after the wave: 45,545/45,545 (349 files). Nothing deployed —
+review before merge, per AGENTS.md.
+
+- **Invite blocking (MSC4380)**: `m.invite_permission_config` gains the
+  stable `default_action: "block"` toggle (glob rules keep precedence);
+  errcode flattened to spec `M_INVITE_BLOCKED` on client invite,
+  createRoom invite list, state-based invites and federation v1/v2
+  invite; sync/sliding-sync now withhold invites on 'block' too, not
+  just 'ignore', so invites that predate the toggle vanish.
+- **Account lock/suspend (MSC4323)**: `GET/PUT
+  /_matrix/client/v1/admin/{lock,suspend}/{userId}` with spec gate
+  ordering (admin before lookup, 400 non-local, 404 unknown/deactivated,
+  403 self/other-admin); requireAuth enforces `M_USER_LOCKED` 401
+  soft_logout (logout exempt, sessions kept) and `M_USER_SUSPENDED` 403
+  on the forbidden action set; suspended users may only redact their own
+  events (refined inside performRedaction). `m.account_moderation`
+  capability added for admins; /_synapse/admin user detail surfaces real
+  lock/suspend state. Migration **025_account_moderation.sql** adds
+  users.locked/suspended — HITL: ALTER TABLE, review before deploy.
+- **Auto-forget on leave (MSC4267)**: `m.forget_forced_upon_leave`
+  advertised enabled; /leave, kick, ban, unban and federation-inbound
+  leave/ban for LOCAL users delete the membership row (guarded: only
+  fresh, non-replayed events, local targets only).
+- **Server ACLs**: new `src/services/server-acl.ts` (deny→allow order,
+  port stripping, MSC4436 case-insensitivity, IP literals
+  default-allowed). Enforced on inbound transactions (before DAG auth,
+  recorded in processed_pdus), make_join templates, send_join
+  authorization, federation invites, and the local send/state/redact
+  cores (self-denial). Outbound destination filtering deliberately NOT
+  done yet — follow-up if wanted.
+- **Redactions via /send (MSC4169)**: m.room.redaction through
+  PUT /rooms/:id/send routes into the shared performRedaction core
+  (extracted from the /redact route; both entry points tested).
+- **Reporting (MSC4277)**: score param gone (column kept, fixed -100);
+  unknown/vanished subjects still 200 and stored, logged server-side.
+- **Mutual rooms (MSC2666)**: stable `GET /_matrix/client/v1/mutual_rooms`
+  with `count`/`joined`/`next_batch` cursor batching; unknown target is
+  an empty 200, not 404.
+- **`unsigned.replaces_state`** (spec v1.19): populated on state events
+  via the state-write core (rides the existing `unsigned` column through
+  every serializer).
+- `/versions` now advertises v1.18/v1.19.
+
+**HITL review list before merge/deploy** (per AGENTS.md):
+`src/middleware/auth.ts` (locked/suspended enforcement + moderation state
+in the token lookup), `src/services/database.ts` (getUserByTokenHash
+joins users for locked/suspended — one query, no extra round trip),
+`migrations/025_account_moderation.sql` (ALTER TABLE users).
+
+**Deliberately left for a next session**: policy servers (MSC4284) —
+new client+federation module, reference implementation is the
+Foundation's policyserv; the biggest untouched v1.18 feature. Also
+noted: outbound federation destination filtering by ACL.
