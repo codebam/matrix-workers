@@ -14,6 +14,8 @@ const REMOTE_USER = '@bob:remote.example.com';
 const LOCAL_USER = '@alice:example.com';
 const FK_ERROR = 'D1_ERROR: FOREIGN KEY constraint failed: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_FOREIGNKEY)';
 
+const authState = vi.hoisted(() => ({ userId: '@alice:example.com' }));
+
 vi.mock('../src/middleware/federation-auth', () => ({
   requireFederationAuth: () => async (
     c: { set: (k: string, v: unknown) => void },
@@ -31,6 +33,17 @@ vi.mock('../src/middleware/federation-auth', () => ({
   },
 }));
 
+vi.mock('../src/middleware/auth', () => ({
+  requireAuth: () => async (
+    c: { set: (k: string, v: unknown) => void },
+    next: () => Promise<void>
+  ) => {
+    c.set('userId', authState.userId);
+    await next();
+  },
+}));
+
+import admin from '../src/api/admin';
 import federation from '../src/api/federation';
 import { ensurePresenceUserRow, recordPresenceChange } from '../src/api/presence';
 
@@ -39,6 +52,7 @@ type UserRow = {
   localpart: string;
   admin: number;
   is_deactivated: number;
+  is_guest?: number;
   display_name?: string | null;
 };
 type PresenceRow = {
@@ -66,7 +80,13 @@ function makeDb() {
     if (sql.includes('INSERT OR IGNORE INTO users')) {
       const [userId, localpart] = args as [string, string];
       if (!users.has(userId)) {
-        users.set(userId, { user_id: userId, localpart, admin: 0, is_deactivated: 0 });
+        // Read is_guest from the statement itself: the stub is marked as a
+        // guest by a literal in the SQL, not a bound argument.
+        const columns = sql.match(/INSERT OR IGNORE INTO users \(([^)]*)\)/)?.[1].split(',').map(s => s.trim()) ?? [];
+        const values = sql.match(/\bVALUES \(([^)]*)\)/)?.[1].split(',').map(s => s.trim()) ?? [];
+        const guestIndex = columns.indexOf('is_guest');
+        const isGuest = guestIndex >= 0 && Number(values[guestIndex]) === 1 ? 1 : 0;
+        users.set(userId, { user_id: userId, localpart, admin: 0, is_deactivated: 0, is_guest: isGuest });
       }
       return;
     }
@@ -137,10 +157,53 @@ function makeDb() {
         if (sql.includes('SELECT position FROM stream_positions')) {
           return { position: streamPositions.get('presence') ?? 0 } as T;
         }
+        if (sql.includes('FROM users WHERE user_id = ?')) {
+          const u = users.get(stmt.args[0] as string);
+          if (!u) return null as T;
+          return {
+            ...u,
+            display_name: u.display_name ?? null,
+            avatar_url: null,
+            created_at: 0,
+          } as T;
+        }
+        if (sql.includes('SELECT COUNT(*) as count FROM users')) {
+          const hiddenGuests = sql.includes('is_guest = 0');
+          let rows = [...users.values()];
+          if (hiddenGuests) rows = rows.filter((u) => (u.is_guest ?? 0) === 0);
+          if (sql.includes('localpart LIKE')) {
+            const like = String(stmt.args[0]).replace(/%/g, '');
+            rows = rows.filter(
+              (u) => u.localpart.includes(like) || (u.display_name ?? '').includes(like)
+            );
+          }
+          return { count: rows.length } as T;
+        }
         return null as T;
       },
       async all<T>() {
         statements.push(sql);
+        if (sql.includes('FROM users') && sql.includes('ORDER BY created_at DESC')) {
+          let rows = [...users.values()];
+          if (sql.includes('is_guest = 0')) rows = rows.filter((u) => (u.is_guest ?? 0) === 0);
+          if (sql.includes('localpart LIKE')) {
+            const like = String(stmt.args[0]).replace(/%/g, '');
+            rows = rows.filter(
+              (u) => u.localpart.includes(like) || (u.display_name ?? '').includes(like)
+            );
+          }
+          const limit = Number(stmt.args[stmt.args.length - 2]);
+          const offset = Number(stmt.args[stmt.args.length - 1]);
+          return {
+            results: rows.slice(offset, offset + limit).map((u) => ({
+              user_id: u.user_id,
+              localpart: u.localpart,
+              display_name: u.display_name ?? null,
+              is_guest: u.is_guest ?? 0,
+              admin: u.admin,
+            })) as T[],
+          };
+        }
         return { results: [] as T[] };
       },
     };
@@ -200,6 +263,7 @@ describe('remote-user presence FK regression', () => {
       localpart: 'bob',
       admin: 0,
       is_deactivated: 0,
+      is_guest: 1,
     });
     const row = db.presence.get(REMOTE_USER);
     expect(row).toMatchObject({
@@ -219,14 +283,55 @@ describe('remote-user presence FK regression', () => {
       localpart: 'alice',
       admin: 1,
       is_deactivated: 0,
+      is_guest: 0,
       display_name: 'Alice',
     });
 
     await ensurePresenceUserRow(db as unknown as D1Database, LOCAL_USER);
     await recordPresenceChange(db as unknown as D1Database, { ...UPDATE, userId: LOCAL_USER });
 
-    expect(db.users.get(LOCAL_USER)).toMatchObject({ admin: 1, display_name: 'Alice' });
+    expect(db.users.get(LOCAL_USER)).toMatchObject({ admin: 1, display_name: 'Alice', is_guest: 0 });
     expect(db.presence.get(LOCAL_USER)?.stream_position).toBe(1);
+  });
+});
+
+describe('presence stubs are hidden from Admin → Users', () => {
+  const makeEnv = (db: ReturnType<typeof makeDb>) => ({
+    SERVER_NAME: 'example.com',
+    SERVER_VERSION: 'test-0.1.0',
+    DB: db as unknown as D1Database,
+    CACHE: {
+      get: async () => null,
+      put: async () => {},
+    } as unknown as KVNamespace,
+  });
+
+  it('lists real users but excludes guest stubs from the list and count', async () => {
+    const db = makeDb();
+    await ensurePresenceUserRow(db as unknown as D1Database, REMOTE_USER);
+    db.users.set(LOCAL_USER, {
+      user_id: LOCAL_USER,
+      localpart: 'alice',
+      admin: 1,
+      is_deactivated: 0,
+      is_guest: 0,
+      display_name: 'Alice',
+    });
+
+    const res = await admin.request(
+      'http://localhost/admin/api/users',
+      {},
+      makeEnv(db) as never
+    );
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      users: { user_id: string; is_guest: number }[];
+      total: number;
+    };
+    expect(body.users.map((u) => u.user_id)).toEqual([LOCAL_USER]);
+    expect(body.total).toBe(1);
+    expect(db.users.get(REMOTE_USER)?.is_guest).toBe(1);
   });
 });
 

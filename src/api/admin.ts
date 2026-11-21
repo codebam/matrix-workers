@@ -145,11 +145,12 @@ app.get('/admin/api/users', requireAuth(), requireAdmin, async (c) => {
   let query = `
     SELECT user_id, localpart, display_name, avatar_url, is_guest, is_deactivated, admin, created_at, locked, suspended
     FROM users
+    WHERE is_guest = 0
   `;
   const params: any[] = [];
 
   if (search) {
-    query += ' WHERE localpart LIKE ? OR display_name LIKE ?';
+    query += ' AND (localpart LIKE ? OR display_name LIKE ?)';
     params.push(`%${search}%`, `%${search}%`);
   }
 
@@ -158,10 +159,10 @@ app.get('/admin/api/users', requireAuth(), requireAdmin, async (c) => {
 
   const users = await db.prepare(query).bind(...params).all();
 
-  // Get total count
-  let countQuery = 'SELECT COUNT(*) as count FROM users';
+  // Get total count (guest presence stubs are hidden from Admin → Users)
+  let countQuery = 'SELECT COUNT(*) as count FROM users WHERE is_guest = 0';
   if (search) {
-    countQuery += ' WHERE localpart LIKE ? OR display_name LIKE ?';
+    countQuery += ' AND (localpart LIKE ? OR display_name LIKE ?)';
   }
   const total = search
     ? await db.prepare(countQuery).bind(`%${search}%`, `%${search}%`).first<{ count: number }>()
