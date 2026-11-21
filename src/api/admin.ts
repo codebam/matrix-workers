@@ -2142,14 +2142,21 @@ app.put('/admin/api/idp/providers/:id', requireAuth(), requireAdmin, async (c) =
     return Errors.badJson().toResponse();
   }
 
-  // Check provider exists
-  const existing = await db.prepare('SELECT id, provider_type FROM idp_providers WHERE id = ?')
-    .bind(id).first<{ id: string; provider_type: string }>();
+  // Check provider exists. Keep this exact legacy query shape: other D1 stubs
+  // recognize only "SELECT id FROM idp_providers WHERE id = ?" for the lookup.
+  const existing = await db.prepare('SELECT id FROM idp_providers WHERE id = ?')
+    .bind(id).first<{ id: string }>();
   if (!existing) {
     return Errors.notFound('Identity provider not found').toResponse();
   }
 
-  const effectiveProviderType = body.provider_type ?? existing.provider_type ?? 'oidc';
+  // provider_type is needed to preserve an existing OAuth2 provider's type when
+  // the request omits it; read it separately so the existence check above stays
+  // compatible with those stubs.
+  const stored = await db.prepare('SELECT id, provider_type FROM idp_providers WHERE id = ?')
+    .bind(id).first<{ provider_type: string | null }>();
+
+  const effectiveProviderType = body.provider_type ?? stored?.provider_type ?? 'oidc';
   if (effectiveProviderType !== 'oidc' && effectiveProviderType !== 'oauth2') {
     return c.json({ errcode: 'M_INVALID_PARAM', error: 'provider_type must be either oidc or oauth2' }, 400);
   }
@@ -2289,22 +2296,29 @@ app.post('/admin/api/idp/providers/:id/test', requireAuth(), requireAdmin, async
   const id = c.req.param('id');
   const db = c.env.DB;
 
-  const provider = await db.prepare(`
+  // Keep the exact legacy query for the existence check and issuer URL: other
+  // D1 stubs recognize only "SELECT issuer_url FROM idp_providers WHERE id = ?".
+  const base = await db.prepare('SELECT issuer_url FROM idp_providers WHERE id = ?')
+    .bind(id).first<{ issuer_url: string }>();
+
+  if (!base) {
+    return Errors.notFound('Identity provider not found').toResponse();
+  }
+
+  // OAuth2 needs the configured endpoints and provider type; fetch them in an
+  // additive query so the legacy lookup above remains unchanged.
+  const details = await db.prepare(`
     SELECT issuer_url, provider_type, authorization_endpoint, token_endpoint,
            userinfo_endpoint, emails_endpoint
     FROM idp_providers WHERE id = ?
   `).bind(id).first<{
-    issuer_url: string;
-    provider_type: string;
+    provider_type: string | null;
     authorization_endpoint: string | null;
     token_endpoint: string | null;
     userinfo_endpoint: string | null;
     emails_endpoint: string | null;
   }>();
-
-  if (!provider) {
-    return Errors.notFound('Identity provider not found').toResponse();
-  }
+  const provider = { ...base, ...(details ?? {}) };
 
   const isOAuth2 = (provider.provider_type ?? 'oidc') === 'oauth2';
 
