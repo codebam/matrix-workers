@@ -720,6 +720,50 @@ describe('telegram image bridging', () => {
     expect(content.info).toMatchObject({ mimetype: 'image/webp', w: 512, h: 512 });
   });
 
+  // Regression (observed live 2026-11-21): Telegram omits mime_type on
+  // regular static stickers — the turtlemojis payload carried only
+  // is_animated:false / is_video:false / type:'regular', matched no relay
+  // branch, and fell to the placeholder. Static stickers without
+  // mime_type must still relay as webp m.sticker events.
+  it('static stickers without a mime_type relay as m.sticker events', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(tgFileFetch(new Uint8Array([1, 2]).buffer, 'image/webp'));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 212,
+      message: {
+        message_id: 21,
+        from: { id: 7, first_name: 'Ivan', username: 'ivan' },
+        chat: { id: 4711, type: 'group' },
+        sticker: {
+          file_id: 'stk2',
+          file_unique_id: 'stk2u',
+          width: 512,
+          height: 512,
+          emoji: '🤠',
+          set_name: 'turtlemojis',
+          is_animated: false,
+          is_video: false,
+          type: 'regular',
+          file_size: 17858,
+          thumbnail: {
+            file_id: 'stk2thumb',
+            file_unique_id: 'stk2thumbu',
+            file_size: 3434,
+            width: 128,
+            height: 128,
+          },
+        },
+      },
+    });
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    const [, , , type, content] = performSendEvent.mock.calls[0];
+    expect(type).toBe('m.sticker');
+    expect(content.msgtype).toBeUndefined();
+    expect(content.emoji).toBe('🤠');
+    expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
+    expect(content.info).toMatchObject({ mimetype: 'image/webp', w: 512, h: 512 });
+  });
+
   it('photos without a caption use the filename in the body', async () => {
     const env = makeEnv();
     fetchMock.mockImplementation(tgFileFetch(PNG_BYTES));

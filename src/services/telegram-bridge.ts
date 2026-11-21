@@ -463,6 +463,20 @@ function extractTgImage(msg: NonNullable<TelegramUpdate['message']>): TgImage | 
       sticker: true,
     };
   }
+  // Static sticker with no mime_type: Telegram's modern payloads omit the
+  // field for regular webp stickers (observed live — is_animated:false,
+  // is_video:false, type:'regular', no mime_type), so default to webp
+  // rather than letting the sticker fall through to the placeholder.
+  if (st && st.is_animated !== true && st.is_video !== true) {
+    return {
+      file: st,
+      mime: st.mime_type || 'image/webp',
+      filename: 'sticker.webp',
+      width: st.width,
+      height: st.height,
+      sticker: true,
+    };
+  }
   return null;
 }
 
@@ -473,7 +487,10 @@ async function downloadTelegramFile(
   file: { file_id: string; file_size?: number },
   fallbackMime: string
 ): Promise<ResolvedMedia | null> {
-  if (typeof file.file_size === 'number' && file.file_size > MAX_TG_DOWNLOAD_BYTES) return null;
+  if (typeof file.file_size === 'number' && file.file_size > MAX_TG_DOWNLOAD_BYTES) {
+    console.warn('[telegram-bridge] file download skipped: declared size', file.file_size);
+    return null;
+  }
   try {
     const info = await fetch(`${TG_API}/bot${token}/getFile`, {
       method: 'POST',
@@ -481,14 +498,23 @@ async function downloadTelegramFile(
       body: JSON.stringify({ file_id: file.file_id }),
     });
     const data = (await info.json().catch(() => null)) as
-      | { result?: { file_path?: string } }
+      | { ok?: boolean; description?: string; result?: { file_path?: string } }
       | null;
     const filePath = data?.result?.file_path;
-    if (!filePath) return null;
+    if (!filePath) {
+      console.warn('[telegram-bridge] getFile returned no file_path:', JSON.stringify(data));
+      return null;
+    }
     const res = await fetch(`${TG_API}/file/bot${token}/${filePath}`);
-    if (!res.ok) return null;
+    if (!res.ok) {
+      console.warn('[telegram-bridge] file fetch failed:', res.status, filePath);
+      return null;
+    }
     const bytes = await res.arrayBuffer();
-    if (bytes.byteLength === 0 || bytes.byteLength > MAX_TG_DOWNLOAD_BYTES) return null;
+    if (bytes.byteLength === 0 || bytes.byteLength > MAX_TG_DOWNLOAD_BYTES) {
+      console.warn('[telegram-bridge] file bytes rejected: length', bytes.byteLength);
+      return null;
+    }
     const header = (res.headers.get('Content-Type') || '').split(';')[0].trim();
     // Telegram serves some files as octet-stream: trust the declared kind.
     return { bytes, contentType: header && header !== 'application/octet-stream' ? header : fallbackMime };
@@ -668,6 +694,24 @@ async function sendBridgedMessage(
   );
 }
 
+/** Diagnostics for the sticker relay failure: persist the failing step plus
+ *  the sticker's raw Bot API payload to CACHE (short TTL) so the cause can
+ *  be read back even when a live tail drops the console batch. Never throws
+ *  and never affects delivery. */
+async function cacheStickerDiag(
+  env: Env,
+  reason: string,
+  st: TgSticker | undefined
+): Promise<void> {
+  try {
+    await env.CACHE.put(
+      'diag:tg-sticker',
+      JSON.stringify({ reason, sticker: st, at: Date.now() }),
+      { expirationTtl: 900 }
+    );
+  } catch { /* diagnostics must never affect delivery */ }
+}
+
 /** Lottie stickers are gzipped JSON: Workers have no renderer, so send the
  *  static thumbnail as a preview sticker when there is one. Otherwise (or
  *  if the preview download fails) ship the .tgs bytes as a downloadable
@@ -711,8 +755,17 @@ async function sendLottieSticker(
       }
     }
 
+    if (!st.thumbnail?.file_id) {
+      console.warn('[telegram-bridge] lottie sticker has no thumbnail file_id; falling to .tgs');
+    }
+    await cacheStickerDiag(env, 'lottie-thumb-unavailable', st);
+
     const tgs = await downloadTelegramFile(bridge.tg_token, st, 'application/gzip');
-    if (!tgs) return false;
+    if (!tgs) {
+      console.warn('[telegram-bridge] lottie .tgs download failed; falling to placeholder');
+      await cacheStickerDiag(env, 'lottie-tgs-download-null', st);
+      return false;
+    }
     const filename = `${label}.tgs`;
     const media: ResolvedMedia = {
       bytes: tgs.bytes,
@@ -720,7 +773,11 @@ async function sendLottieSticker(
       filename,
     };
     const mediaId = await storeBridgeMedia(env, bridge.bot_user_id, media);
-    if (!mediaId) return false;
+    if (!mediaId) {
+      console.warn('[telegram-bridge] lottie .tgs store failed; falling to placeholder');
+      await cacheStickerDiag(env, 'lottie-tgs-store-null', st);
+      return false;
+    }
     await sendBridgedMessage(env, bridge, msg, 'm.room.message', {
       msgtype: 'm.file',
       body: `[TG] ${senderName}: ${msg.caption ?? filename}`,
@@ -774,6 +831,18 @@ export async function processTelegramUpdate(
         if (await sendLottieSticker(env, bridge, msg, st, senderName)) return true;
       } else {
         const img = extractTgImage(msg);
+        if (msg.sticker && !img) {
+          console.warn(
+            '[telegram-bridge] sticker matched no relay branch:',
+            JSON.stringify({
+              animated: msg.sticker.is_animated,
+              video: msg.sticker.is_video,
+              mime: msg.sticker.mime_type,
+              size: msg.sticker.file_size,
+            })
+          );
+          await cacheStickerDiag(env, 'no-branch-match', msg.sticker);
+        }
         if (img) {
           const downloaded = await downloadTelegramFile(bridge.tg_token, img.file, img.mime);
           // A sticker's kind is declared by Bot API; Telegram can serve the
@@ -803,6 +872,13 @@ export async function processTelegramUpdate(
             }
             await sendBridgedMessage(env, bridge, msg, eventType, content);
             return true;
+          }
+          if (!downloaded) {
+            console.warn('[telegram-bridge] media download failed after match:', img.mime, img.filename);
+            await cacheStickerDiag(env, 'download-failed', st ?? undefined);
+          } else if (!mediaId) {
+            console.warn('[telegram-bridge] media store failed after download:', img.mime, img.filename);
+            await cacheStickerDiag(env, 'store-failed', st ?? undefined);
           }
         }
       }
