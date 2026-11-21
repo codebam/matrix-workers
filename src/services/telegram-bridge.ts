@@ -377,6 +377,8 @@ interface TelegramUpdate {
   message?: {
     message_id: number;
     from?: { id: number; first_name?: string; username?: string };
+    /** Telegram's reply reference; the quoted message may predate this bridge. */
+    reply_to_message?: { message_id: number };
     chat: { id: number; type: string; title?: string };
     text?: string;
     caption?: string;
@@ -508,6 +510,145 @@ async function storeBridgeMedia(
   }
 }
 
+// --- Telegram reply -> Matrix rich reply ---
+
+interface BridgedMessageMapRow {
+  matrix_event_id: string;
+  room_id: string;
+  sender: string;
+  body: string;
+  formatted_body: string | null;
+}
+
+/** Look up the Matrix event a Telegram message was bridged to. A missing
+ *  table or any other D1 failure means "no mapping" — delivery continues. */
+async function findBridgedMessage(
+  db: D1Database,
+  chatId: string,
+  telegramMessageId: number
+): Promise<BridgedMessageMapRow | null> {
+  try {
+    return await db
+      .prepare(
+        `SELECT matrix_event_id, room_id, sender, body, formatted_body
+         FROM telegram_message_map WHERE chat_id = ? AND telegram_message_id = ?`
+      )
+      .bind(chatId, telegramMessageId)
+      .first<BridgedMessageMapRow>();
+  } catch (err) {
+    console.warn('[telegram-bridge] message map lookup failed:', err);
+    return null;
+  }
+}
+
+/** Best effort mapping write: a failure must never fail message delivery. */
+async function recordBridgedMessage(
+  db: D1Database,
+  chatId: string,
+  telegramMessageId: number,
+  roomId: string,
+  eventId: string,
+  sender: string,
+  content: Record<string, unknown>
+): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `INSERT INTO telegram_message_map
+           (chat_id, telegram_message_id, room_id, matrix_event_id, sender, body, formatted_body, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(chat_id, telegram_message_id) DO UPDATE SET
+           room_id = excluded.room_id,
+           matrix_event_id = excluded.matrix_event_id,
+           sender = excluded.sender,
+           body = excluded.body,
+           formatted_body = excluded.formatted_body`
+      )
+      .bind(
+        chatId,
+        telegramMessageId,
+        roomId,
+        eventId,
+        sender,
+        typeof content.body === 'string' ? content.body : '',
+        typeof content.formatted_body === 'string' ? content.formatted_body : null,
+        Date.now()
+      )
+      .run();
+  } catch (err) {
+    console.warn('[telegram-bridge] message map write failed:', err);
+  }
+}
+
+/** Spec rich-reply fallback: a quoted line for clients that ignore
+ *  m.relates_to, plus the mx-reply blockquote in formatted_body. The
+ *  relation itself is the authoritative pointer to the original event. */
+function applyRichReply(
+  content: Record<string, unknown>,
+  original: BridgedMessageMapRow,
+  defaultSender: string
+): void {
+  const sender = original.sender || defaultSender;
+  const eventId = original.matrix_event_id;
+  const roomId = original.room_id;
+  const newBody = typeof content.body === 'string' ? content.body : '';
+  const originalBody = typeof original.body === 'string' ? original.body : '';
+  const originalText = originalBody.split('\n').map((line, i) =>
+    i === 0 ? `> <${sender}> ${line}` : `> ${line}`
+  ).join('\n');
+  content.body = `${originalText}\n${newBody}`;
+
+  const originalHtml = original.formatted_body
+    ? original.formatted_body
+    : escapeHtml(originalBody).replace(/\n/g, '<br>');
+  const newHtml =
+    content.format === 'org.matrix.custom.html' && typeof content.formatted_body === 'string'
+      ? content.formatted_body
+      : escapeHtml(newBody).replace(/\n/g, '<br>');
+  const roomLink = escapeHtml(`https://matrix.to/#/${roomId}/${eventId}`);
+  const senderLink = escapeHtml(`https://matrix.to/#/${sender}`);
+  content.format = 'org.matrix.custom.html';
+  content.formatted_body =
+    `<mx-reply><blockquote><a href="${roomLink}">In reply to</a> ` +
+    `<a href="${senderLink}">${escapeHtml(sender)}</a><br>${originalHtml}</blockquote></mx-reply>${newHtml}`;
+  content['m.relates_to'] = { 'm.in_reply_to': { event_id: eventId } };
+}
+
+/** Send one bridged Telegram message to Matrix. Reply metadata is resolved
+ *  from the message map (a miss means an old/unbridged message: plain send),
+ *  and the mapping is recorded only after a successful send. */
+async function sendBridgedMessage(
+  env: Env,
+  bridge: TelegramBridgeRow,
+  msg: NonNullable<TelegramUpdate['message']>,
+  eventType: string,
+  content: Record<string, unknown>
+): Promise<void> {
+  const chatId = String(bridge.chat_id);
+  const sentContent = { ...content };
+  const replyToId = msg.reply_to_message?.message_id;
+  if (typeof replyToId === 'number') {
+    const original = await findBridgedMessage(env.DB, chatId, replyToId);
+    if (original?.matrix_event_id) applyRichReply(content, original, bridge.bot_user_id);
+  }
+
+  const { performSendEvent } = await import('../api/rooms');
+  const result = await performSendEvent(env, bridge.room_id, bridge.bot_user_id, eventType, content);
+  if ('error' in result) {
+    console.error('[telegram-bridge] matrix send failed:', result.error.errcode);
+    return;
+  }
+  await recordBridgedMessage(
+    env.DB,
+    chatId,
+    msg.message_id,
+    bridge.room_id,
+    result.eventId,
+    bridge.bot_user_id,
+    sentContent
+  );
+}
+
 /**
  * Process one webhook update. Returns true when handled (Telegram expects a
  * 200 so it stops retrying — we also 200 on unknown/duplicate updates).
@@ -535,8 +676,6 @@ export async function processTelegramUpdate(
     const senderName = msg.from?.first_name
       ? `${msg.from.first_name}${msg.from.username ? ` (@${msg.from.username})` : ''}`
       : 'telegram user';
-
-    const { performSendEvent } = await import('../api/rooms');
 
     // Images are downloaded from Telegram, stored in our media repo, and
     // posted as m.image / m.sticker events carrying the mxc URI. Failure at
@@ -566,10 +705,7 @@ export async function processTelegramUpdate(
           } else if (typeof (msg.sticker as TgSticker | undefined)?.emoji === 'string') {
             content.emoji = (msg.sticker as TgSticker).emoji;
           }
-          const result = await performSendEvent(env, bridge.room_id, bridge.bot_user_id, eventType, content);
-          if ('error' in result) {
-            console.error('[telegram-bridge] matrix send failed:', result.error.errcode);
-          }
+          await sendBridgedMessage(env, bridge, msg, eventType, content);
           return true;
         }
       }
@@ -604,10 +740,7 @@ export async function processTelegramUpdate(
       return true; // service messages / unsupported — ack silently.
     }
 
-    const result = await performSendEvent(env, bridge.room_id, bridge.bot_user_id, 'm.room.message', content);
-    if ('error' in result) {
-      console.error('[telegram-bridge] matrix send failed:', result.error.errcode);
-    }
+    await sendBridgedMessage(env, bridge, msg, 'm.room.message', content);
     return true;
   } catch (err) {
     console.error('[telegram-bridge] update processing failed:', err);

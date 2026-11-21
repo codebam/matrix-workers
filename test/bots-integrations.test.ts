@@ -42,6 +42,8 @@ interface FakeOpts {
   admins?: string[];
   bots?: Array<{ user_id: string; kind: string }>;
   bridges?: Array<{ id: string; chat_id: string; room_id?: string; last_update_id?: number }>;
+  /** Simulate a D1 failure when recording a bridged message mapping. */
+  failMessageMapWrite?: boolean;
 }
 
 function makeDb(opts: FakeOpts = {}) {
@@ -62,12 +64,13 @@ function makeDb(opts: FakeOpts = {}) {
   ]);
   const tokens: any[] = [];
   const mediaRows: any[] = [];
+  const messageMap: any[] = [];
   const bridges = (opts.bridges ?? [{ id: 'tgb1', chat_id: '4711', room_id: ROOM, last_update_id: 0 }]).map(
     (b) => ({ ...b, room_id: b.room_id ?? ROOM, bot_user_id: TG_BOT, tg_token: '111111111:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', webhook_secret: 's3cret', enabled: 1, created_at: 1, last_update_id: b.last_update_id ?? 0 })
   );
 
   const db = {
-    users, botRows, memberships, tokens, bridges, mediaRows,
+    users, botRows, memberships, tokens, bridges, mediaRows, messageMap,
     prepare(sql: string) {
       const stmt = (args: unknown[]) => ({
         async first<T>(): Promise<T | null> {
@@ -94,6 +97,12 @@ function makeDb(opts: FakeOpts = {}) {
           if (sql.includes('FROM telegram_bridges WHERE id = ?')) {
             const b = bridges.find((x: any) => x.id === args[0]);
             return (b ? { ...b } : null) as T;
+          }
+          if (sql.includes('FROM telegram_message_map WHERE chat_id = ?')) {
+            const row = messageMap.find(
+              (m) => String(m.chat_id) === String(args[0]) && m.telegram_message_id === args[1]
+            );
+            return (row ? { ...row } : null) as T;
           }
           if (sql.includes('SELECT membership FROM room_memberships')) {
             return { membership: memberships.get(`${args[0]}\0${args[1]}`) ?? null } as T;
@@ -154,6 +163,20 @@ function makeDb(opts: FakeOpts = {}) {
           }
           if (sql.includes('INSERT INTO media')) {
             mediaRows.push({ media_id: args[0], user_id: args[1], content_type: args[2], content_length: args[3], filename: args[4], created_at: args[5] });
+            return { meta: { changes: 1 } };
+          }
+          if (sql.includes('INSERT INTO telegram_message_map')) {
+            if (opts.failMessageMapWrite) throw new Error('D1 mapping write failed');
+            const row = {
+              chat_id: args[0], telegram_message_id: args[1], room_id: args[2],
+              matrix_event_id: args[3], sender: args[4], body: args[5],
+              formatted_body: args[6], created_at: args[7],
+            };
+            const existing = messageMap.findIndex(
+              (m) => String(m.chat_id) === String(row.chat_id) && m.telegram_message_id === row.telegram_message_id
+            );
+            if (existing >= 0) messageMap[existing] = row;
+            else messageMap.push(row);
             return { meta: { changes: 1 } };
           }
           if (sql.includes('INSERT INTO bots')) {
@@ -409,6 +432,175 @@ describe('telegram webhook update processing', () => {
     });
     expect(performSendEvent).toHaveBeenCalledTimes(1);
     expect(performSendEvent.mock.calls[0][4].body).toContain('[telegram photo] look');
+  });
+});
+
+describe('telegram reply rendering', () => {
+  const bridge = { id: 'tgb1', bot_user_id: TG_BOT, room_id: ROOM, chat_id: '4711', tg_token: '111111111:AAAA', webhook_secret: 's3cret', last_update_id: 0, enabled: 1, created_at: 1 };
+  const sender = { id: 7, first_name: 'Ivan', username: 'ivan' };
+  const chat = { id: 4711, type: 'private' };
+
+  it('a reply to a bridged message carries m.in_reply_to and the spec fallback blocks', async () => {
+    const env = makeEnv();
+    performSendEvent.mockImplementationOnce(async () => ({ eventId: '$orig:example.com', originServerTs: 1 }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 400,
+      message: { message_id: 50, from: sender, chat, text: 'original message' },
+    });
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 401,
+      message: {
+        message_id: 51, from: sender, chat, text: 'my reply',
+        reply_to_message: { message_id: 50 },
+      },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(2);
+    const [, roomId, sentBy, type, content] = performSendEvent.mock.calls[1];
+    expect(roomId).toBe(ROOM);
+    expect(sentBy).toBe(TG_BOT);
+    expect(type).toBe('m.room.message');
+    expect(content['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$orig:example.com' } });
+    expect(content.body).toBe('> <@tgbot:example.com> [TG] Ivan (@ivan): original message\n[TG] Ivan (@ivan): my reply');
+    expect(content.format).toBe('org.matrix.custom.html');
+    expect(content.formatted_body).toBe(
+      '<mx-reply><blockquote>' +
+      '<a href="https://matrix.to/#/!room:example.com/$orig:example.com">In reply to</a> ' +
+      '<a href="https://matrix.to/#/@tgbot:example.com">@tgbot:example.com</a><br>' +
+      '[TG] Ivan (@ivan): original message</blockquote></mx-reply>[TG] Ivan (@ivan): my reply'
+    );
+
+    const rows = (env.DB as any).messageMap;
+    expect(rows).toHaveLength(2);
+    expect(rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        chat_id: '4711', telegram_message_id: 50, room_id: ROOM,
+        matrix_event_id: '$orig:example.com', sender: TG_BOT,
+        body: '[TG] Ivan (@ivan): original message', formatted_body: null,
+      }),
+      expect.objectContaining({
+        chat_id: '4711', telegram_message_id: 51, room_id: ROOM,
+        matrix_event_id: '$botmsg:example.com', sender: TG_BOT,
+        body: '[TG] Ivan (@ivan): my reply',
+      }),
+    ]));
+    // The mapping stores the message's own text, not the reply's fallback.
+    expect(rows[1].body).not.toContain('> <@');
+  });
+
+  it('quotes the original formatted_body when the bridged message had entities', async () => {
+    const env = makeEnv();
+    performSendEvent.mockImplementationOnce(async () => ({ eventId: '$rich:example.com', originServerTs: 1 }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 410,
+      message: {
+        message_id: 70, from: sender, chat, text: 'bold text',
+        entities: [{ offset: 0, length: 4, type: 'bold' }],
+      },
+    });
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 411,
+      message: { message_id: 71, from: sender, chat, text: 'agree', reply_to_message: { message_id: 70 } },
+    });
+
+    const content = performSendEvent.mock.calls[1][4];
+    expect(content['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$rich:example.com' } });
+    expect(content.formatted_body).toContain('[TG] Ivan (@ivan): <b>bold</b> text</blockquote></mx-reply>');
+    expect(content.formatted_body).toContain('</mx-reply>[TG] Ivan (@ivan): agree');
+    const rows = (env.DB as any).messageMap;
+    expect(rows[0].formatted_body).toBe('[TG] Ivan (@ivan): <b>bold</b> text');
+  });
+
+  it('a reply to an unmapped message stays plain and is still delivered', async () => {
+    const env = makeEnv();
+    const handled = await processTelegramUpdate(env, bridge as any, {
+      update_id: 420,
+      message: {
+        message_id: 80, from: sender, chat, text: 'plain reply',
+        reply_to_message: { message_id: 999 },
+      },
+    });
+    expect(handled).toBe(true);
+    expect(performSendEvent).toHaveBeenCalledTimes(1);
+    expect(performSendEvent.mock.calls[0][4]).toEqual({
+      msgtype: 'm.text', body: '[TG] Ivan (@ivan): plain reply',
+    });
+    // The new message itself is still mapped for future replies.
+    expect((env.DB as any).messageMap).toHaveLength(1);
+  });
+
+  it('a mapping write failure does not fail delivery', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const env = makeEnv({ failMessageMapWrite: true });
+      const handled = await processTelegramUpdate(env, bridge as any, {
+        update_id: 430,
+        message: {
+          message_id: 90, from: sender, chat, text: 'still delivered',
+          reply_to_message: { message_id: 123 },
+        },
+      });
+      expect(handled).toBe(true);
+      expect(performSendEvent).toHaveBeenCalledTimes(1);
+      expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan (@ivan): still delivered');
+      expect((env.DB as any).messageMap).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a reply to a bridged media message points at whatever event was mapped', async () => {
+    const env = makeEnv();
+    fetchMock.mockImplementation(async (url: string) => {
+      if (String(url).includes('/getFile')) {
+        return Response.json({ ok: true, result: { file_path: 'photos/x.jpg' } });
+      }
+      if (String(url).includes('/file/bot')) {
+        return new Response(new Uint8Array([1, 2, 3]).buffer, { headers: { 'Content-Type': 'image/jpeg' } });
+      }
+      return Response.json({ ok: true });
+    });
+    performSendEvent.mockImplementationOnce(async () => ({ eventId: '$photo:example.com', originServerTs: 1 }));
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 440,
+      message: {
+        message_id: 100, from: sender, chat,
+        photo: [{ file_id: 'p', width: 640, height: 480, file_size: 300 }],
+        caption: 'look',
+      },
+    });
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 441,
+      message: { message_id: 101, from: sender, chat, text: 'nice', reply_to_message: { message_id: 100 } },
+    });
+
+    expect(performSendEvent).toHaveBeenCalledTimes(2);
+    expect((env.DB as any).messageMap).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        telegram_message_id: 100, matrix_event_id: '$photo:example.com',
+        body: '[TG] Ivan (@ivan): look',
+      }),
+    ]));
+    const replyContent = performSendEvent.mock.calls[1][4];
+    expect(replyContent['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$photo:example.com' } });
+    expect(replyContent.body).toContain('> <@tgbot:example.com> [TG] Ivan (@ivan): look');
+    expect(replyContent.formatted_body).toContain(
+      'href="https://matrix.to/#/!room:example.com/$photo:example.com"'
+    );
+  });
+
+  it('the outbound relay still skips the bot-sent reply', async () => {
+    const env = makeEnv();
+    await processTelegramUpdate(env, bridge as any, {
+      update_id: 450,
+      message: {
+        message_id: 110, from: sender, chat, text: 'a reply',
+        reply_to_message: { message_id: 111 },
+      },
+    });
+    const replyContent = performSendEvent.mock.calls[0][4] as Record<string, unknown>;
+    await handleRoomMessage(env, ROOM, TG_BOT, replyContent, 'local');
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
