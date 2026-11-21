@@ -798,3 +798,29 @@ overwrites earlier algorithms per device. Low: /notifications limit
 defaults 20 not 50 with mixed ordering; /sync room summary and
 event_format/event_fields unimplemented; AS transactions carry only
 events (no ephemeral/to_device).
+
+### Postscript — the whole ledger is closed (2026-11-21)
+
+Every gap-hunt item above was implemented and shipped after the watch list
+was written: federation signatures, send_leave, state-at-event (#1-#3,
+`c4fdfa7`); room upgrade and createRoom (#4, `#11`, `9e7b70b`); account UIA
+(#5, `18dd0d7`); device lists (#6, `e28e5fc` + `c4fdfa7`); media, keys and
+AS transactions (#7, `#12`, `#15`, `c6930f5`); push (#8, `#9`, `#13`,
+`9793ac8`); summary/filters (#14, `e28e5fc`). The user also hit a static
+Telegram sticker arriving as `[telegram sticker]` text: modern Bot API
+payloads omit `mime_type` on regular webp stickers, so the relay matched
+no branch — fixed and user-verified in `ab5ab47`, with durable KV failure
+diagnostics left in place.
+
+The one deliberate partial — incremental presence — was completed with the
+user's approval in `51f25ea`: migration `030_presence_stream.sql` (stream
+position + index + backfill at 0) applied to prod via `d1 execute --file`
+and dev via `d1 migrations apply`; local PUT, activity updates and inbound
+`m.presence` EDU stamp the stream; legacy `/sync` carries an optional
+`_pr` token cursor; sliding-sync prefers the D1 rows. Verified live: prod's
+`presence` stream advanced 0 → 6 within seconds of the deploy.
+
+Final deploy state: prod `51f25ea` / version `95d8b7a0-a7f0-465f-a6e3-f6cfe52b63c0`;
+dev `51f25ea` / version `16702267-ce27-44eb-8ed6-8b05763f01b7`. Full suite
+after: 45,750/45,750 (367 files). HITL review remains advised on the
+account-UIA and federation-key-handling commits.
