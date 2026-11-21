@@ -125,7 +125,7 @@ const wireRoom = {
 
 function createDb(
   rows: Row[] = [],
-  opts: { roomVersion?: string; creator?: string } = {}
+  opts: { roomVersion?: string; creator?: string; requireRemoteMember?: boolean } = {}
 ) {
   const queries: Array<{ sql: string; args: unknown[] }> = [];
   const db = {
@@ -137,6 +137,16 @@ function createDb(
           return {
             async all<T>() {
               if (sql.includes('sender LIKE ?') && sql.includes('stream_ordering > ?')) {
+                // Model reality: a locally-written event is only observable
+                // by the sweep once remote members (the federation
+                // destinations) have been registered. A sweep that runs too
+                // early sees nothing and queues nothing.
+                if (opts.requireRemoteMember) {
+                  const registered = updateMembership.mock.calls.some((call) =>
+                    typeof call[2] === 'string' && call[2].includes(`:${RESIDENT}`)
+                  );
+                  if (!registered) return { results: [] } as T;
+                }
                 return { results: rows } as T;
               }
               return { results: [] } as T;
@@ -258,6 +268,46 @@ describe('RoomJoinWorkflow closes the /join handshake race', () => {
     expect(body.event_id).toBe('$wire-message:example.com');
     expect(body.room_id).toBe(ROOM);
     expect(body.pdu).toEqual(wireMessage);
+  });
+
+  it('sweeps after remote members register federation destinations, covering the whole gap', async () => {
+    // store-remote-state registers a joined member resident on RESIDENT. Until
+    // that happens getJoinedRemoteServers() returns [] and a local send in the
+    // gap is stored but never queued. The re-sweep must therefore run AFTER
+    // the remote state (and its memberships) are persisted — not merely after
+    // the local join event is persisted.
+    federationPut.mockResolvedValueOnce(new Response(JSON.stringify({
+      state: [{
+        event_id: '$remote-member:remote.example',
+        room_id: ROOM,
+        type: 'm.room.member',
+        sender: '@bob:remote.example',
+        state_key: '@bob:remote.example',
+        content: { membership: 'join' },
+        origin_server_ts: 1,
+        depth: 1,
+        auth_events: [],
+        prev_events: [],
+      }],
+      auth_chain: [],
+    }), { status: 200 }));
+
+    const db = createDb([residentMessage], { requireRemoteMember: true });
+    const env = createEnv(db, async () => new Response('queued'));
+    const { step, result } = runJoin(env, 41);
+
+    expect((await result).success).toBe(true);
+    expect(step.names.indexOf('store-remote-state')).toBeLessThan(
+      step.names.indexOf('resweep-recent-events')
+    );
+    // The sweep sees the gap event precisely because the destination was
+    // registered first; an early sweep would observe no rows and queue nothing.
+    expect(env.fetches).toHaveLength(1);
+    const body = await env.fetches[0].json() as {
+      event_id: string; destination: string;
+    };
+    expect(body.event_id).toBe('$wire-message:example.com');
+    expect(body.destination).toBe(RESIDENT);
   });
 
   it('excludes already-delivered events and the join event itself from the sweep', async () => {

@@ -185,22 +185,6 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
         await updateMembership(this.env.DB, roomId, userId, 'join', joinEventData.event_id);
       });
 
-      // Step 4a: close the /join race. Until send_join registered us as a
-      // destination, locally-written events (resident messages, state changes)
-      // had no remote to queue for — the 200 had already gone to the client.
-      // Now that membership is persisted, later sends fan out normally; sweep
-      // the gap exactly once, as a durable workflow step (never waitUntil).
-      if (isRemote && remoteServer && typeof sinceStreamOrdering === 'number') {
-        await step.do('resweep-recent-events', {
-          retries: { limit: 2, delay: 1000, backoff: 'exponential' },
-          timeout: 30000,
-        }, async () => {
-          await this.resweepLocalEventsToServer(
-            roomId, chosenServer ?? remoteServer, sinceStreamOrdering, joinEventData.event_id
-          );
-        });
-      }
-
       // Step 4b: Persist the room state the remote server returned with the
       // accepted join (v2 send_join: auth_chain + state + counter-signed
       // event). Without it, events the remote server later relays to us
@@ -299,6 +283,29 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           // Only after every consumer succeeded: a step retry must still find
           // the payload if a later operation in this step throws.
           if (sendJoinRef) await this.env.MEDIA.delete(sendJoinRef.stateKey);
+        });
+      }
+
+      // Close the /join race (after step 4b, deliberately). Locally-written
+      // events (resident messages, state changes) from the handshake window
+      // had no federation destination yet: the send path only queues a wire
+      // PDU once a joined REMOTE member exists, and those destinations come
+      // from room_memberships (getJoinedRemoteServers). `persist` above only
+      // stores the local joiner's membership; the remote members that populate
+      // our destination list are registered by store-remote-state (step 4b).
+      // Sweeping before that step left a second gap: events written after the
+      // sweep but before the remote members landed were stored locally yet
+      // never queued. Running the sweep here — after destinations exist, before
+      // the joining server sends through the normal path — covers the whole
+      // /join → send_join → state-sync window in one durable step.
+      if (isRemote && remoteServer && typeof sinceStreamOrdering === 'number') {
+        await step.do('resweep-recent-events', {
+          retries: { limit: 2, delay: 1000, backoff: 'exponential' },
+          timeout: 30000,
+        }, async () => {
+          await this.resweepLocalEventsToServer(
+            roomId, chosenServer ?? remoteServer, sinceStreamOrdering, joinEventData.event_id
+          );
         });
       }
 
@@ -405,9 +412,11 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
 
   // Re-deliver locally written events from the /join → send_join gap. The
   // send path only prepares a wire PDU when it already has remote
-  // destinations; during the gap there were none, so nothing was queued for
-  // the joining server. Now that our membership is persisted, future sends
-  // fan out normally — this sweep covers the finite window before that.
+  // destinations (joined remote members in room_memberships); during the gap
+  // there were none, so nothing was queued for the joining server. This sweep
+  // runs after store-remote-state has registered those members, so sends from
+  // here on fan out normally and this covers exactly the finite window where
+  // they could not.
   private async resweepLocalEventsToServer(
     roomId: string,
     destination: string,
