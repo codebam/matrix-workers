@@ -388,3 +388,142 @@ export function deriveUsername(claims: OIDCUserClaims, usernameClaim: string): s
 
   return username;
 }
+
+/**
+ * Endpoints for a generic OAuth 2.0 provider. OIDC providers derive these from
+ * discovery; OAuth2 providers (e.g. GitHub) configure them explicitly because
+ * they publish no discovery document or JWKS.
+ */
+export interface OAuthEndpoints {
+  authorization_endpoint: string;
+  token_endpoint: string;
+  userinfo_endpoint: string;
+  emails_endpoint?: string;
+}
+
+/**
+ * Build the authorization URL for a generic OAuth 2.0 flow. Unlike OIDC, there
+ * is no nonce: OAuth2 issues no ID token to validate.
+ */
+export function buildOAuthAuthorizationUrl(
+  endpoints: OAuthEndpoints,
+  clientId: string,
+  redirectUri: string,
+  scopes: string,
+  state: string
+): string {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: scopes,
+    state: state,
+  });
+
+  return `${endpoints.authorization_endpoint}?${params.toString()}`;
+}
+
+/**
+ * Exchange an authorization code for tokens at a generic OAuth 2.0 token endpoint.
+ */
+export async function exchangeOAuthCode(
+  endpoints: OAuthEndpoints,
+  clientId: string,
+  clientSecret: string,
+  code: string,
+  redirectUri: string
+): Promise<{ access_token: string; token_type: string; scope?: string }> {
+  const response = await fetch(endpoints.token_endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json',
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code: code,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      client_secret: clientSecret,
+    }).toString(),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Token exchange failed: ${response.status} - ${error}`);
+  }
+
+  return await response.json() as { access_token: string; token_type: string; scope?: string };
+}
+
+/**
+ * Fetch user info from a generic OAuth 2.0 provider and map provider-specific
+ * fields (GitHub-style) onto the OIDC claim shape. When an emails endpoint is
+ * configured, prefer a primary+verified address, then any verified address;
+ * otherwise fall back to the profile email without claiming it is verified.
+ * A missing or failing emails endpoint is non-fatal.
+ */
+export async function fetchOAuthUserInfo(
+  endpoints: OAuthEndpoints,
+  accessToken: string
+): Promise<OIDCUserClaims> {
+  const headers = {
+    'Authorization': `Bearer ${accessToken}`,
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'User-Agent': 'matrix-workers-oauth2',
+  };
+
+  const response = await fetch(endpoints.userinfo_endpoint, { headers });
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(
+      `Failed to fetch user info from ${endpoints.userinfo_endpoint}: ${response.status} - ${error}`
+    );
+  }
+
+  const user = await response.json() as {
+    id: string | number;
+    login?: string;
+    name?: string | null;
+    email?: string | null;
+    avatar_url?: string;
+  };
+
+  const claims: OIDCUserClaims = {
+    sub: String(user.id),
+    preferred_username: user.login,
+    name: user.name ?? user.login,
+    picture: user.avatar_url,
+  };
+
+  if (endpoints.emails_endpoint) {
+    try {
+      const emailsResponse = await fetch(endpoints.emails_endpoint, { headers });
+      if (emailsResponse.ok) {
+        const emails = await emailsResponse.json() as Array<{
+          email?: string;
+          primary?: boolean;
+          verified?: boolean;
+        }>;
+        const entries = Array.isArray(emails) ? emails : [];
+        const chosen =
+          entries.find(e => e.primary && e.verified && e.email) ??
+          entries.find(e => e.verified && e.email);
+        if (chosen?.email) {
+          claims.email = chosen.email;
+          claims.email_verified = true;
+        }
+      }
+    } catch {
+      // Non-fatal: keep the profile email as the fallback.
+    }
+  }
+
+  if (!claims.email && user.email) {
+    claims.email = user.email;
+    // The profile email's verification status is unknown — do not claim it.
+  }
+
+  return claims;
+}
