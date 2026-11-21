@@ -11,7 +11,7 @@
  * "missing auth event type m.room.power_levels".
  */
 import { describe, expect, it } from 'vitest';
-import { computeWireEventId, redactEventForSigning } from '../src/utils/event-signing';
+import { computeWireEventId, inboundWireEventIdCandidates, redactEventForSigning } from '../src/utils/event-signing';
 
 // Verbatim fixture: the GNU/Linux room's m.room.create (v9, halogen.city,
 // 2022 — fetched from matrix.org by ID $vg_GNDVSf2hYj1hJUJSmYoA760umYC5dJPl14SUhR4o).
@@ -137,5 +137,34 @@ describe('redaction keep-list is version-correct (v1/v2 legacy, v3+ modern)', ()
     delete member.prev_state;
     // m.room.member content and top-level keeps coincide across v9/v11+.
     expect(await computeWireEventId(member, '9')).toBe(await computeWireEventId(member));
+  });
+});
+
+describe('inbound ID candidates preserve remote (resident-authored) IDs', () => {
+  it('prefers the legacy form for pre-2023 origin-bearing v9 events', async () => {
+    const candidates = await inboundWireEventIdCandidates(GNU_LINUX_CREATE, '9');
+    expect(candidates).toEqual([
+      '$vg_GNDVSf2hYj1hJUJSmYoA760umYC5dJPl14SUhR4o',
+      await computeWireEventId(GNU_LINUX_CREATE, '9'),
+    ]);
+    // Our outbound derivation is untouched: it still uses room-version rules.
+    expect(await computeWireEventId(GNU_LINUX_CREATE, '9')).not.toBe(candidates[0]);
+  });
+
+  it('uses only room-version derivation for modern events and v11+ rooms', async () => {
+    const modern = {
+      ...GNU_LINUX_CREATE,
+      origin_server_ts: 1_700_000_000_000,
+    } as Record<string, unknown>;
+    delete modern.origin;
+    delete modern.prev_state;
+    expect(await inboundWireEventIdCandidates(modern, '9')).toEqual([
+      await computeWireEventId(modern, '9'),
+    ]);
+
+    const v11 = { ...GNU_LINUX_CREATE, room_version: '11' } as Record<string, unknown>;
+    expect(await inboundWireEventIdCandidates(v11, '11')).toEqual([
+      await computeWireEventId(v11, '11'),
+    ]);
   });
 });

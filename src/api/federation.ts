@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
-import { computeWireEventId, isMsc4291RoomVersion, redactEventForSigning, toWireEventObject, omitWireEventId } from '../utils/event-signing';
+import { computeWireEventId, inboundWireEventIdCandidates, isMsc4291RoomVersion, redactEventForSigning, toWireEventObject, omitWireEventId } from '../utils/event-signing';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import { federationOriginRateLimit } from '../middleware/rate-limit';
 import {
@@ -46,6 +46,31 @@ async function callerDeniedByRoomAcl(
   if (!origin || !roomId) return false;
   try {
     return !(await isServerAllowedInRoom(c.env.DB, roomId, origin));
+  } catch {
+    return false;
+  }
+}
+
+// Wire derivation rebuilds a whole room's IDs from stored rows. That is only
+// sound for rooms WE created: a remote-created room's stored IDs are the
+// residents' real IDs (their events can carry fields we never stored, e.g.
+// pre-2023 `origin`), so re-deriving them produces phantom references no peer
+// resolves. Callers that use deriveRoomWireEvents directly must gate here.
+async function roomWireDerivationAllowed(env: Env, roomId: string): Promise<boolean> {
+  try {
+    const create = await env.DB.prepare(
+      `SELECT e.event_id, e.sender FROM room_state rs
+       JOIN events e ON rs.event_id = e.event_id
+       WHERE rs.room_id = ? AND rs.event_type = 'm.room.create'`
+    ).bind(roomId).first<{ event_id: string; sender?: string }>();
+    if (!create) return false;
+    if (create.sender) return create.sender.endsWith(`:${env.SERVER_NAME}`);
+    // Some D1 wrappers return only the projected event_id; resolve the
+    // sender from the event row before deciding.
+    const eventRow = await env.DB.prepare(
+      `SELECT sender FROM events WHERE event_id = ?`
+    ).bind(create.event_id).first<{ sender: string }>();
+    return Boolean(eventRow?.sender?.endsWith(`:${env.SERVER_NAME}`));
   } catch {
     return false;
   }
@@ -681,6 +706,74 @@ async function deliverInboundTypingEdu(env: Env, content: unknown): Promise<void
   }));
 }
 
+// A server publishes cross-signing key changes for its OWN users with an
+// m.signing_key_update EDU. Cache the keys in the same D1 table + KV shape the
+// upload path uses, and mark a key change so clients re-query /keys/query.
+// The sender is authenticated by transaction origin: never let one server
+// overwrite another server's users' cross-signing keys.
+async function storeInboundSigningKeyUpdate(
+  env: Env,
+  content: unknown,
+  origin: string
+): Promise<void> {
+  const edu = (content ?? {}) as Record<string, unknown>;
+  const userId = edu.user_id;
+  if (typeof userId !== 'string' || !userId.includes(':')) {
+    console.warn('[federation] Ignoring m.signing_key_update without user_id');
+    return;
+  }
+  if (!userId.endsWith(`:${origin}`)) {
+    console.warn(`[federation] Ignoring m.signing_key_update for foreign user ${userId} from ${origin}`);
+    return;
+  }
+
+  const merged: Record<string, unknown> = {};
+  const updates: Array<{ type: string; key: Record<string, unknown> }> = [];
+  for (const [type, field] of [
+    ['master', 'master_key'],
+    ['self_signing', 'self_signing_key'],
+    ['user_signing', 'user_signing_key'],
+  ]) {
+    const key = edu[field];
+    if (key && typeof key === 'object' && !Array.isArray(key)) {
+      updates.push({ type, key: key as Record<string, unknown> });
+    }
+  }
+
+  for (const { type, key } of updates) {
+    const keys = key.keys;
+    if (!keys || typeof keys !== 'object' || Array.isArray(keys)) continue;
+    const keyId = Object.keys(keys as Record<string, unknown>)[0];
+    if (!keyId) continue;
+    await env.DB.prepare(`
+      INSERT INTO cross_signing_keys (user_id, key_type, key_id, key_data)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (user_id, key_type) DO UPDATE SET
+        key_id = excluded.key_id,
+        key_data = excluded.key_data
+    `).bind(userId, type, keyId, JSON.stringify(key)).run();
+    merged[type] = key;
+  }
+  if (Object.keys(merged).length === 0) return;
+
+  try {
+    const raw = await env.CROSS_SIGNING_KEYS.get(`user:${userId}`);
+    const existing = raw ? JSON.parse(raw) as Record<string, unknown> : {};
+    await env.CROSS_SIGNING_KEYS.put(`user:${userId}`, JSON.stringify({ ...existing, ...merged }));
+  } catch (kvErr) {
+    console.warn('[federation] Cross-signing EDU KV cache update failed:', kvErr);
+  }
+
+  try {
+    // device_key_changes is what /sync uses for device_lists.changed; a
+    // remote user's next /keys/query then refreshes the client's verification
+    // state from the freshly cached cross-signing keys.
+    await recordKeyChange(env.DB, userId, null, 'update');
+  } catch (changeErr) {
+    console.warn('[federation] Cross-signing EDU key-change record failed:', changeErr);
+  }
+}
+
 // Spec v1.19 wire shape: room_id plus content keyed by event ID, receipt type,
 // then user ID. Only m.read is a public ephemeral receipt: m.read.private is
 // never accepted from a remote server, and m.fully_read is local account data.
@@ -707,11 +800,21 @@ async function deliverInboundReceiptEdu(env: Env, content: unknown): Promise<voi
       for (const [userId, data] of Object.entries(byUserId as Record<string, unknown>)) {
         if (!userId) continue;
         const threadId = (data as { thread_id?: unknown } | null)?.thread_id;
-        const receipt: { user_id: string; event_id: string; receipt_type: string; thread_id?: string } = {
+        const remoteTs = (data as { ts?: unknown } | null)?.ts;
+        const receipt: {
+          user_id: string;
+          event_id: string;
+          receipt_type: string;
+          ts?: number;
+          thread_id?: string;
+        } = {
           user_id: userId,
           event_id: eventId,
           receipt_type: receiptType,
         };
+        // Forward the resident's read time; the Room DO stamps Date.now()
+        // only when ts is absent (local receipts still use their own clock).
+        if (typeof remoteTs === 'number' && Number.isFinite(remoteTs)) receipt.ts = remoteTs;
         if (typeof threadId === 'string') receipt.thread_id = threadId;
         try {
           await roomDO.fetch(new Request('https://room/receipt', {
@@ -779,18 +882,36 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           ).bind(roomId).first<{ room_id: string; room_version: string }>()
         : null;
       // v4+ wire events (room versions 3 and up) omit `event_id`; the
-      // receiving server derives it as the event's reference hash. Derive
-      // it once here so everything downstream (processed_pdus, storage,
-      // sync) uses the same ID the sender's server uses.
-      const eventId =
-        typeof pdu.event_id === 'string' && pdu.event_id
-          ? pdu.event_id
-          : await computeWireEventId(pdu as Record<string, unknown>, room?.room_version);
-
-      // Check if we've already processed this PDU
-      const existingPdu = await c.env.DB.prepare(
-        `SELECT accepted, rejection_reason FROM processed_pdus WHERE event_id = ?`
-      ).bind(eventId).first<{ accepted: number; rejection_reason: string | null }>();
+      // receiving server derives it as the event's reference hash. Use the
+      // resident's redaction form when the wire carries pre-2023 `origin` /
+      // `prev_state`, and keep an ID we already stored under authoritative —
+      // re-deriving a stored remote ID can produce a phantom no peer knows.
+      const candidates = typeof pdu.event_id === 'string' && pdu.event_id
+        ? [pdu.event_id as string]
+        : await inboundWireEventIdCandidates(pdu as Record<string, unknown>, room?.room_version);
+      let eventId = candidates[0];
+      let existingPdu: { accepted: number; rejection_reason: string | null } | null = null;
+      for (const candidate of candidates) {
+        const found = await c.env.DB.prepare(
+          `SELECT accepted, rejection_reason FROM processed_pdus WHERE event_id = ?`
+        ).bind(candidate).first<{ accepted: number; rejection_reason: string | null }>();
+        if (found) {
+          eventId = candidate;
+          existingPdu = found;
+          break;
+        }
+      }
+      if (!existingPdu && candidates.length > 1) {
+        for (const candidate of candidates) {
+          const stored = await c.env.DB.prepare(
+            `SELECT 1 FROM events WHERE event_id = ?`
+          ).bind(candidate).first();
+          if (stored) {
+            eventId = candidate;
+            break;
+          }
+        }
+      }
 
       if (existingPdu) {
         // Already processed
@@ -1397,7 +1518,11 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           break;
 
         case 'm.signing_key_update':
-          // Handle cross-signing key updates
+          try {
+            await storeInboundSigningKeyUpdate(c.env, content, origin);
+          } catch (keyErr) {
+            console.warn('[federation] Failed to store inbound signing key update:', keyErr);
+          }
           break;
 
         default:
@@ -2351,10 +2476,13 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
     restrictedAuthEventId = decision.authEventId;
   }
 
-  // MSC4291 (room version 12): the template must reference the derived wire
-  // IDs that federation exchanges, and the create event is implicit so it is
-  // never listed in auth_events.
-  const makerWire = await deriveRoomWireEvents(c.env, roomId, room.room_version);
+  // The template must reference the IDs residents exchange. Only re-derive
+  // rooms WE created: a remote-created room's stored IDs are the residents'
+  // real IDs (often derived with the legacy keep-list that retained `origin`),
+  // so translating them here would put phantom refs in the join template.
+  const makerWire = await roomWireDerivationAllowed(c.env, roomId)
+    ? await deriveRoomWireEvents(c.env, roomId, room.room_version)
+    : null;
   const wireRef = (id: string): string => makerWire?.idMap.get(id) ?? id;
 
   const authEvents: string[] = [];

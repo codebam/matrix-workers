@@ -3726,6 +3726,54 @@ describe('make_join / send_join for v11+ (derived event IDs)', () => {
   });
 });
 
+describe('make_join preserves resident IDs in remote-created rooms', () => {
+  it('does not re-derive a remote room create/PL into phantom auth refs', async () => {
+    const create = makeEvent({
+      event_id: '$remote-create',
+      event_type: 'm.room.create',
+      sender: REMOTE_USER,
+      content: JSON.stringify({ creator: REMOTE_USER, room_version: '10' }),
+      depth: 1,
+    });
+    const joinRules = makeEvent({
+      event_id: '$remote-jr',
+      event_type: 'm.room.join_rules',
+      sender: REMOTE_USER,
+      content: JSON.stringify({ join_rule: 'public' }),
+      depth: 2,
+    });
+    const power = makeEvent({
+      event_id: '$remote-pl',
+      event_type: 'm.room.power_levels',
+      sender: REMOTE_USER,
+      content: JSON.stringify({ users: { [REMOTE_USER]: 100 } }),
+      depth: 3,
+    });
+    const db = createFedDb({
+      rooms: [{ room_id: ROOM, room_version: '10', is_public: 1, created_at: 1 }],
+      events: [create, joinRules, power],
+      roomState: new Map([
+        [stateKey(ROOM, 'm.room.create', ''), create.event_id],
+        [stateKey(ROOM, 'm.room.join_rules', ''), joinRules.event_id],
+        [stateKey(ROOM, 'm.room.power_levels', ''), power.event_id],
+      ]),
+    });
+
+    const { status, body } = await req(
+      'GET',
+      `/_matrix/federation/v1/make_join/${encodeURIComponent(ROOM)}/${encodeURIComponent(REMOTE_USER)}`,
+      makeEnv(db)
+    );
+    expect(status).toBe(200);
+    const authEvents = (body as { event: { auth_events: string[] } }).event.auth_events;
+    // Stored resident IDs stay authoritative; only locally-created rooms are
+    // re-derived, because only their stored bytes are fully reproducible.
+    expect(authEvents).toContain('$remote-pl');
+    expect(authEvents).toContain('$remote-jr');
+    expect(authEvents).toContain('$remote-create');
+  });
+});
+
 afterEach(() => {
   federationOrigin = FED_ORIGIN;
   vi.clearAllMocks();

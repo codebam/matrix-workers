@@ -9,7 +9,17 @@ vi.mock('cloudflare:workers', () => ({
   },
 }));
 
+const storeEventIdempotentMock = vi.hoisted(() =>
+  vi.fn(async () => ({ inserted: true, streamOrdering: 42 }))
+);
+
+vi.mock('../src/services/database', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/database')>();
+  return { ...actual, storeEventIdempotent: storeEventIdempotentMock };
+});
+
 import { FederationCatchupWorkflow } from '../src/workflows/FederationCatchupWorkflow';
+import { computeWireEventId } from '../src/utils/event-signing';
 
 function mockStep() {
   const names: string[] = [];
@@ -275,5 +285,142 @@ describe('FederationCatchupWorkflow empty-events / timeout wiring after #71', ()
     expect(fetchMock.mock.calls[1][0]).toBe(
       `https://remote.example/_matrix/federation/v1/get_missing_events/${encodeURIComponent(roomId)}`
     );
+  });
+});
+
+describe('FederationCatchupWorkflow get_missing_events persistence after the fetch-only stub', () => {
+  const ROOM = '!a:example.com';
+  const LATEST = '$latest-a';
+
+  let fetchMock: ReturnType<typeof vi.fn>;
+
+  function createStoreEnv(roomVersion: string, heldIds: Set<string> = new Set()) {
+    return {
+      DB: {
+        prepare(sql: string) {
+          return {
+            bind(...args: unknown[]) {
+              return {
+                async first<T>() {
+                  if (sql.includes('ORDER BY stream_ordering')) return { event_id: LATEST } as T;
+                  if (sql.includes('FROM rooms')) return { room_version: roomVersion } as T;
+                  if (sql.includes('SELECT 1 FROM events WHERE event_id = ?')) {
+                    return heldIds.has(args[0] as string) ? ({} as T) : null;
+                  }
+                  return null;
+                },
+              };
+            },
+          };
+        },
+      },
+    } as unknown as { DB: D1Database };
+  }
+
+  function returnedPdu(): Record<string, unknown> {
+    return {
+      room_id: ROOM,
+      sender: '@bob:remote.example',
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'gap filler' },
+      origin_server_ts: 1_700_000_000_000,
+      depth: 12,
+      auth_events: ['$auth'],
+      prev_events: [LATEST],
+      hashes: { sha256: 'abc' },
+    };
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(AbortSignal, 'timeout').mockReturnValue(new AbortController().signal);
+    storeEventIdempotentMock.mockClear();
+    fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('stores returned PDUs under derived wire IDs through the idempotent pipeline', async () => {
+    const pdu = returnedPdu();
+    const wireId = await computeWireEventId(pdu, '11');
+    fetchMock
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ events: [pdu] }), { status: 200 }));
+
+    const wf = new FederationCatchupWorkflow({} as any, createStoreEnv('11') as any);
+    const result = await wf.run(
+      { payload: { serverName: 'remote.example', roomIds: [ROOM] } } as any,
+      mockStep() as any
+    );
+
+    expect(result).toMatchObject({ backfilledEvents: 1, success: true });
+    expect(storeEventIdempotentMock).toHaveBeenCalledTimes(1);
+    const [db, stored] = storeEventIdempotentMock.mock.calls[0] as unknown as [D1Database, any];
+    expect(db).toBeDefined();
+    expect(stored).toMatchObject({
+      event_id: wireId,
+      room_id: ROOM,
+      sender: '@bob:remote.example',
+      type: 'm.room.message',
+      depth: 12,
+      prev_events: [LATEST],
+    });
+  });
+
+  it('keeps an already-stored resident ID for origin-bearing v9 events', async () => {
+    // The 2022 GNU/Linux create: its real ID uses the legacy keep-list.
+    const residentEvent = {
+      auth_events: [],
+      content: { creator: '@mazunki:halogen.city', room_version: '9' },
+      depth: 1,
+      hashes: { sha256: 'fWw9Z86qj9PugtVK3a+9cpPn6ihyvBIci2UzYWGxTcg' },
+      origin: 'halogen.city',
+      origin_server_ts: 1654943205025,
+      prev_events: [],
+      prev_state: [],
+      room_id: ROOM,
+      sender: '@mazunki:halogen.city',
+      signatures: { 'halogen.city': { 'ed25519:a_FRIi': 'sig' } },
+      state_key: '',
+      type: 'm.room.create',
+    };
+    const residentId = await computeWireEventId(residentEvent, '2');
+    expect(await computeWireEventId(residentEvent, '9')).not.toBe(residentId);
+    fetchMock
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ events: [residentEvent] }), { status: 200 })
+      );
+
+    const wf = new FederationCatchupWorkflow(
+      {} as any,
+      createStoreEnv('9', new Set([residentId])) as any
+    );
+    await wf.run(
+      { payload: { serverName: 'remote.example', roomIds: [ROOM] } } as any,
+      mockStep() as any
+    );
+
+    expect(storeEventIdempotentMock).toHaveBeenCalledTimes(1);
+    expect(storeEventIdempotentMock.mock.calls[0][1]).toMatchObject({ event_id: residentId });
+  });
+
+  it('counts malformed placeholders but never stores them', async () => {
+    fetchMock
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ events: [{}, null, { type: 'm.room.message' }] }), { status: 200 }));
+
+    const wf = new FederationCatchupWorkflow({} as any, createStoreEnv('11') as any);
+    const result = await wf.run(
+      { payload: { serverName: 'remote.example', roomIds: [ROOM] } } as any,
+      mockStep() as any
+    );
+    expect(result).toMatchObject({ backfilledEvents: 3, success: true });
+    expect(storeEventIdempotentMock).not.toHaveBeenCalled();
   });
 });

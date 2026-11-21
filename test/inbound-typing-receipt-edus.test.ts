@@ -70,11 +70,12 @@ function createRoomDOStub(roomId: string) {
         return Response.json({ user_ids: [...typingUsers] });
       }
       if (url.pathname === '/receipt' && req.method === 'PUT') {
-        const { event_id, receipt_type, user_id, thread_id } = body ?? {};
+        const { event_id, receipt_type, user_id, thread_id, ts } = body ?? {};
         receipts[event_id] ??= {};
         receipts[event_id][receipt_type] ??= {};
         receipts[event_id][receipt_type][user_id] = {
-          ts: Date.now(),
+          // Mirrors the Room DO: honor a forwarded remote ts, else local now.
+          ts: typeof ts === 'number' ? ts : Date.now(),
           ...(thread_id ? { thread_id } : {}),
         };
         return new Response('OK');
@@ -223,15 +224,18 @@ describe('inbound m.receipt EDUs', () => {
     const env = createEnv();
     const res = await sendEdus(env, 'txn-receipt-read', [
       receiptEdu(ROOM, {
-        [EVENT]: { 'm.read': { [REMOTE_USER]: { ts: 1, thread_id: THREAD } } },
-        [EVENT2]: { 'm.read': { [REMOTE_USER]: { ts: 2 } } },
+        [EVENT]: { 'm.read': { [REMOTE_USER]: { ts: 1_700_000_111_234, thread_id: THREAD } } },
+        [EVENT2]: { 'm.read': { [REMOTE_USER]: { ts: 1_700_000_222_345 } } },
       }),
     ]);
     expect(res.status).toBe(200);
 
     const receipts = await getReceiptsForRoom(env, ROOM, LOCAL_USER);
-    expect(receipts.content[EVENT]['m.read'][REMOTE_USER].thread_id).toBe(THREAD);
-    expect(receipts.content[EVENT2]['m.read'][REMOTE_USER].ts).toEqual(expect.any(Number));
+    expect(receipts.content[EVENT]['m.read'][REMOTE_USER]).toMatchObject({
+      ts: 1_700_000_111_234,
+      thread_id: THREAD,
+    });
+    expect(receipts.content[EVENT2]['m.read'][REMOTE_USER].ts).toBe(1_700_000_222_345);
     expect(receipts.content[EVENT2]['m.read'][REMOTE_USER]).not.toHaveProperty('thread_id');
 
     const room = env._rooms.get(ROOM)!;
@@ -242,9 +246,23 @@ describe('inbound m.receipt EDUs', () => {
         user_id: REMOTE_USER,
         event_id: EVENT,
         receipt_type: 'm.read',
+        ts: 1_700_000_111_234,
         thread_id: THREAD,
       },
     });
+    expect(room.fetches[1].body.ts).toBe(1_700_000_222_345);
+  });
+
+  it('falls back to the local clock when the EDU omits ts', async () => {
+    const env = createEnv();
+    const res = await sendEdus(env, 'txn-receipt-no-ts', [
+      receiptEdu(ROOM, { [EVENT]: { 'm.read': { [REMOTE_USER]: {} } } }),
+    ]);
+    expect(res.status).toBe(200);
+    const room = env._rooms.get(ROOM)!;
+    expect(room.fetches[0].body).not.toHaveProperty('ts');
+    const receipts = await getReceiptsForRoom(env, ROOM, LOCAL_USER);
+    expect(receipts.content[EVENT]['m.read'][REMOTE_USER].ts).toEqual(expect.any(Number));
   });
 
   it('ignores m.read.private and m.fully_read from remote servers', async () => {

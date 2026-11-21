@@ -180,6 +180,29 @@ export async function computeWireEventId(
 }
 
 /**
+ * Candidate wire IDs for an event RECEIVED from a resident server.
+ *
+ * Outbound IDs always use the room version's rules (computeWireEventId).
+ * Inbound, a pre-2023 Synapse event in a v3-v10 room may carry `origin` /
+ * `prev_state`; its real ID was derived with the legacy keep-list, which
+ * retained those fields. Re-deriving it with modern rules produces a phantom
+ * ID no resident resolves. Return the legacy form first when those fields are
+ * present, with the modern form as a fallback for already-stored rows.
+ */
+export async function inboundWireEventIdCandidates(
+  event: Record<string, unknown>,
+  roomVersion?: string
+): Promise<string[]> {
+  const modern = await computeWireEventId(event, roomVersion);
+  const num = parseInt(roomVersion ?? '', 10);
+  const legacyForm = Number.isFinite(num) && num >= 3 && num <= 10 &&
+    ('origin' in event || 'prev_state' in event);
+  if (!legacyForm) return [modern];
+  const legacy = await computeWireEventId(event, '2');
+  return legacy === modern ? [modern] : [legacy, modern];
+}
+
+/**
  * Strip local-only fields from an event before it goes on the wire. v4+
  * events must not include `event_id` — the resident server rejects PDUs
  * that carry one ("Invalid event JSON").

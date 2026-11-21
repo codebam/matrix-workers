@@ -9,7 +9,7 @@ import { getUserById, createRegistrationToken, listRegistrationTokens, revokeReg
 import { invalidatePolicyRulesCache } from '../services/moderation-policy';
 import { generateLoginToken, generateOpaqueId, generateRegistrationToken } from '../utils/ids';
 import { base64UrlDecode, hashToken, verifySignature } from '../utils/crypto';
-import { computeWireEventId } from '../utils/event-signing';
+import { inboundWireEventIdCandidates } from '../utils/event-signing';
 import { federationGet } from '../services/federation-keys';
 import { encryptSecret } from './oidc-auth';
 import { fetchOIDCDiscovery } from '../services/oidc';
@@ -3014,12 +3014,29 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
   ).bind(roomId).first<{ room_version: string }>();
   const roomVersion = roomRow?.room_version;
 
+  // A resident's /state PDUs carry the IDs every other peer references. For
+  // v3+ they omit event_id; derive it with the redaction form the resident
+  // used (pre-2023 `origin` events use the legacy keep-list), and prefer an
+  // ID already stored locally so a re-sync never mints a phantom duplicate.
+  const residentEventId = async (ev: any): Promise<string> => {
+    const candidates = typeof ev?.event_id === 'string' && ev.event_id
+      ? [ev.event_id as string]
+      : await inboundWireEventIdCandidates(ev as Record<string, unknown>, roomVersion);
+    for (const candidate of candidates) {
+      const stored = await db.prepare(
+        `SELECT 1 FROM events WHERE event_id = ?`
+      ).bind(candidate).first();
+      if (stored) return candidate;
+    }
+    return candidates[0];
+  };
+
   const storeEv = async (ev: any): Promise<boolean> => {
     if (!ev || typeof ev !== 'object' || !ev.type) return false;
     try {
       const normalized: Record<string, unknown> = { ...ev };
       if (typeof ev.event_id !== 'string' || !ev.event_id) {
-        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>, roomVersion);
+        normalized.event_id = await residentEventId(ev);
       }
       if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
         normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
@@ -3067,16 +3084,14 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
       for (const ev of chunk) {
         const mem = ev.content?.membership;
         if (!['join', 'invite', 'leave', 'ban', 'knock'].includes(mem)) continue;
-        // State PDUs for v3+ rooms carry no event_id — derive the wire ID
-        // so a membership row never points at '' (our own users' messages
-        // read this event id when building auth_events).
-        let memberId = typeof ev.event_id === 'string' && ev.event_id ? ev.event_id : '';
-        if (!memberId) {
-          try {
-            memberId = await computeWireEventId(ev as Record<string, unknown>, roomVersion);
-          } catch {
-            continue;
-          }
+        // State PDUs for v3+ rooms carry no event_id — use the resident's
+        // wire ID (see residentEventId) so a membership row never points at
+        // '' or at a phantom derived with the wrong redaction rules.
+        let memberId: string;
+        try {
+          memberId = await residentEventId(ev);
+        } catch {
+          continue;
         }
         stmts.push(db.prepare(
           `INSERT OR REPLACE INTO room_memberships (room_id, user_id, membership, event_id) VALUES (?, ?, ?, ?)`

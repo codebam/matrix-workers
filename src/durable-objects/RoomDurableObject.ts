@@ -154,10 +154,16 @@ export class RoomDurableObject extends DurableObject<Env> {
       event_id: string;
       receipt_type: string;
       thread_id?: string;
+      ts?: number;
     };
 
     const { user_id, event_id, receipt_type, thread_id } = body;
-    const ts = Date.now();
+    // Federated receipts carry the resident's read time; local receipts leave
+    // ts unset and use our clock. Clamp to now so a peer cannot inject a
+    // future timestamp into the room's receipt state.
+    const ts = typeof body.ts === 'number' && Number.isFinite(body.ts)
+      ? Math.min(body.ts, Date.now())
+      : Date.now();
 
     // Determine thread context for storage key
     // - undefined/absent = "unthreaded" (room-level receipt)
