@@ -2512,9 +2512,35 @@ export const adminDashboardHtml = (serverName: string) => `
           <input type="text" class="form-control" id="idpName" placeholder="e.g., Google, Okta, Azure AD">
         </div>
         <div class="form-group">
-          <label>Issuer URL *</label>
+          <label>Provider Type</label>
+          <select class="form-control" id="idpProviderType" onchange="updateIdpTypeFields(true)">
+            <option value="oidc">OpenID Connect (OIDC)</option>
+            <option value="oauth2">OAuth 2.0 (e.g. GitHub)</option>
+          </select>
+          <small style="color: var(--text-secondary); font-size: 12px;">OAuth 2.0 uses manually configured endpoints instead of discovery.</small>
+        </div>
+        <div class="form-group">
+          <label id="idpIssuerUrlLabel">Issuer URL *</label>
           <input type="text" class="form-control" id="idpIssuerUrl" placeholder="e.g., https://accounts.google.com">
-          <small style="color: var(--text-secondary); font-size: 12px;">The OIDC issuer URL. Must support /.well-known/openid-configuration</small>
+          <small id="idpIssuerUrlHelp" style="color: var(--text-secondary); font-size: 12px;">The OIDC issuer URL. Must support /.well-known/openid-configuration</small>
+        </div>
+        <div id="idpOAuth2Fields" style="display: none;">
+          <div class="form-group">
+            <label>Authorization URL *</label>
+            <input type="text" class="form-control" id="idpAuthorizationUrl" placeholder="https://github.com/login/oauth/authorize">
+          </div>
+          <div class="form-group">
+            <label>Token URL *</label>
+            <input type="text" class="form-control" id="idpTokenUrl" placeholder="https://github.com/login/oauth/access_token">
+          </div>
+          <div class="form-group">
+            <label>Userinfo URL *</label>
+            <input type="text" class="form-control" id="idpUserinfoUrl" placeholder="https://api.github.com/user">
+          </div>
+          <div class="form-group">
+            <label>Emails URL (optional)</label>
+            <input type="text" class="form-control" id="idpEmailsUrl" placeholder="https://api.github.com/user/emails">
+          </div>
         </div>
         <div class="form-row">
           <div class="form-group">
@@ -2530,6 +2556,7 @@ export const adminDashboardHtml = (serverName: string) => `
         <div class="form-group">
           <label>Scopes</label>
           <input type="text" class="form-control" id="idpScopes" placeholder="openid profile email" value="openid profile email">
+          <small id="idpScopesHelp" style="color: var(--text-secondary); font-size: 12px;">OIDC scopes (default: openid profile email)</small>
         </div>
         <div class="form-group">
           <label>Username Claim</label>
@@ -2538,7 +2565,7 @@ export const adminDashboardHtml = (serverName: string) => `
             <option value="preferred_username">preferred_username</option>
             <option value="sub">sub (subject ID)</option>
           </select>
-          <small style="color: var(--text-secondary); font-size: 12px;">Which claim to use for deriving Matrix usernames</small>
+          <small id="idpUsernameClaimHelp" style="color: var(--text-secondary); font-size: 12px;">Which claim to use for deriving Matrix usernames</small>
         </div>
         <div class="form-group">
           <label>Icon URL (optional)</label>
@@ -4187,6 +4214,7 @@ export const adminDashboardHtml = (serverName: string) => `
                 \${p.icon_url ? \`<img src="\${escapeHtml(p.icon_url)}" style="width: 20px; height: 20px; vertical-align: middle; margin-right: 8px;">\` : ''}
                 \${escapeHtml(p.name)}
                 <span style="font-size: 11px; color: var(--text-secondary); margin-left: 8px;">(\${escapeHtml(p.id)})</span>
+                <span class="badge" style="margin-left: 8px;">\${escapeHtml(p.provider_type === 'oauth2' ? 'OAuth2' : 'OIDC')}</span>
               </td>
               <td style="font-size: 12px; max-width: 200px; overflow: hidden; text-overflow: ellipsis;">\${escapeHtml(p.issuer_url)}</td>
               <td>\${p.linked_users_count || 0}</td>
@@ -4206,6 +4234,39 @@ export const adminDashboardHtml = (serverName: string) => `
       }
     }
 
+    function updateIdpTypeFields(applyDefaults) {
+      const isOAuth2 = document.getElementById('idpProviderType').value === 'oauth2';
+      document.getElementById('idpOAuth2Fields').style.display = isOAuth2 ? '' : 'none';
+      document.getElementById('idpIssuerUrlLabel').textContent = isOAuth2 ? 'Issuer URL' : 'Issuer URL *';
+      document.getElementById('idpIssuerUrlHelp').textContent = isOAuth2
+        ? 'Issuer identifier (e.g. https://github.com). No discovery document is fetched for OAuth 2.0.'
+        : 'The OIDC issuer URL. Must support /.well-known/openid-configuration';
+      document.getElementById('idpScopesHelp').textContent = isOAuth2
+        ? 'OAuth 2.0 scopes (GitHub default: read:user user:email)'
+        : 'OIDC scopes (default: openid profile email)';
+      document.getElementById('idpUsernameClaimHelp').textContent = isOAuth2
+        ? 'For GitHub, preferred_username is derived from the login field.'
+        : 'Which claim to use for deriving Matrix usernames';
+
+      if (applyDefaults && isOAuth2) {
+        const setIfEmpty = (id, value) => {
+          const el = document.getElementById(id);
+          if (!el.value.trim()) el.value = value;
+        };
+        setIfEmpty('idpIssuerUrl', 'https://github.com');
+        setIfEmpty('idpAuthorizationUrl', 'https://github.com/login/oauth/authorize');
+        setIfEmpty('idpTokenUrl', 'https://github.com/login/oauth/access_token');
+        setIfEmpty('idpUserinfoUrl', 'https://api.github.com/user');
+        setIfEmpty('idpEmailsUrl', 'https://api.github.com/user/emails');
+        const scopes = document.getElementById('idpScopes');
+        if (!scopes.value.trim() || scopes.value.trim() === 'openid profile email') {
+          scopes.value = 'read:user user:email';
+        }
+        const claim = document.getElementById('idpUsernameClaim');
+        if (!claim.value || claim.value === 'email') claim.value = 'preferred_username';
+      }
+    }
+
     function openCreateIdpModal() {
       // Reset form for new provider
       document.getElementById('idpModalTitle').textContent = 'Add Identity Provider';
@@ -4213,7 +4274,13 @@ export const adminDashboardHtml = (serverName: string) => `
       document.getElementById('idpId').value = '';
       document.getElementById('idpId').disabled = false;
       document.getElementById('idpName').value = '';
+      document.getElementById('idpProviderType').value = 'oidc';
       document.getElementById('idpIssuerUrl').value = '';
+      document.getElementById('idpAuthorizationUrl').value = '';
+      document.getElementById('idpTokenUrl').value = '';
+      document.getElementById('idpUserinfoUrl').value = '';
+      document.getElementById('idpEmailsUrl').value = '';
+      updateIdpTypeFields(false);
       document.getElementById('idpClientId').value = '';
       document.getElementById('idpClientSecret').value = '';
       document.getElementById('idpSecretHint').textContent = '';
@@ -4236,7 +4303,13 @@ export const adminDashboardHtml = (serverName: string) => `
         document.getElementById('idpId').value = data.id;
         document.getElementById('idpId').disabled = true;
         document.getElementById('idpName').value = data.name;
+        document.getElementById('idpProviderType').value = data.provider_type === 'oauth2' ? 'oauth2' : 'oidc';
         document.getElementById('idpIssuerUrl').value = data.issuer_url;
+        document.getElementById('idpAuthorizationUrl').value = data.authorization_endpoint || '';
+        document.getElementById('idpTokenUrl').value = data.token_endpoint || '';
+        document.getElementById('idpUserinfoUrl').value = data.userinfo_endpoint || '';
+        document.getElementById('idpEmailsUrl').value = data.emails_endpoint || '';
+        updateIdpTypeFields(false);
         document.getElementById('idpClientId').value = data.client_id;
         document.getElementById('idpClientSecret').value = '';
         document.getElementById('idpSecretHint').textContent = 'Leave blank to keep existing secret';
@@ -4257,10 +4330,16 @@ export const adminDashboardHtml = (serverName: string) => `
       const editId = document.getElementById('idpEditId').value;
       const isEdit = !!editId;
 
+      const isOAuth2 = document.getElementById('idpProviderType').value === 'oauth2';
       const payload = {
         id: document.getElementById('idpId').value.trim(),
         name: document.getElementById('idpName').value.trim(),
+        provider_type: isOAuth2 ? 'oauth2' : 'oidc',
         issuer_url: document.getElementById('idpIssuerUrl').value.trim(),
+        authorization_endpoint: document.getElementById('idpAuthorizationUrl').value.trim() || null,
+        token_endpoint: document.getElementById('idpTokenUrl').value.trim() || null,
+        userinfo_endpoint: document.getElementById('idpUserinfoUrl').value.trim() || null,
+        emails_endpoint: document.getElementById('idpEmailsUrl').value.trim() || null,
         client_id: document.getElementById('idpClientId').value.trim(),
         client_secret: document.getElementById('idpClientSecret').value,
         scopes: document.getElementById('idpScopes').value.trim(),
@@ -4272,8 +4351,19 @@ export const adminDashboardHtml = (serverName: string) => `
       };
 
       // Validation
-      if (!payload.id || !payload.name || !payload.issuer_url || !payload.client_id) {
+      if (!payload.id || !payload.name || !payload.client_id) {
         showToast('Please fill in all required fields', 'error');
+        return;
+      }
+      if (isOAuth2) {
+        if (!payload.authorization_endpoint || !payload.token_endpoint || !payload.userinfo_endpoint) {
+          showToast('Authorization, token, and userinfo URLs are required for OAuth 2.0 providers', 'error');
+          return;
+        }
+        // The schema still requires an issuer; GitHub is the common default.
+        if (!payload.issuer_url) payload.issuer_url = 'https://github.com';
+      } else if (!payload.issuer_url) {
+        showToast('Please enter an issuer URL', 'error');
         return;
       }
 
@@ -4311,6 +4401,24 @@ export const adminDashboardHtml = (serverName: string) => `
     async function viewIdp(providerId) {
       try {
         const data = await api(\`/admin/api/idp/providers/\${encodeURIComponent(providerId)}\`);
+        const oauth2Details = data.provider_type === 'oauth2' ? \`
+            <div class="detail-item">
+              <div class="label">Authorization URL</div>
+              <div class="value" style="font-size: 13px;">\${escapeHtml(data.authorization_endpoint || '-')}</div>
+            </div>
+            <div class="detail-item">
+              <div class="label">Token URL</div>
+              <div class="value" style="font-size: 13px;">\${escapeHtml(data.token_endpoint || '-')}</div>
+            </div>
+            <div class="detail-item">
+              <div class="label">Userinfo URL</div>
+              <div class="value" style="font-size: 13px;">\${escapeHtml(data.userinfo_endpoint || '-')}</div>
+            </div>
+            <div class="detail-item">
+              <div class="label">Emails URL</div>
+              <div class="value" style="font-size: 13px;">\${escapeHtml(data.emails_endpoint || '-')}</div>
+            </div>
+          \` : '';
 
         document.getElementById('idpDetailContent').innerHTML = \`
           <div class="detail-grid">
@@ -4323,9 +4431,14 @@ export const adminDashboardHtml = (serverName: string) => `
               <div class="value">\${escapeHtml(data.name)}</div>
             </div>
             <div class="detail-item">
+              <div class="label">Provider Type</div>
+              <div class="value">\${escapeHtml(data.provider_type === 'oauth2' ? 'OAuth 2.0' : 'OpenID Connect')}</div>
+            </div>
+            <div class="detail-item">
               <div class="label">Issuer URL</div>
               <div class="value" style="font-size: 13px;">\${escapeHtml(data.issuer_url)}</div>
             </div>
+            \${oauth2Details}
             <div class="detail-item">
               <div class="label">Client ID</div>
               <div class="value" style="font-size: 13px;">\${escapeHtml(data.client_id)}</div>
@@ -4426,10 +4539,29 @@ export const adminDashboardHtml = (serverName: string) => `
     }
 
     async function testIdpConnection() {
+      const isOAuth2 = document.getElementById('idpProviderType').value === 'oauth2';
       const issuerUrl = document.getElementById('idpIssuerUrl').value.trim();
-      if (!issuerUrl) {
+
+      if (!isOAuth2 && !issuerUrl) {
         showToast('Please enter an issuer URL first', 'error');
         return;
+      }
+      if (isOAuth2) {
+        // GitHub has no discovery document and CORS blocks a browser-side fetch.
+        const endpointIds = ['idpAuthorizationUrl', 'idpTokenUrl', 'idpUserinfoUrl'];
+        for (const id of endpointIds) {
+          const value = document.getElementById(id).value.trim();
+          if (!value) {
+            showToast('Authorization, token, and userinfo URLs are required', 'error');
+            return;
+          }
+          try {
+            new URL(value);
+          } catch {
+            showToast('One or more OAuth 2.0 endpoint URLs are invalid', 'error');
+            return;
+          }
+        }
       }
 
       const btn = document.getElementById('testIdpBtn');
@@ -4440,14 +4572,19 @@ export const adminDashboardHtml = (serverName: string) => `
       try {
         const providerId = document.getElementById('idpEditId').value || document.getElementById('idpId').value;
         if (providerId) {
+          // Both types are tested server-side; OAuth 2.0 uses configured endpoints, not discovery.
           const result = await api(\`/admin/api/idp/providers/\${encodeURIComponent(providerId)}/test\`, { method: 'POST' });
           if (result.success) {
-            showToast(\`Connection successful! Found endpoints: \${result.endpoints_found.join(', ')}\`, 'success');
+            const found = result.endpoints_found || [];
+            showToast(found.length ? \`Connection successful! Found endpoints: \${found.join(', ')}\` : 'Connection successful!', 'success');
           } else {
             showToast(\`Connection failed: \${result.error}\`, 'error');
           }
+        } else if (isOAuth2) {
+          // No saved provider yet — the endpoint URLs were validated above.
+          showToast('OAuth 2.0 endpoints look valid. Save the provider to run a server-side check.', 'success');
         } else {
-          // For new providers, just test the issuer URL directly
+          // For new OIDC providers, just test the issuer URL directly
           const discoveryUrl = issuerUrl.replace(/\\/$/, '') + '/.well-known/openid-configuration';
           const res = await fetch(discoveryUrl);
           if (res.ok) {
