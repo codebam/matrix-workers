@@ -63,6 +63,185 @@ async function getUserDevices(db: D1Database, userId: string): Promise<string[]>
 }
 
 // ============================================
+// MSC4075 MatrixRTC invite transport helpers
+// ============================================
+
+// MSC4075 specifies sticky room events, not to-device messages. Until sticky
+// events are available here, RTC invites use the existing to-device store so
+// they reach clients through /sync. The unstable event type and the invite /
+// decline shapes follow the MSC; the invite state field is local bookkeeping.
+export const RTC_INVITE_STATE_FIELD = 'msc4075_state';
+
+export interface RtcToDeviceMessage {
+  id: number;
+  recipientUserId: string;
+  senderUserId: string;
+  content: Record<string, any>;
+  createdAt: number;
+  streamPosition: number;
+}
+
+// Store one to-device message per recipient device, reusing the ordinary
+// to-device stream ordering and SyncDO wake-up.
+export async function deliverRtcToDeviceMessage(
+  env: Env,
+  senderUserId: string,
+  eventType: string,
+  recipientUserIds: string[],
+  content: Record<string, any>,
+  messageIdPrefix: string
+): Promise<number> {
+  const db = env.DB;
+  const notified = new Set<string>();
+  let stored = 0;
+
+  for (const recipientUserId of recipientUserIds) {
+    const targetDevices = await getUserDevices(db, recipientUserId);
+    for (const targetDeviceId of targetDevices) {
+      const streamPosition = await getNextStreamPosition(db, 'to_device');
+      const messageId = `${messageIdPrefix}_${recipientUserId}_${targetDeviceId}`;
+      await db.prepare(`
+        INSERT INTO to_device_messages (
+          recipient_user_id, recipient_device_id, sender_user_id,
+          event_type, content, message_id, stream_position
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (recipient_user_id, recipient_device_id, message_id) DO NOTHING
+      `).bind(
+        recipientUserId,
+        targetDeviceId,
+        senderUserId,
+        eventType,
+        JSON.stringify(content),
+        messageId,
+        streamPosition
+      ).run();
+      stored++;
+    }
+    notified.add(recipientUserId);
+  }
+
+  if (env.SYNC) {
+    for (const userId of notified) {
+      await notifyUserSync(env, userId, 'to_device');
+    }
+  }
+  return stored;
+}
+
+async function readRtcToDeviceMessages(
+  db: D1Database,
+  whereClause: string,
+  binds: string[],
+  limit: number
+): Promise<RtcToDeviceMessage[]> {
+  const rows = await db.prepare(`
+    SELECT id, recipient_user_id, sender_user_id, content, created_at, stream_position
+    FROM to_device_messages
+    WHERE ${whereClause}
+    ORDER BY stream_position DESC
+    LIMIT ?
+  `).bind(...binds, limit).all<{
+    id: number;
+    recipient_user_id: string;
+    sender_user_id: string;
+    content: string;
+    created_at: number;
+    stream_position: number;
+  }>();
+
+  const messages: RtcToDeviceMessage[] = [];
+  for (const row of rows.results) {
+    try {
+      messages.push({
+        id: row.id,
+        recipientUserId: row.recipient_user_id,
+        senderUserId: row.sender_user_id,
+        content: JSON.parse(row.content),
+        createdAt: row.created_at,
+        streamPosition: row.stream_position,
+      });
+    } catch {
+      // Ignore corrupt stored notifications.
+    }
+  }
+  return messages;
+}
+
+// Read stored RTC notifications (invites) for a recipient, newest first.
+export async function getRtcToDeviceMessages(
+  db: D1Database,
+  recipientUserId: string,
+  eventType: string,
+  limit: number = 100
+): Promise<RtcToDeviceMessage[]> {
+  return readRtcToDeviceMessages(
+    db,
+    'recipient_user_id = ? AND event_type = ?',
+    [recipientUserId, eventType],
+    limit
+  );
+}
+
+// Read invites issued by a sender, used for sender-side withdrawal.
+export async function getRtcToDeviceMessagesBySender(
+  db: D1Database,
+  senderUserId: string,
+  eventType: string,
+  limit: number = 100
+): Promise<RtcToDeviceMessage[]> {
+  return readRtcToDeviceMessages(
+    db,
+    'sender_user_id = ? AND event_type = ?',
+    [senderUserId, eventType],
+    limit
+  );
+}
+
+// Mark stored RTC notifications as acted upon. The state lives inside the
+// message content so no schema migration is needed.
+export async function updateRtcToDeviceMessageState(
+  db: D1Database,
+  eventType: string,
+  state: string,
+  filter: { recipientUserId?: string; senderUserId?: string; inviteId?: string }
+): Promise<number> {
+  const clauses = ['event_type = ?'];
+  const binds: any[] = [eventType];
+  if (filter.recipientUserId) {
+    clauses.push('recipient_user_id = ?');
+    binds.push(filter.recipientUserId);
+  }
+  if (filter.senderUserId) {
+    clauses.push('sender_user_id = ?');
+    binds.push(filter.senderUserId);
+  }
+
+  const rows = await db.prepare(`
+    SELECT id, content FROM to_device_messages
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY stream_position DESC LIMIT 200
+  `).bind(...binds).all<{ id: number; content: string }>();
+
+  let updated = 0;
+  for (const row of rows.results) {
+    let content: Record<string, any>;
+    try {
+      content = JSON.parse(row.content);
+    } catch {
+      continue;
+    }
+    if (filter.inviteId && content.invite_id !== filter.inviteId) continue;
+    content[RTC_INVITE_STATE_FIELD] = state;
+    content.acted_at = Date.now();
+    await db.prepare(`
+      UPDATE to_device_messages SET content = ? WHERE id = ?
+    `).bind(JSON.stringify(content), row.id).run();
+    updated++;
+  }
+  return updated;
+}
+
+// ============================================
 // Inbound federation delivery (m.direct_to_device EDUs)
 // ============================================
 
