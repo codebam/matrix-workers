@@ -225,6 +225,8 @@ app.get('/_matrix/client/versions', (c) => {
       'org.matrix.msc4155': true,
       // MSC4140: delayed events
       'org.matrix.msc4140': true,
+      // MSC4437 (FCP): PUT variant replacing the entire profile.
+      'org.matrix.msc4437': true,
       // MSC3906: sign in with QR (rendezvous flows)
       'org.matrix.msc3906': true,
       // MSC3886: simple rendezvous transport

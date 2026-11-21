@@ -1554,6 +1554,19 @@ describe('database getRoomEvents / getRoomState / getStateEvent', () => {
     expect(next.end).toBe(4);
   });
 
+  it('pagination tokens are directionless (MSC4492): a backward end token paginates forward', async () => {
+    const db = createCrudDb({ events: seededEvents() });
+    const back = await getRoomEvents(db, ROOM, undefined, 2, 'b');
+    expect(back.events.map((e) => e.event_id)).toEqual(['$5', '$4']);
+
+    // The token produced by a BACKWARD page is a plain stream position:
+    // reusing it in the forward direction is valid, which is exactly the
+    // property MSC4492 (accepted) standardizes. Backward end = position
+    // of $4; forward from there yields everything after it.
+    const fwd = await getRoomEvents(db, ROOM, back.end, 2, 'f');
+    expect(fwd.events.map((e) => e.event_id)).toEqual(['$5']);
+  });
+
   it('getRoomEvents end falls back to fromToken then 0 when empty', async () => {
     const db = createCrudDb({ events: [] });
     await expect(getRoomEvents(db, ROOM, 9, 10, 'b')).resolves.toEqual({

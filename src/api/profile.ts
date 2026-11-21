@@ -136,6 +136,59 @@ app.put('/_matrix/client/v3/profile/:userId/avatar_url', requireAuth(), async (c
   return c.json({});
 });
 
+// PUT /_matrix/client/unstable/org.matrix.msc4437/profile/:userId -
+// MSC4437 (in final comment period): replace the user's ENTIRE profile.
+// Every field absent from the request content is deleted; custom fields
+// (the m.profile_fields surface) are replaced wholesale.
+app.put('/_matrix/client/unstable/org.matrix.msc4437/profile/:userId', requireAuth(), async (c) => {
+  const authUserId = c.get('userId');
+  const targetUserId = decodeURIComponent(c.req.param('userId'));
+
+  if (authUserId !== targetUserId) {
+    return Errors.forbidden('Cannot modify another user\'s profile').toResponse();
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return Errors.badJson().toResponse();
+  }
+
+  const { displayname, avatar_url: avatarUrl, ...customFields } = body;
+
+  // Validation: standard fields must be strings (or explicit null to
+  // clear). Our m.profile_fields capability allows every custom field.
+  if (
+    (displayname !== undefined && displayname !== null && typeof displayname !== 'string') ||
+    (avatarUrl !== undefined && avatarUrl !== null && typeof avatarUrl !== 'string')
+  ) {
+    return Errors.invalidParam(
+      'displayname/avatar_url',
+      'Standard profile fields must be strings or null'
+    ).toResponse();
+  }
+
+  // Absent standard fields are DELETED (null), per the replace semantics.
+  await updateUserProfile(
+    c.env.DB,
+    targetUserId,
+    displayname === undefined ? null : displayname,
+    avatarUrl === undefined ? null : avatarUrl
+  );
+
+  // Custom fields replace the stored set wholesale.
+  await c.env.CACHE.put(
+    `profile:${targetUserId}:custom`,
+    JSON.stringify(customFields)
+  );
+
+  return c.json({});
+});
+
 // ============================================
 // Custom Profile Keys (Matrix v1.17 Extension)
 // ============================================

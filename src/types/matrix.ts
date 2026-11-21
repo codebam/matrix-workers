@@ -431,6 +431,10 @@ export const ErrorCodes = {
   // arrived in v1.18). M_USER_LOCKED carries soft_logout: true on 401s.
   M_USER_LOCKED: 'M_USER_LOCKED',
   M_USER_SUSPENDED: 'M_USER_SUSPENDED',
+  // MSC4335 (stable since spec v1.18): account-scoped resource limits
+  // (storage quota, room/device counts, feature usage). Emitted when the
+  // admin API grows quotas; MUST carry info_uri, MAY carry can_upgrade.
+  M_USER_LIMIT_EXCEEDED: 'M_USER_LIMIT_EXCEEDED',
   // MSC4155 (unstable): the recipient's invite permission config blocks the
   // inviter.
   ORG_MATRIX_MSC4155_M_INVITE_BLOCKED: 'ORG.MATRIX.MSC4155.M_INVITE_BLOCKED',

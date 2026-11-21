@@ -183,8 +183,8 @@ export async function getInvitePermission(
 export async function updateUserProfile(
   db: D1Database,
   userId: string,
-  displayName?: string,
-  avatarUrl?: string
+  displayName?: string | null,
+  avatarUrl?: string | null
 ): Promise<void> {
   if (displayName !== undefined) {
     await db.prepare(

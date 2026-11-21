@@ -424,6 +424,7 @@ describe('versions TOKENMAXX HEAVY after #83 — discovery leftovers', () => {
         'org.matrix.msc4143',
         'org.matrix.msc4155',
         'org.matrix.msc4222',
+        'org.matrix.msc4437',
         'org.matrix.simplified_msc3575',
         'uk.half-shot.msc2666.query_mutual_rooms',
       ].sort()
