@@ -8,6 +8,7 @@
 //   SignalRequest.offer / add_track              -> POST /sessions/{id}/tracks/new (local)
 //   SignalResponse.track_published               -> synthesized TrackInfo for the client
 //   SignalRequest.subscription                   -> POST /sessions/{id}/tracks/new (remote)
+//   join (subscriber PC)                         -> POST /sessions/{id}/tracks/new (empty) -> offer
 //   SignalResponse.offer / SignalRequest.answer  -> subscriber negotiation + /renegotiate
 //
 // Wire details verified against livekit/protocol livekit_rtc.proto and
@@ -687,6 +688,8 @@ export async function verifyLiveKitJwt(
 // ---------------------------------------------------------------------------
 
 export interface JoinRequestJson {
+  /** False only for a bare upgrade with no JoinRequest (legacy/no SDP client). */
+  hasJoinRequest?: boolean;
   clientInfo?: { sdk?: number; version?: string; protocol?: number; clientProtocol?: number };
   connectionSettings?: { autoSubscribe?: boolean };
   reconnect?: boolean;
@@ -696,7 +699,7 @@ export interface JoinRequestJson {
 }
 
 export async function decodeJoinRequestParam(raw: string | null): Promise<JoinRequestJson> {
-  const empty: JoinRequestJson = { addTrackRequests: [] };
+  const empty: JoinRequestJson = { addTrackRequests: [], hasJoinRequest: false };
   if (!raw) return empty;
   try {
     const wrapped = decodePb(base64UrlBytes(raw));
@@ -713,6 +716,7 @@ export async function decodeJoinRequestParam(raw: string | null): Promise<JoinRe
     const connectionSettings = fieldMsg(join, 2);
     const publisherOffer = fieldMsg(join, 6);
     return {
+      hasJoinRequest: true,
       clientInfo: clientInfo ? {
         sdk: fieldNum(clientInfo, 1),
         version: fieldStr(clientInfo, 2),
@@ -761,6 +765,11 @@ interface ShimParticipant {
   nextOfferId: number;
   pendingOffers: Map<number, { trackSid: string; needsRenegotiation: boolean }>;
   subscribedMids: Map<string, string>;
+  /** Initial subscriber offer that must be answered before subscriptions are mutated. */
+  pendingInitialOfferId?: number;
+  /** Resolves once the initial subscriber answer has been accepted by Calls (or on close). */
+  subscriberReady: Promise<void>;
+  resolveSubscriberReady: () => void;
   queues: Map<string, Promise<void>>;
   /** JSON-encoded LiveKit trickles, keyed by SignalTarget (PUBLISHER=0, SUBSCRIBER=1). */
   trickleCandidates: Map<number, TrickleCandidate[]>;
@@ -931,6 +940,10 @@ export class LiveKitCallsShimSession {
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.serverProtocol = options.serverProtocol ?? 17;
     this.stunUrls = parseStunUrls(env.LIVEKIT_STUN_URLS);
+    let resolveSubscriberReady!: () => void;
+    const subscriberReady = new Promise<void>((resolve) => {
+      resolveSubscriberReady = resolve;
+    });
     this.participant = {
       sid: randomId('PA'),
       room: identity.room,
@@ -944,6 +957,8 @@ export class LiveKitCallsShimSession {
       nextOfferId: 1,
       pendingOffers: new Map(),
       subscribedMids: new Map(),
+      subscriberReady,
+      resolveSubscriberReady,
       queues: new Map(),
       trickleCandidates: new Map(),
       jsonMode: false,
@@ -978,6 +993,16 @@ export class LiveKitCallsShimSession {
       // this they only learn of each other when a track is published or the
       // session closes, so a call with muted participants appears 1:1.
       this.broadcastUpdate();
+      // With subscriberPrimary=false the SDK creates a subscriber PC but waits
+      // for the server to drive negotiation. Calls only sends an SFU offer via
+      // tracks/new, so start that exchange before any subscription arrives.
+      // A bare upgrade without JoinRequest is a legacy socket with no PC to
+      // drive, so it keeps the original publisher-only session count.
+      if (joinRequest.hasJoinRequest !== false) {
+        await this.startSubscriberOffer();
+      } else {
+        this.participant.resolveSubscriberReady();
+      }
       for (const request of joinRequest.addTrackRequests) this.handleAddTrack(request);
       if (joinRequest.publisherOffer?.sdp) await this.handleOffer(joinRequest.publisherOffer);
     } catch (error) {
@@ -1034,6 +1059,31 @@ export class LiveKitCallsShimSession {
     // Ignore join-time metadata/attributes from the client: room and identity
     // come from the verified JWT only.
     void joinRequest;
+  }
+
+  /**
+   * Open the subscriber PC with a Calls-generated offer. `tracks: []` asks the
+   * SFU to produce an offer without any published publications; whatever
+   * transport m-lines Calls returns are forwarded to the SDK verbatim.
+   */
+  private async startSubscriberOffer(): Promise<void> {
+    const p = this.participant;
+    const session = await createSession(this.env);
+    p.subscriberSessionId = session.sessionId;
+    if (!p.identity.canSubscribe) {
+      p.resolveSubscriberReady();
+      return;
+    }
+    await this.enqueue('subscriber', async () => {
+      const response = await addTracks(this.env, p.subscriberSessionId!, { tracks: [] });
+      const offer = response.sessionDescription;
+      if (!offer || offer.type !== 'offer' || !offer.sdp) {
+        throw new Error('Calls did not return an initial subscriber offer');
+      }
+      // There is no LiveKit track SID for this transport-only offer, so no
+      // midToTrackId entries are sent; subscription offers carry their own.
+      p.pendingInitialOfferId = this.sendCallsOffer(offer, undefined, true);
+    });
   }
 
   private enqueue(key: string, task: () => Promise<void>): Promise<void> {
@@ -1178,6 +1228,12 @@ export class LiveKitCallsShimSession {
   private async handleSubscription(value: Extract<SignalRequestJson, { message: 'subscription' }>['value']): Promise<void> {
     const p = this.participant;
     if (!p.identity.canSubscribe || value.subscribe === false) return;
+    // Calls rejects a second mutation on this session before the first
+    // SFU offer has been answered (HTTP 406). Wait for the initial answer.
+    if (p.pendingInitialOfferId !== undefined) {
+      await p.subscriberReady;
+      if (this.closed) return;
+    }
     for (const trackSid of value.trackSids ?? []) {
       const found = this.registry.findTrack(trackSid);
       if (!found || found.owner.sid === p.sid) continue;
@@ -1207,13 +1263,14 @@ export class LiveKitCallsShimSession {
     midToTrackId?: Record<string, string>,
     needsRenegotiation = false,
     trackSid?: string
-  ): void {
+  ): number {
     const p = this.participant;
     const id = ++p.nextOfferId;
     if (trackSid || needsRenegotiation) {
       p.pendingOffers.set(id, { trackSid: trackSid ?? '', needsRenegotiation });
     }
     this.send({ message: 'offer', value: { type: 'offer', sdp: offer.sdp, id, midToTrackId } });
+    return id;
   }
 
   private async handleAnswer(sd: SdJson): Promise<void> {
@@ -1227,8 +1284,15 @@ export class LiveKitCallsShimSession {
       const response = await renegotiate(this.env, p.subscriberSessionId!, {
         sessionDescription: { type: 'answer', sdp: gatheredSdp } as SessionDescription,
       });
+      const isInitialExchange = p.pendingInitialOfferId === sd.id;
       if (response.sessionDescription?.type === 'offer') {
-        this.sendCallsOffer(response.sessionDescription, undefined, true, pending.trackSid || undefined);
+        // A follow-up offer keeps the subscription gate closed until it too is
+        // answered; the initial exchange may produce one in Calls.
+        const nextId = this.sendCallsOffer(response.sessionDescription, undefined, true, pending.trackSid || undefined);
+        if (isInitialExchange) p.pendingInitialOfferId = nextId;
+      } else if (isInitialExchange) {
+        p.pendingInitialOfferId = undefined;
+        p.resolveSubscriberReady();
       }
     });
   }
@@ -1247,6 +1311,7 @@ export class LiveKitCallsShimSession {
     this.closed = true;
     const p = this.participant;
     p.closed = true;
+    p.resolveSubscriberReady();
     p.trickleCandidates.clear();
     this.registry.remove(p.sid);
     for (const other of this.registry.inRoom(p.room)) {
