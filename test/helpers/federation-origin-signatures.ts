@@ -88,12 +88,12 @@ export async function seedPduVerifyKey(
 /** Sign a PDU with its sender server's key, keeping any existing hashes. */
 export async function signPduForOrigin<T extends Record<string, unknown>>(
   pdu: T,
-  origin: string
+  origin: string,
+  version = '10'
 ): Promise<T> {
   const pair = await fixtureKeyPair();
-  // Legacy wire events carry event_id; verify with the matching redaction
-  // rules (modern v3+ wire events omit it).
-  const version = typeof pdu.event_id === 'string' && pdu.event_id ? '2' : '10';
+  // Sign over the room version's redaction rules, matching the /send handler
+  // (which no longer keys the version off the presence of an event_id).
   // The /send handler verifies the content hash separately and passes the
   // event without `hashes` to verifyPdu, so sign that same view here.
   const { hashes: _hashes, ...forSignature } = pdu;
@@ -115,10 +115,10 @@ export async function signPduForOrigin<T extends Record<string, unknown>>(
  */
 export async function signEventForOrigin<T extends Record<string, unknown>>(
   event: T,
-  origin: string
+  origin: string,
+  version = '10'
 ): Promise<T> {
   const pair = await fixtureKeyPair();
-  const version = typeof event.event_id === 'string' && event.event_id ? '2' : '10';
   const redacted = redactEventForSigning(event, version);
   const signed = await signJson(redacted, origin, pair.keyId, pair.privateKeyJwk);
   const originSigs = (signed.signatures as Record<string, Record<string, string>>)[origin];
@@ -141,12 +141,27 @@ const EXPLICIT_INVALID_SIGNATURES = new Set(['bad', 'invalid', '__invalid__']);
  *   - signatures by another server only (the foreign-signatory attack).
  */
 export async function signSendBodyPdus(
-  env: { CACHE: { put: (key: string, value: string, options?: unknown) => Promise<unknown> } },
-  body: unknown
+  env: {
+    CACHE: { put: (key: string, value: string, options?: unknown) => Promise<unknown> };
+    DB?: { prepare: (sql: string) => { bind: (...args: unknown[]) => { first: () => Promise<unknown> } } };
+  },
+  body: unknown,
+  versionOverride?: string
 ): Promise<unknown> {
   if (!body || typeof body !== 'object' || !Array.isArray((body as { pdus?: unknown }).pdus)) {
     return body;
   }
+  const roomVersion = async (roomId: unknown): Promise<string> => {
+    if (versionOverride) return versionOverride;
+    if (typeof roomId !== 'string' || !env.DB) return '10';
+    try {
+      const row = await env.DB.prepare('SELECT room_version FROM rooms WHERE room_id = ?')
+        .bind(roomId).first() as { room_version?: string } | null;
+      return row?.room_version ?? '10';
+    } catch {
+      return '10';
+    }
+  };
   const pdus: unknown[] = [];
   for (const raw of (body as { pdus: unknown[] }).pdus) {
     if (!raw || typeof raw !== 'object') {
@@ -169,7 +184,7 @@ export async function signSendBodyPdus(
       continue;
     }
     await seedPduVerifyKey(env.CACHE, origin);
-    pdus.push(await signPduForOrigin(pdu, origin));
+    pdus.push(await signPduForOrigin(pdu, origin, await roomVersion(pdu.room_id)));
   }
   return { ...(body as Record<string, unknown>), pdus };
 }

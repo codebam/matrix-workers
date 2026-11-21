@@ -885,15 +885,13 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       // forge events for users it does not host; accepting none lets anyone
       // inject arbitrary events.
       //
-      // PDUs that carry an explicit event_id use the legacy wire shape (v1-2);
-      // verify them with the legacy redaction rules even when the room itself
-      // is modern. v3+ PDUs omit event_id and are verified with the room's
-      // actual version rules. Content hashing is enforced above, so we drop
+      // Redaction rules come from the ROOM VERSION, not from the presence of
+      // an explicit event_id: real Synapse PDUs in modern rooms carry
+      // event_id and are signed over the room version's redacted shape, so
+      // forcing v1-2 rules rejects legitimate peers. Unknown rooms default
+      // to a modern version. Content hashing is enforced above, so we drop
       // `hashes` from the verification view to avoid verifying it twice.
-      const verificationVersion =
-        typeof pdu.event_id === 'string' && pdu.event_id
-          ? '2'
-          : (room?.room_version ?? '10');
+      const verificationVersion = room?.room_version ?? '10';
       const { hashes: _verifiedHashes, ...verificationView } = pdu as Record<string, unknown>;
       const verifyKeys = await resolvePduVerifyKeys(c.env, pduOrigin);
       const verification = await verifyPdu(
@@ -2896,10 +2894,8 @@ async function verifyInboundLeaveSignature(
   origin: string,
   roomVersion: string
 ): Promise<string | null> {
-  const verificationVersion =
-    typeof leaveEvent.event_id === 'string' && leaveEvent.event_id ? '2' : roomVersion;
   const verifyKeys = await resolvePduVerifyKeys(env, origin);
-  const result = await verifyPdu(leaveEvent as unknown as PDU, origin, verificationVersion, verifyKeys);
+  const result = await verifyPdu(leaveEvent as unknown as PDU, origin, roomVersion, verifyKeys);
   return 'error' in result ? result.error : null;
 }
 

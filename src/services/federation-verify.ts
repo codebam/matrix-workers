@@ -50,9 +50,11 @@ export async function verifyPdu(
   const num = parseInt(roomVersion, 10);
   const modern = !Number.isFinite(num) || num >= 3;
   const wire = pdu as unknown as Record<string, unknown>;
-  if (modern && wire['event_id'] !== undefined) {
-    return { error: 'explicit event_id on wire PDU' };
-  }
+  // Modern room versions derive the event ID from the reference hash, and
+  // redaction already excludes event_id from that hash and from the signed
+  // canonical JSON. Real peers (Synapse) sometimes still include the field,
+  // so ignore it rather than rejecting an otherwise-valid PDU — the ID below
+  // is computed from the wire, never taken from the field.
   if (!modern && wire['event_id'] === undefined) {
     return { error: 'missing event_id for legacy room version' };
   }
