@@ -27,6 +27,8 @@ import { getToDeviceMessages } from './to-device';
 import {
   getGlobalAccountData,
   getRoomAccountData,
+  getStickyEventsForRooms,
+  type StickyClientEvent,
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { getTypingUsers } from './typing';
@@ -768,6 +770,23 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
   // Get user's joined rooms
   const joinedRoomIds = await getUserRooms(c.env.DB, userId, 'join');
+
+  // MSC4354: sticky events are stored outside the timeline tables, so they
+  // never enter `getEventsSince`; they ride in their own `sticky` room section.
+  // A failure here must never break the rest of sync.
+  type StickyJoinedRoom = JoinedRoom & {
+    sticky?: { events: StickyClientEvent[] };
+    msc4354_sticky?: { events: StickyClientEvent[] };
+  };
+  let stickyByRoom: Record<string, StickyClientEvent[]> = {};
+  try {
+    stickyByRoom = await getStickyEventsForRooms(c.env.DB, joinedRoomIds, {
+      since: hasSinceToken ? sinceAccountDataPos : undefined,
+    });
+  } catch (error) {
+    console.error('[sync] Failed to load sticky events:', error);
+  }
+
   for (const roomId of joinedRoomIds) {
     // Check if room should be included based on filter
     if (!shouldIncludeRoom(roomId, filter?.room)) {
@@ -885,8 +904,17 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     // of every member of every room — a 4,000-member room would otherwise
     // ship a multi-hundred-KB initial sync and choke fresh logins. The rest
     // of the members are fetched on demand via the members API.
+    // MSC4354: a sticky event appearing in neither timeline nor sticky section
+    // is dropped here; the rest are deduplicated against the timeline so a
+    // given event is never rendered twice in one response.
+    const stickyEvents = (stickyByRoom[roomId] ?? []).filter(
+      sticky => !timelineEvents.some(event => event.event_id === sticky.event_id)
+    );
+
     if (filter?.room?.state?.lazy_load_members) {
       const timelineSenders = new Set(timelineEvents.map(e => e.sender));
+      // MSC4354: sticky senders count as timeline senders for lazy loading.
+      for (const sticky of stickyEvents) timelineSenders.add(sticky.sender);
       timelineSenders.add(userId);
       stateEvents = stateEvents.filter(e => {
         if (e.type !== 'm.room.member') return true;
@@ -904,6 +932,13 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
 
     joinedRoom.timeline!.events = timelineEvents;
+    if (stickyEvents.length > 0) {
+      const withSticky = joinedRoom as StickyJoinedRoom;
+      // Stable and unstable section names are both emitted while MSC4354 is
+      // not part of the spec proper; clients may read either.
+      withSticky.sticky = { events: stickyEvents };
+      withSticky.msc4354_sticky = { events: stickyEvents };
+    }
     // prev_batch must point at the START of the returned timeline window so
     // clients paginate backwards into older history. Using sincePosition
     // here (0 on initial sync) made /messages?from=0 return the NEWEST events
@@ -1150,9 +1185,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   const hasToDevice = response.to_device!.events.length > 0;
   const hasAccountData = response.account_data!.events.length > 0;
   const hasPresence = response.presence!.events.length > 0;
+  const hasSticky = Object.values(stickyByRoom).some(events => events.length > 0);
   const hasChanges =
     hasRoomChanges || hasInvites || hasKnocks || hasLeaves || hasToDevice || hasAccountData ||
-    hasPresence;
+    hasPresence || hasSticky;
 
   // Parse timeout from query params (default 0 for no wait, max 30s)
   const timeout = Math.min(parseInt(c.req.query('timeout') || '0'), 30000);

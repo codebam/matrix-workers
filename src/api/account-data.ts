@@ -91,6 +91,224 @@ async function recordAccountDataChange(
 }
 
 // ============================================
+// MSC4354 / MSC4480 sticky events
+// ============================================
+
+// Sticky events are normal room PDUs with a top-level `sticky.duration_ms`
+// (MSC4354). MSC4480 is the sliding-sync extension that delivers them. We
+// reuse the existing account_data table under a reserved event-type prefix so
+// no new table or migration is needed. Sticky rows are keyed by the sender's
+// user_id and the room_id, which makes them room-scoped and visible to every
+// joined user, as MSC4354 requires.
+export const STICKY_EVENT_TYPE_PREFIX = 'org.matrix.msc4354.sticky.';
+const STICKY_EVENT_TYPE_LIKE = `${STICKY_EVENT_TYPE_PREFIX}%`;
+const MAX_STICKY_DURATION_MS = 3_600_000;
+const DEFAULT_STICKY_LIMIT = 100;
+
+export interface StickyEventRecord {
+  event_id: string;
+  type: string;
+  sender: string;
+  room_id: string;
+  origin_server_ts: number;
+  received_ts: number;
+  duration_ms: number;
+  content: Record<string, unknown>;
+}
+
+export interface StickyClientEvent {
+  type: string;
+  event_id: string;
+  sender: string;
+  room_id: string;
+  origin_server_ts: number;
+  content: Record<string, unknown>;
+  sticky: { duration_ms: number };
+  msc4354_sticky: { duration_ms: number };
+  unsigned: {
+    sticky_duration_remaining_ms: number;
+    msc4354_sticky_duration_ttl_ms: number;
+  };
+}
+
+/** True for reserved sticky event_types; callers must hide these from account_data. */
+export function isStickyEventType(eventType: string): boolean {
+  return eventType.startsWith(STICKY_EVENT_TYPE_PREFIX);
+}
+
+/** MSC4354 requires a strictly positive integer sticky_duration_ms. */
+export function parseStickyDuration(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value;
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    const parsed = Number(value);
+    if (parsed > 0) return parsed;
+  }
+  return null;
+}
+
+function stickyExpiresAt(record: StickyEventRecord): number {
+  // MSC4354: start = min(received_ts, origin_server_ts); end is capped at 1h.
+  const start = Math.min(record.received_ts, record.origin_server_ts);
+  return start + Math.min(record.duration_ms, MAX_STICKY_DURATION_MS);
+}
+
+/** Exported for tests. Returns null once the event is no longer sticky. */
+export function toStickyClientEvent(
+  record: StickyEventRecord,
+  now: number = Date.now()
+): StickyClientEvent | null {
+  const remaining = stickyExpiresAt(record) - now;
+  if (!Number.isFinite(remaining) || remaining <= 0) return null;
+  return {
+    type: record.type,
+    event_id: record.event_id,
+    sender: record.sender,
+    room_id: record.room_id,
+    origin_server_ts: record.origin_server_ts,
+    content: record.content,
+    sticky: { duration_ms: record.duration_ms },
+    msc4354_sticky: { duration_ms: record.duration_ms },
+    unsigned: {
+      sticky_duration_remaining_ms: remaining,
+      msc4354_sticky_duration_ttl_ms: remaining,
+    },
+  };
+}
+
+/** Write a sticky event and record it on the account_data stream for /sync. */
+export async function putStickyEvent(
+  db: D1Database,
+  args: {
+    userId: string;
+    roomId: string;
+    eventType: string;
+    txnId: string;
+    durationMs: number;
+    content: Record<string, unknown>;
+    eventId?: string;
+    originServerTs?: number;
+    receivedTs?: number;
+  }
+): Promise<StickyEventRecord> {
+  const now = Date.now();
+  const rawId = args.eventId ?? `msc4354_${args.userId}_${args.roomId}_${args.txnId}`;
+  const eventId = rawId.startsWith('$') ? rawId : `$${rawId}`;
+  const record: StickyEventRecord = {
+    event_id: eventId,
+    type: args.eventType,
+    sender: args.userId,
+    room_id: args.roomId,
+    origin_server_ts: args.originServerTs ?? now,
+    received_ts: args.receivedTs ?? now,
+    duration_ms: args.durationMs,
+    content: args.content,
+  };
+  const accountDataType = `${STICKY_EVENT_TYPE_PREFIX}${eventId}`;
+
+  await db.prepare(`
+    INSERT INTO account_data (user_id, room_id, event_type, content)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (user_id, room_id, event_type) DO UPDATE SET
+      content = excluded.content
+  `).bind(args.userId, args.roomId, accountDataType, JSON.stringify(record)).run();
+
+  // Reuses the account_data stream: no extra sequence column or migration.
+  await recordAccountDataChange(db, args.userId, args.roomId, accountDataType);
+  return record;
+}
+
+interface StickyRow {
+  user_id: string;
+  room_id: string;
+  event_type: string;
+  content: string;
+  stream_position?: number;
+}
+
+function decodeStickyRow(row: StickyRow): StickyEventRecord | null {
+  try {
+    const parsed = JSON.parse(row.content) as StickyEventRecord;
+    if (!parsed || typeof parsed !== 'object' || typeof parsed.duration_ms !== 'number') {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Unexpired sticky events for the given rooms, oldest first, capped per room.
+ * `since` is an account_data stream position; changes recorded by
+ * putStickyEvent are delivered exactly once as the token advances.
+ */
+export async function getStickyEventsForRooms(
+  db: D1Database,
+  roomIds: string[],
+  opts: { since?: number; limit?: number; now?: number } = {}
+): Promise<Record<string, StickyClientEvent[]>> {
+  const byRoom: Record<string, StickyClientEvent[]> = {};
+  if (roomIds.length === 0) return byRoom;
+
+  const now = opts.now ?? Date.now();
+  const limit = Math.max(1, Math.min(opts.limit ?? DEFAULT_STICKY_LIMIT, DEFAULT_STICKY_LIMIT));
+  const rows: StickyRow[] = [];
+
+  // Stay below D1's bind-variable limit (see the presence query in sync.ts).
+  for (let i = 0; i < roomIds.length; i += 90) {
+    const chunk = roomIds.slice(i, i + 90);
+    const placeholders = chunk.map(() => '?').join(',');
+    if (opts.since !== undefined) {
+      const result = await db.prepare(`
+        SELECT ad.user_id, ad.room_id, ad.event_type, ad.content,
+               MAX(adc.stream_position) AS stream_position
+        FROM account_data ad
+        INNER JOIN account_data_changes adc ON
+          ad.user_id = adc.user_id AND ad.room_id = adc.room_id AND ad.event_type = adc.event_type
+        WHERE ad.room_id IN (${placeholders}) AND ad.event_type LIKE ?
+        GROUP BY ad.user_id, ad.room_id, ad.event_type, ad.content
+        HAVING MAX(adc.stream_position) > ?
+      `).bind(...chunk, STICKY_EVENT_TYPE_LIKE, opts.since).all<StickyRow>();
+      rows.push(...result.results);
+    } else {
+      const result = await db.prepare(`
+        SELECT user_id, room_id, event_type, content FROM account_data
+        WHERE room_id IN (${placeholders}) AND event_type LIKE ?
+      `).bind(...chunk, STICKY_EVENT_TYPE_LIKE).all<StickyRow>();
+      rows.push(...result.results);
+    }
+  }
+
+  rows.sort((a, b) => {
+    const ra = decodeStickyRow(a);
+    const rb = decodeStickyRow(b);
+    return (ra?.received_ts ?? 0) - (rb?.received_ts ?? 0) || a.event_type.localeCompare(b.event_type);
+  });
+
+  for (const row of rows) {
+    const record = decodeStickyRow(row);
+    if (!record) continue;
+    const event = toStickyClientEvent(record, now);
+    if (!event) continue;
+    const roomId = row.room_id;
+    if (!byRoom[roomId]) byRoom[roomId] = [];
+    if (byRoom[roomId].length >= limit) continue;
+    if (byRoom[roomId].some(existing => existing.event_id === event.event_id)) continue;
+    byRoom[roomId].push(event);
+  }
+  return byRoom;
+}
+
+export async function getStickyEventsForRoom(
+  db: D1Database,
+  roomId: string,
+  opts: { now?: number } = {}
+): Promise<StickyClientEvent[]> {
+  const byRoom = await getStickyEventsForRooms(db, [roomId], opts);
+  return byRoom[roomId] ?? [];
+}
+
+// ============================================
 // Global Account Data
 // ============================================
 
@@ -361,6 +579,112 @@ app.put('/_matrix/client/v3/user/:userId/rooms/:roomId/account_data/:type', requ
 });
 
 // ============================================
+// MSC4354 / MSC4480 sticky event endpoints
+// ============================================
+
+async function requireJoinedRoom(
+  db: D1Database,
+  roomId: string,
+  userId: string
+): Promise<boolean> {
+  const membership = await db.prepare(`
+    SELECT membership FROM room_memberships
+    WHERE room_id = ? AND user_id = ?
+  `).bind(roomId, userId).first<{ membership: string }>();
+  return membership?.membership === 'join';
+}
+
+async function handlePutStickyEvent(c: any): Promise<Response> {
+  const userId = c.get('userId') as string;
+  const roomId = decodeURIComponent(c.req.param('roomId'));
+  const eventType = decodeURIComponent(c.req.param('eventType'));
+  const txnId = decodeURIComponent(c.req.param('txnId'));
+  const db = c.env.DB as D1Database;
+
+  if (!eventType || !(await requireJoinedRoom(db, roomId, userId))) {
+    return c.json({ errcode: 'M_FORBIDDEN', error: 'User not in room' }, 403);
+  }
+
+  // MSC4354's unstable query parameter, with the stable name accepted too.
+  const durationMs = parseStickyDuration(
+    c.req.query('org.matrix.msc4354.sticky_duration_ms') ?? c.req.query('sticky_duration_ms')
+  );
+  if (durationMs === null) {
+    return c.json({
+      errcode: 'M_INVALID_PARAM',
+      error: 'sticky_duration_ms must be a strictly positive integer',
+    }, 400);
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    const parsed = await c.req.json();
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return Errors.badJson().toResponse();
+    }
+    body = parsed as Record<string, unknown>;
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+
+  const content = (body.content && typeof body.content === 'object' && !Array.isArray(body.content))
+    ? body.content as Record<string, unknown>
+    : body;
+  const eventId = typeof body.event_id === 'string' ? body.event_id : undefined;
+  const originServerTs = typeof body.origin_server_ts === 'number'
+    ? body.origin_server_ts
+    : Date.now();
+
+  await putStickyEvent(db, {
+    userId,
+    roomId,
+    eventType,
+    txnId,
+    durationMs,
+    content,
+    eventId,
+    originServerTs,
+  });
+
+  // Best-effort wake of this user's long-poll so the write is echoed promptly.
+  try {
+    await notifyUserSync(c.env, userId, 'account_data');
+  } catch (error) {
+    console.error('[account-data] sticky notify failed:', error);
+  }
+
+  return c.json({});
+}
+
+async function handleGetStickyEvents(c: any): Promise<Response> {
+  const userId = c.get('userId') as string;
+  const roomId = decodeURIComponent(c.req.param('roomId'));
+  const db = c.env.DB as D1Database;
+
+  if (!(await requireJoinedRoom(db, roomId, userId))) {
+    return c.json({ errcode: 'M_FORBIDDEN', error: 'User not in room' }, 403);
+  }
+
+  const events = await getStickyEventsForRoom(db, roomId);
+  return c.json({ events });
+}
+
+// MSC4354 owns the sticky-event identifiers; MSC4480 is the sliding-sync
+// extension, so both unstable namespaces are accepted for the client endpoint.
+for (const prefix of ['org.matrix.msc4354', 'org.matrix.msc4480']) {
+  app.put(
+    `/_matrix/client/unstable/${prefix}/rooms/:roomId/sticky/:eventType/:txnId`,
+    requireAuth(),
+    handlePutStickyEvent
+  );
+  app.get(
+    `/_matrix/client/unstable/${prefix}/rooms/:roomId/sticky`,
+    requireAuth(),
+    handleGetStickyEvents
+  );
+}
+
+// ============================================
 // Batch Account Data (for sync)
 // ============================================
 
@@ -382,6 +706,7 @@ export async function getGlobalAccountData(
         ad.event_type = adc.event_type AND
         ad.room_id = adc.room_id
       WHERE ad.user_id = ? AND ad.room_id = '' AND adc.stream_position > ?
+        AND ad.event_type NOT LIKE 'org.matrix.msc4354.sticky.%'
       GROUP BY ad.event_type
     `;
     params.push(since);
@@ -390,6 +715,7 @@ export async function getGlobalAccountData(
     query = `
       SELECT event_type, content FROM account_data
       WHERE user_id = ? AND room_id = ''
+        AND event_type NOT LIKE 'org.matrix.msc4354.sticky.%'
     `;
   }
 
@@ -422,6 +748,7 @@ export async function getRoomAccountData(
         ad.event_type = adc.event_type AND
         ad.room_id = adc.room_id
       WHERE ad.user_id = ? AND ad.room_id = ? AND adc.stream_position > ?
+        AND ad.event_type NOT LIKE 'org.matrix.msc4354.sticky.%'
       GROUP BY ad.event_type
     `;
     params.push(since);
@@ -429,6 +756,7 @@ export async function getRoomAccountData(
     query = `
       SELECT event_type, content FROM account_data
       WHERE user_id = ? AND room_id = ?
+        AND event_type NOT LIKE 'org.matrix.msc4354.sticky.%'
     `;
   }
 
@@ -465,6 +793,7 @@ export async function getAllRoomAccountData(
         ad.event_type = adc.event_type AND
         ad.room_id = adc.room_id
       WHERE ad.user_id = ? AND ad.room_id IN (${placeholders}) AND adc.stream_position > ?
+        AND ad.event_type NOT LIKE 'org.matrix.msc4354.sticky.%'
       GROUP BY ad.room_id, ad.event_type
     `;
     params.push(since);
@@ -472,6 +801,7 @@ export async function getAllRoomAccountData(
     query = `
       SELECT room_id, event_type, content FROM account_data
       WHERE user_id = ? AND room_id IN (${placeholders})
+        AND event_type NOT LIKE 'org.matrix.msc4354.sticky.%'
     `;
   }
 

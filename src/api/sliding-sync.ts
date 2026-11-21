@@ -11,6 +11,7 @@ import { countNotificationsWithRules } from '../services/push-rule-evaluator';
 import { getInvitePermission } from '../services/database';
 import { getDeviceListRemovals } from './sync';
 import { getPresenceForUsers } from './presence';
+import { getStickyEventsForRooms, isStickyEventType } from './account-data';
 // Room cache helper available for future optimizations
 // import { getRoomMetadata, invalidateRoomCache, type RoomMetadata } from '../services/room-cache';
 
@@ -96,6 +97,83 @@ export function matchesSlidingRoomFilters(
   return true;
 }
 
+// MSC4480: the stable extension name is `sticky_events`; while unstable the
+// MSC uses `org.matrix.msc4354.sticky_events` (from the base MSC4354).
+function getStickyExtensionRequest(request: SlidingSyncRequest): StickyExtensionRequest | undefined {
+  const ext = request.extensions?.sticky_events
+    ?? request.extensions?.['org.matrix.msc4354.sticky_events'];
+  return ext && ext.enabled !== false ? ext : undefined;
+}
+
+/**
+ * Build the MSC4480 sticky_events extension body for the rooms in scope.
+ * With no explicit `rooms`/`lists`, every room in the response is in scope
+ * (the common MSC4508 default). Sticky events are never read from the timeline
+ * tables, so they cannot leak into `rooms.<id>.timeline`.
+ */
+async function buildStickyExtension(
+  db: D1Database,
+  userId: string,
+  request: SlidingSyncRequest,
+  response: SlidingSyncResponse,
+  connectionState: ConnectionState
+): Promise<{ rooms: Record<string, { events: any[] }> } | null> {
+  const ext = getStickyExtensionRequest(request);
+  if (!ext) return null;
+
+  const listRoomIds = new Set<string>();
+  for (const listId of ext.lists ?? []) {
+    for (const roomId of connectionState.listStates[listId]?.roomIds ?? []) listRoomIds.add(roomId);
+  }
+  const scopedIds = ext.rooms?.length || listRoomIds.size
+    ? [...new Set([...(ext.rooms ?? []), ...listRoomIds])]
+    : Object.keys(response.rooms);
+  if (scopedIds.length === 0) return null;
+
+  // MSC4480: rooms the user is not joined to (e.g. left rooms still present
+  // in a list) must never receive sticky events.
+  let joinedIds = scopedIds;
+  try {
+    const joined = await db.prepare(`
+      SELECT room_id FROM room_memberships WHERE user_id = ? AND membership = 'join'
+    `).bind(userId).all<{ room_id: string }>();
+    const joinedSet = new Set(joined.results.map(row => row.room_id));
+    joinedIds = scopedIds.filter(roomId => joinedSet.has(roomId));
+  } catch (error) {
+    console.error('[sliding-sync] sticky membership check failed:', error);
+  }
+  if (joinedIds.length === 0) return null;
+
+  let stickyByRoom: Awaited<ReturnType<typeof getStickyEventsForRooms>>;
+  try {
+    stickyByRoom = await getStickyEventsForRooms(db, joinedIds, { limit: ext.limit ?? 100 });
+  } catch (error) {
+    console.error('[sliding-sync] failed to load sticky events:', error);
+    return null;
+  }
+
+  const rooms: Record<string, { events: any[] }> = {};
+  for (const roomId of joinedIds) {
+    const timelineIds = new Set(
+      (response.rooms[roomId]?.timeline ?? []).map((event: any) => event.event_id)
+    );
+    const events = (stickyByRoom[roomId] ?? []).filter(event => !timelineIds.has(event.event_id));
+    if (events.length > 0) rooms[roomId] = { events };
+  }
+  return Object.keys(rooms).length > 0 ? { rooms } : null;
+}
+
+/** Attach an MSC4480 sticky extension body under both stable and unstable names. */
+function setStickyExtension(
+  response: SlidingSyncResponse,
+  sticky: { rooms: Record<string, { events: any[] }> } | null
+): boolean {
+  if (!sticky) return false;
+  response.extensions.sticky_events = sticky;
+  response.extensions['org.matrix.msc4354.sticky_events'] = sticky;
+  return true;
+}
+
 /**
  * Resolve MSC3575 `ranges` / MSC4186 `range` into inclusive start/end indices.
  * Exported for unit tests.
@@ -154,6 +232,16 @@ interface ExtensionsRequest {
   presence?: {
     enabled?: boolean;
   };
+  // MSC4480: sticky-event extension (unstable name: org.matrix.msc4354.sticky_events)
+  sticky_events?: StickyExtensionRequest;
+  'org.matrix.msc4354.sticky_events'?: StickyExtensionRequest;
+}
+
+interface StickyExtensionRequest {
+  enabled?: boolean;
+  limit?: number;
+  lists?: string[];
+  rooms?: string[];
 }
 
 interface SlidingSyncResponse {
@@ -235,6 +323,9 @@ interface ExtensionsResponse {
   presence?: {
     events?: any[];
   };
+  // MSC4480: per-room sticky events (unstable name uses msc4354)
+  sticky_events?: { rooms: Record<string, { events: any[] }> };
+  'org.matrix.msc4354.sticky_events'?: { rooms: Record<string, { events: any[] }> };
 }
 
 // Connection state stored in Durable Object (previously KV, migrated to avoid rate limits)
@@ -1368,6 +1459,8 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
       // Build map of D1 account data
       const globalAccountData: Record<string, any> = {};
       for (const d of globalData.results as any[]) {
+        // Sticky events are delivered by the MSC4480 extension, not account_data.
+        if (isStickyEventType(d.event_type)) continue;
         try {
           globalAccountData[d.event_type] = JSON.parse(d.content);
         } catch {
@@ -1408,13 +1501,15 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         `).bind(userId, roomId).all();
 
         if (roomData.results.length > 0) {
-          response.extensions.account_data.rooms![roomId] = (roomData.results as any[]).map(d => {
-            try {
-              return { type: d.event_type, content: JSON.parse(d.content) };
-            } catch {
-              return { type: d.event_type, content: {} };
-            }
-          });
+          response.extensions.account_data.rooms![roomId] = (roomData.results as any[])
+            .filter(d => !isStickyEventType(d.event_type))
+            .map(d => {
+              try {
+                return { type: d.event_type, content: JSON.parse(d.content) };
+              } catch {
+                return { type: d.event_type, content: {} };
+              }
+            });
         }
       }
     }
@@ -1522,6 +1617,12 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         });
       }
     }
+
+    // MSC4480 sticky events extension
+    setStickyExtension(
+      response,
+      await buildStickyExtension(db, userId, body, response, connectionState)
+    );
   }
 
   // ALWAYS save connection state - using DO now (not KV), no rate limit concerns
@@ -2096,6 +2197,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       // Build map of D1 account data
       const globalAccountData: Record<string, any> = {};
       for (const d of globalData.results as any[]) {
+        // Sticky events are delivered by the MSC4480 extension, not account_data.
+        if (isStickyEventType(d.event_type)) continue;
         try {
           globalAccountData[d.event_type] = JSON.parse(d.content);
         } catch {
@@ -2138,13 +2241,15 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         `).bind(userId, roomId).all();
 
         if (roomAccountData.results.length > 0) {
-          response.extensions.account_data.rooms![roomId] = (roomAccountData.results as any[]).map(d => {
-            try {
-              return { type: d.event_type, content: JSON.parse(d.content) };
-            } catch {
-              return { type: d.event_type, content: {} };
-            }
-          });
+          response.extensions.account_data.rooms![roomId] = (roomAccountData.results as any[])
+            .filter(d => !isStickyEventType(d.event_type))
+            .map(d => {
+              try {
+                return { type: d.event_type, content: JSON.parse(d.content) };
+              } catch {
+                return { type: d.event_type, content: {} };
+              }
+            });
         }
       }
     }
@@ -2236,6 +2341,15 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
     if (body.extensions.presence) {
       response.extensions.presence = { events: [] };
     }
+
+    // MSC4480 sticky events extension. A sticky event counts as an update for
+    // long-polling so clients drain undelivered events without waiting.
+    if (setStickyExtension(
+      response,
+      await buildStickyExtension(db, userId, body, response, connectionState)
+    )) {
+      hasChanges = true;
+    }
   }
 
   // Include ephemeral data on INITIAL sync only if extensions weren't requested
@@ -2289,13 +2403,15 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
       `).bind(userId, roomId).all();
 
       if (roomAccountData.results.length > 0) {
-        response.extensions.account_data.rooms![roomId] = (roomAccountData.results as any[]).map(d => {
-          try {
-            return { type: d.event_type, content: JSON.parse(d.content) };
-          } catch {
-            return { type: d.event_type, content: {} };
-          }
-        });
+        response.extensions.account_data.rooms![roomId] = (roomAccountData.results as any[])
+          .filter(d => !isStickyEventType(d.event_type))
+          .map(d => {
+            try {
+              return { type: d.event_type, content: JSON.parse(d.content) };
+            } catch {
+              return { type: d.event_type, content: {} };
+            }
+          });
 
       }
     }
