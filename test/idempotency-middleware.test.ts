@@ -137,3 +137,80 @@ describe('idempotentResponse TOKENMAXX edge paths after #58', () => {
     expect(db.store.size).toBe(0);
   });
 });
+
+describe('idempotent middleware — pure wiring edges', () => {
+  const USER = '@u:ex.com';
+
+  it('does not touch the DB when txnId or userId is missing', async () => {
+    const db = {
+      prepare: () => {
+        throw new Error('DB must not be touched on the pass-through path');
+      },
+    } as unknown as D1Database;
+    const next = vi.fn(async () => 'ok');
+    const mw = idempotent();
+
+    await expect(mw(makeCtx({ db }), next)).resolves.toBe('ok');
+    await expect(mw(makeCtx({ db, txnId: 't' }), next)).resolves.toBe('ok');
+    await expect(mw(makeCtx({ db, userId: USER }), next)).resolves.toBe('ok');
+    expect(next).toHaveBeenCalledTimes(3);
+  });
+
+  it('propagates a rejection from the downstream handler', async () => {
+    const db = createTxnDb();
+    const next = vi.fn(async () => {
+      throw new Error('handler failed');
+    });
+
+    await expect(
+      idempotent()(makeCtx({ db, txnId: 'err', userId: USER }), next)
+    ).rejects.toThrow('handler failed');
+  });
+
+  it('does not store a transaction on the pre-check path', async () => {
+    const db = createTxnDb();
+    await idempotent()(makeCtx({ db, txnId: 'fresh', userId: USER }), vi.fn());
+    expect(db.store.size).toBe(0);
+  });
+
+  it('returns a cached payload unchanged', async () => {
+    const db = createTxnDb();
+    const payload = { nested: { list: [1, 2] }, count: 0 };
+    await storeTransaction(db, USER, 'shape', undefined, payload);
+    const next = vi.fn();
+
+    const result = await idempotent()(
+      makeCtx({ db, txnId: 'shape', userId: USER }),
+      next
+    );
+
+    expect(result).toEqual({ body: payload });
+    expect(next).not.toHaveBeenCalled();
+  });
+});
+
+describe('idempotentResponse — pure wiring edges', () => {
+  const USER = '@u:ex.com';
+
+  it('stores the exact response body when no eventId is given', async () => {
+    const db = createTxnDb();
+    const response = { a: 1, nested: { b: 2 } };
+
+    const result = await idempotentResponse(
+      makeCtx({ db, txnId: 'no-event', userId: USER }),
+      response
+    );
+
+    expect(result).toEqual({ body: response });
+    expect(db.store.get(`${USER}:no-event`)).toEqual({
+      event_id: null,
+      response: JSON.stringify(response),
+    });
+  });
+
+  it('treats an empty txnId as missing', async () => {
+    const db = createTxnDb();
+    await idempotentResponse(makeCtx({ db, txnId: '', userId: USER }), { a: 1 });
+    expect(db.store.size).toBe(0);
+  });
+});
