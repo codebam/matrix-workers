@@ -17,7 +17,13 @@ import { federationGet } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
 import { augmentAuthEvents, legacyWireForRoom, prepareOutboundPdu } from '../services/event-wire';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
-import { isServerAllowedByAcl, isServerAllowedInRoom, type ServerAclContent } from '../services/server-acl';
+import { isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId, type ServerAclContent } from '../services/server-acl';
+import {
+  getActivePolicyRules,
+  isRoomBannedByPolicy,
+  isServerBannedByPolicy,
+  isUserBannedByPolicy,
+} from '../services/moderation-policy';
 import {
   createRoom,
   getRoom,
@@ -486,6 +492,23 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
       if ((await getInvitePermission(c.env.DB, invitee, userId)) === 'block') {
         return Errors.inviteBlocked().toResponse();
       }
+      // Moderation policy lists (spec module): no invites to banned users
+      // or onto banned servers ("no outbound invites").
+      {
+        const modRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
+        if (modRules.subscriptions > 0) {
+          const bannedUser = isUserBannedByPolicy(modRules, invitee);
+          const bannedServer = isServerBannedByPolicy(
+            modRules,
+            serverNameFromId(invitee)
+          );
+          if (bannedUser || bannedServer) {
+            return Errors.forbidden(
+              `The invitee is banned by a moderation policy list (${bannedUser?.reason || bannedServer?.reason || 'banned entity'})`
+            ).toResponse();
+          }
+        }
+      }
     }
   }
 
@@ -736,6 +759,20 @@ export async function joinFallbackServers(
 app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
+
+  // Moderation policy lists (spec module): banned rooms are not joinable
+  // by our users ("the user should leave the room and not join it").
+  {
+    const modRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
+    if (modRules.subscriptions > 0) {
+      const bannedRoom = isRoomBannedByPolicy(modRules, roomId);
+      if (bannedRoom) {
+        return Errors.forbidden(
+          `This room is banned by a moderation policy list (${bannedRoom.reason || bannedRoom.entity})`
+        ).toResponse();
+      }
+    }
+  }
 
   // Extract server from room ID to check if it's a remote room. v12 room IDs
   // have no suffix, so fall back to the create event's sender domain.
@@ -1224,6 +1261,22 @@ export async function performStateEvent(
   if (eventType === 'm.room.member' && content?.membership === 'invite') {
     if ((await getInvitePermission(env.DB, stateKey, userId)) === 'block') {
       return { error: Errors.inviteBlocked() };
+    }
+    // Moderation policy lists (spec module): no invites to banned users
+    // or onto banned servers ("no outbound invites").
+    {
+      const modRules = await getActivePolicyRules(env.DB, env.CACHE);
+      if (modRules.subscriptions > 0) {
+        const bannedUser = isUserBannedByPolicy(modRules, stateKey);
+        const bannedServer = isServerBannedByPolicy(modRules, serverNameFromId(stateKey));
+        if (bannedUser || bannedServer) {
+          return {
+            error: Errors.forbidden(
+              `The invitee is banned by a moderation policy list (${bannedUser?.reason || bannedServer?.reason || 'banned entity'})`
+            ),
+          };
+        }
+      }
     }
   }
 
@@ -2329,6 +2382,21 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     return Errors.inviteBlocked().toResponse();
   }
 
+  // Moderation policy lists (spec module): no invites to banned users or
+  // onto banned servers ("no outbound invites").
+  {
+    const modRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
+    if (modRules.subscriptions > 0) {
+      const bannedUser = isUserBannedByPolicy(modRules, inviteeId);
+      const bannedServer = isServerBannedByPolicy(modRules, serverNameFromId(inviteeId));
+      if (bannedUser || bannedServer) {
+        return Errors.forbidden(
+          `The invitee is banned by a moderation policy list (${bannedUser?.reason || bannedServer?.reason || 'banned entity'})`
+        ).toResponse();
+      }
+    }
+  }
+
   // Check power levels (captured at check-time; re-validated just before write
   // for optimistic concurrency — see issue 009 sub-finding 3).
   const createEventForPower = await getStateEvent(c.env.DB, roomId, 'm.room.create');
@@ -2906,6 +2974,22 @@ async function performRedaction(
     targetEventId
   );
 
+  // Federate the redaction event so remote servers apply the redaction
+  // too (the storage core only persists locally). Same wire pipeline as
+  // message sends; destinations are already ACL-filtered.
+  const redactionDestinations = await getJoinedRemoteServers(env.DB, roomId, env.SERVER_NAME);
+  if (redactionDestinations.length > 0) {
+    const prepared = await prepareOutboundPdu(env, event, String(roomRow?.room_version ?? '10'));
+    if (prepared) {
+      event.event_id = prepared.wireId;
+      event.hashes = prepared.hashes as PDU['hashes'];
+      event.signatures = prepared.signatures as PDU['signatures'];
+      await queueFederationPdu(
+        env, redactionDestinations, prepared.wire, event.event_id, roomId
+      );
+    }
+  }
+
   // Notify room members about the redaction
   await notifyUsersOfEvent(env, roomId, eventId, 'm.room.redaction');
 
@@ -3099,6 +3183,20 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   // Determine if it's an alias or room ID. Aliases may be local or hosted on
   // another server; remote aliases resolve via federation query/directory.
   if (roomIdOrAlias.startsWith('#')) {
+    // Moderation policy lists (spec module): policy rules can name the
+    // ALIAS itself, and a banned alias may be unresolvable on purpose —
+    // check before attempting federation resolution.
+    {
+      const modRules = await getActivePolicyRules(db, c.env.CACHE);
+      if (modRules.subscriptions > 0) {
+        const bannedByAlias = isRoomBannedByPolicy(modRules, roomIdOrAlias);
+        if (bannedByAlias) {
+          return Errors.forbidden(
+            `This room is banned by a moderation policy list (${bannedByAlias.reason || bannedByAlias.entity})`
+          ).toResponse();
+        }
+      }
+    }
     const resolved = await getRoomByAlias(db, roomIdOrAlias);
     if (resolved) {
       roomId = resolved;
@@ -3115,6 +3213,25 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   }
 
   const room = await getRoom(db, roomId);
+
+  // Moderation policy lists (spec module): banned rooms are not joinable
+  // by our users; aliases are checked in both forms (the spec's rules can
+  // name either).
+  {
+    const modRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
+    if (modRules.subscriptions > 0) {
+      const bannedRoom =
+        isRoomBannedByPolicy(modRules, roomId) ??
+        (roomIdOrAlias.startsWith('#')
+          ? isRoomBannedByPolicy(modRules, roomIdOrAlias)
+          : null);
+      if (bannedRoom) {
+        return Errors.forbidden(
+          `This room is banned by a moderation policy list (${bannedRoom.reason || bannedRoom.entity})`
+        ).toResponse();
+      }
+    }
+  }
 
   // Remote rooms (incl. v12 suffix-less IDs and rooms unknown locally) must
   // complete the federation handshake with the resident server.

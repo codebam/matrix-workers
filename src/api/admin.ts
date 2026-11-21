@@ -5,7 +5,8 @@ import { createMiddleware } from 'hono/factory';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
-import { getUserById, createRegistrationToken, listRegistrationTokens, revokeRegistrationToken, storeEventIdempotent, updateMembership } from '../services/database';
+import { getUserById, createRegistrationToken, listRegistrationTokens, revokeRegistrationToken, storeEventIdempotent, updateMembership, getRoom } from '../services/database';
+import { invalidatePolicyRulesCache } from '../services/moderation-policy';
 import { generateLoginToken, generateOpaqueId, generateRegistrationToken } from '../utils/ids';
 import { base64UrlDecode, hashToken, verifySignature } from '../utils/crypto';
 import { computeWireEventId } from '../utils/event-signing';
@@ -142,7 +143,7 @@ app.get('/admin/api/users', requireAuth(), requireAdmin, async (c) => {
   const search = c.req.query('search');
 
   let query = `
-    SELECT user_id, localpart, display_name, avatar_url, is_guest, is_deactivated, admin, created_at
+    SELECT user_id, localpart, display_name, avatar_url, is_guest, is_deactivated, admin, created_at, locked, suspended
     FROM users
   `;
   const params: any[] = [];
@@ -180,7 +181,7 @@ app.get('/admin/api/users/:userId', requireAuth(), requireAdmin, async (c) => {
   const db = c.env.DB;
 
   const user = await db.prepare(`
-    SELECT user_id, localpart, display_name, avatar_url, is_guest, is_deactivated, admin, created_at, updated_at
+    SELECT user_id, localpart, display_name, avatar_url, is_guest, is_deactivated, admin, created_at, updated_at, locked, suspended
     FROM users WHERE user_id = ?
   `).bind(userId).first();
 
@@ -425,6 +426,167 @@ app.put('/_matrix/client/v1/admin/lock/:userId', requireAuth(), requireAdmin, as
 
   // Sessions are intentionally left intact (soft logout semantics).
   return c.json({ locked: body.locked });
+});
+
+// ============================================================================
+// Moderation policy lists (spec module): server-side subscriptions.
+//
+// A subscription points the server at a policy room, joined by a
+// dedicated local system user (@moderation:<server>, created on first
+// use with an unknowable random password). m.ban rules in that room's
+// m.policy.rule.{user,room,server} state are enforced at our invite/
+// join/PDU gates (see src/services/moderation-policy.ts).
+// ============================================================================
+
+async function getOrCreateModerationUser(
+  db: D1Database,
+  serverName: string
+): Promise<string> {
+  const userId = `@moderation:${serverName}`;
+  const existing = await db
+    .prepare('SELECT user_id FROM users WHERE user_id = ?')
+    .bind(userId)
+    .first<{ user_id: string }>();
+  if (existing) return userId;
+
+  // Random, discarded credential: the account only acts server-side via
+  // workflows, never logs in.
+  const randomPassword = crypto.randomUUID() + crypto.randomUUID();
+  const { hashPassword } = await import('../utils/crypto');
+  const passwordHash = await hashPassword(randomPassword);
+  await db.prepare(
+    `INSERT INTO users (user_id, localpart, password_hash, display_name, admin, created_at, updated_at)
+     VALUES (?, 'moderation', ?, 'Moderation Policy Subscriber', 0, ?, ?)`
+  ).bind(userId, passwordHash, Date.now(), Date.now()).run();
+  return userId;
+}
+
+// GET /admin/api/policy-lists - List subscriptions with rule counts
+app.get('/admin/api/policy-lists', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  const rows = await db
+    .prepare(
+      `SELECT room_id, enabled, subscriber_user_id, added_at, added_by
+       FROM policy_list_subscriptions ORDER BY added_at DESC`
+    )
+    .all<{
+      room_id: string;
+      enabled: number;
+      subscriber_user_id: string;
+      added_at: number;
+      added_by: string;
+    }>();
+
+  const lists = [];
+  for (const row of rows.results) {
+    let ruleCount = 0;
+    try {
+      const counted = await db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM room_state rs
+           JOIN events e ON rs.event_id = e.event_id
+           WHERE rs.room_id = ? AND rs.event_type IN
+             ('m.policy.rule.user', 'm.policy.rule.room', 'm.policy.rule.server')`
+        )
+        .bind(row.room_id)
+        .first<{ count: number }>();
+      ruleCount = counted?.count ?? 0;
+    } catch {
+      // rules unreadable (room state not synced yet)
+    }
+    lists.push({ ...row, enabled: row.enabled === 1, rule_count: ruleCount });
+  }
+
+  return c.json({ lists, total: lists.length });
+});
+
+// POST /admin/api/policy-lists - Subscribe to a policy room
+app.post('/admin/api/policy-lists', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  const requester = c.get('userId');
+
+  let body: { room_id?: string };
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+  const roomId = body.room_id;
+  if (!roomId || !roomId.startsWith('!')) {
+    return Errors.invalidParam('room_id', 'A room ID (!...) is required').toResponse();
+  }
+
+  // The dedicated subscriber user keeps state flowing to us.
+  const subscriber = await getOrCreateModerationUser(db, c.env.SERVER_NAME);
+
+  const room = await getRoom(db, roomId);
+  const roomServer = roomId.includes(':') ? roomId.slice(roomId.indexOf(':') + 1) : null;
+  const isRemoteRoom = Boolean(roomServer && roomServer !== c.env.SERVER_NAME);
+
+  await db.prepare(
+    `INSERT INTO policy_list_subscriptions (room_id, enabled, subscriber_user_id, added_at, added_by)
+     VALUES (?, 1, ?, ?, ?)
+     ON CONFLICT(room_id) DO UPDATE SET enabled = 1, subscriber_user_id = excluded.subscriber_user_id`
+  ).bind(roomId, subscriber, Date.now(), requester).run();
+
+  // Join the policy room so the rules actually flow to us. Local rooms
+  // with public join rules can be joined directly; remote rooms (or
+  // invite-only rooms) go through the join workflow — invite-only lists
+  // need an invite for @moderation:<server> first.
+  if (!room || isRemoteRoom) {
+    const targetServer = roomServer ?? c.env.SERVER_NAME;
+    try {
+      await c.env.ROOM_JOIN_WORKFLOW.create({
+        params: {
+          roomId,
+          userId: subscriber,
+          isRemote: isRemoteRoom,
+          remoteServer: targetServer,
+          backfill: true,
+        },
+      });
+    } catch (wfErr) {
+      console.warn('[admin] policy list join workflow failed:', wfErr);
+    }
+  } else {
+    try {
+      const { joinBotUserToRoom } = await import('./rooms');
+      await joinBotUserToRoom(c.env, roomId, subscriber);
+    } catch (joinErr) {
+      console.warn('[admin] policy list local join failed:', joinErr);
+    }
+  }
+
+  await invalidatePolicyRulesCache(c.env.CACHE).catch(() => {});
+  await logAdminAction(c, { action: 'policy_list.subscribe', target: roomId });
+
+  return c.json({
+    success: true,
+    room_id: roomId,
+    subscriber_user_id: subscriber,
+    note: isRemoteRoom
+      ? 'Joining in the background; invite-only lists require an invite for the subscriber user first.'
+      : 'Subscribed; rules are enforced within the cache TTL.',
+  });
+});
+
+// DELETE /admin/api/policy-lists/:roomId - Unsubscribe (rules stop
+// applying; the subscriber's membership is left alone — it is harmless
+// and leaving remote rooms requires a federated leave event).
+app.delete('/admin/api/policy-lists/:roomId', requireAuth(), requireAdmin, async (c) => {
+  const db = c.env.DB;
+  const roomId = c.req.param('roomId');
+
+  const result = await db.prepare(
+    `UPDATE policy_list_subscriptions SET enabled = 0 WHERE room_id = ?`
+  ).bind(roomId).run();
+  if ((result.meta?.changes ?? 0) === 0) {
+    return Errors.notFound('Subscription not found').toResponse();
+  }
+
+  await invalidatePolicyRulesCache(c.env.CACHE).catch(() => {});
+  await logAdminAction(c, { action: 'policy_list.unsubscribe', target: roomId });
+  return c.json({ success: true });
 });
 
 // GET /_matrix/client/v1/admin/suspend/:userId - Suspension status
