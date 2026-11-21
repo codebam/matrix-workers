@@ -122,7 +122,7 @@ async function policySignatureMissing(
   }
 }
 import { recordKeyChange } from './keys';
-import { recordPresenceChange } from './presence';
+import { ensurePresenceUserRow, recordPresenceChange } from './presence';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { deliverInboundToDevice } from './to-device';
 import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../services/event-wire';
@@ -1418,6 +1418,11 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
                   ? now - update.last_active_ago
                   : now;
                 try {
+                  // Remote senders have no local users row, but presence has a
+                  // FK to users. Seed a placeholder first or the upsert fails
+                  // and presence is silently lost (the /send still returns 200).
+                  await ensurePresenceUserRow(c.env.DB, update.user_id);
+
                   // Stamp the row with a new presence stream position in the
                   // same D1 batch/transaction, so local /sync clients see this
                   // EDU exactly once. recordPresenceChange degrades to the

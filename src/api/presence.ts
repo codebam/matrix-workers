@@ -48,6 +48,18 @@ async function getNextPresencePosition(db: D1Database): Promise<number> {
   }
 }
 
+// Remote senders have no local `users` row, but presence.user_id has a FK to
+// users. Seed a minimal, non-loginable placeholder so their presence can be
+// stored and stamped. OR IGNORE leaves existing local rows untouched.
+export async function ensurePresenceUserRow(db: D1Database, userId: string): Promise<void> {
+  const colon = userId.indexOf(':');
+  const localpart = userId.startsWith('@') && colon > 1 ? userId.slice(1, colon) : userId;
+  await db.prepare(
+    `INSERT OR IGNORE INTO users (user_id, localpart, admin, is_deactivated)
+     VALUES (?, ?, 0, 0)`
+  ).bind(userId, localpart).run();
+}
+
 // Write a presence row and stamp it with a fresh stream position. D1 batches
 // run in a transaction, so bumping the counter and stamping the row commit
 // together: a client's next /sync cannot observe a position whose row was
