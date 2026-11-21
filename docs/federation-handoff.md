@@ -543,3 +543,57 @@ joins users for locked/suspended — one query, no extra round trip),
 new client+federation module, reference implementation is the
 Foundation's policyserv; the biggest untouched v1.18 feature. Also
 noted: outbound federation destination filtering by ACL.
+
+## Follow-up wave: ACL destinations, redaction serving, policy servers (2026-11-20, session 11)
+
+The three follow-ups recorded at the end of session 10, landed and
+verified. Full suite green after the wave: 45,569/45,569 (351 files).
+
+- **Outbound ACL destination filtering**: getJoinedRemoteServers now
+  drops servers denied by the room's m.room.server_acl before any
+  fanout — send/state/leave/kick/ban/unban/invite destinations all
+  compute through it. (The one exception: invite fanout's explicit
+  target-domain append happens before the filter in some paths —
+  acceptable: invites are one-server pings, not room traffic.)
+- **Serve-side redaction (closes the redacted_because follow-up)**:
+  migration **027_redacted_content.sql** adds events.redacted_content.
+  applyEventRedaction (new src/services/event-redaction.ts) computes
+  the pruned client view per the room-version keep rules
+  (computeRedactedContent in room-versions.ts), sets
+  unsigned.redacted_because, and is applied BOTH locally
+  (performRedaction) and on federation-inbound redactions (v11+ reads
+  content.redacts, older versions the top-level field). Client-facing
+  reads prefer redacted_content: legacy /sync, sliding sync (timeline,
+  required_state, state_after), getEventsSince/getRoomEvents (so
+  /messages), /context, /rooms/:id/event. The original `content` column
+  is untouched — federation hashes/signatures stay valid over it.
+  Known remainder: stripped-state invites and relation/thread listings
+  still read raw content; redaction events themselves are not yet
+  federated outbound from performRedaction (pre-existing).
+- **Policy servers (MSC4284, spec v1.18) — the big module**:
+  - src/services/policy-server.ts: config parsing (m.room.policy with
+    `via` + `public_keys.ed25519`, empty state key only), the joined-
+    member consent gate for `via`, signature verify/attach (always
+    `ed25519:policy_server`), and the ask (POST /_matrix/policy/v1/sign
+    via federationPost, 10s cap).
+  - Send-side: performSendEvent and prepareAndStoreLocalEvent (so ALL
+    local event shapes: messages, state, memberships, redactions) ask
+    AFTER wire-ID derivation so the PS signs the final form; refusals
+    fail the client request verbatim (index.ts onError now maps
+    MatrixApiError → its status/errcode); returned signatures are
+    verified against the room's pinned key before use; prepareOutboundPdu
+    now MERGES foreign signatures so the countersignature rides the wire
+    and stored form everywhere.
+  - Receive-side: transaction PDUs in policy rooms validate the PS
+    signature (spec check #7); missing/invalid ones are re-requested
+    from the PS (key rotation redemption, persisted), and still-bad
+    events are SOFT-FAILED: stored for DAG integrity, never notified to
+    clients.
+  - Policy server role: POST /_matrix/policy/v1/sign served under
+    federation auth (permissive policy: known room + caller allowed by
+    the room ACL; per-room rules can layer in without contract change);
+    GET /.well-known/matrix/policy_server publishes the dedicated
+    key (server_keys key_version 4, deliberately NOT the federation
+    signing key).
+
+Deploy order for this wave: migration 027 first, then wrangler deploy.

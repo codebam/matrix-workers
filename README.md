@@ -105,7 +105,9 @@ npx wrangler secret put EMAIL_FROM
 | [3PID Management](https://spec.matrix.org/v1.19/client-server-api/#adding-account-administrative-contact-information) | [`src/api/account.ts`](src/api/account.ts) | Email verification, 3PID binding |
 | [Invite Permission](https://spec.matrix.org/v1.19/client-server-api/#invite-permission) | [`src/services/database.ts`](src/services/database.ts) | MSC4155 globs + MSC4380 block-all toggle |
 | [Account Moderation](https://spec.matrix.org/v1.19/client-server-api/#account-moderation) | [`src/api/admin.ts`](src/api/admin.ts), [`src/middleware/auth.ts`](src/middleware/auth.ts) | MSC4323 lock/suspend + enforcement |
-| [Server ACLs](https://spec.matrix.org/v1.19/client-server-api/#server-access-control-lists-acls-for-rooms) | [`src/services/server-acl.ts`](src/services/server-acl.ts) | m.room.server_acl enforcement, MSC4436 case-insensitive |
+| [Server ACLs](https://spec.matrix.org/v1.19/client-server-api/#server-access-control-lists-acls-for-rooms) | [`src/services/server-acl.ts`](src/services/server-acl.ts) | m.room.server_acl enforcement (inbound + outbound destinations), MSC4436 case-insensitive |
+| [Policy Servers](https://spec.matrix.org/v1.19/client-server-api/#policy-servers) | [`src/services/policy-server.ts`](src/services/policy-server.ts) | MSC4284: ask-and-countersign on send, receive-side soft-fail, `POST /_matrix/policy/v1/sign`, `/.well-known/matrix/policy_server` |
+| [Redactions](https://spec.matrix.org/v1.19/client-server-api/#redactions) | [`src/services/event-redaction.ts`](src/services/event-redaction.ts) | client-facing content pruned per room-version keep rules (`events.redacted_content`), local + federation-initiated |
 | [Reporting Content](https://spec.matrix.org/v1.19/client-server-api/#reporting-content) | [`src/api/report.ts`](src/api/report.ts) | MSC4277 anti-fingerprinting |
 | [Mutual Rooms](https://spec.matrix.org/v1.19/client-server-api/#mutual-rooms) | [`src/api/rooms.ts`](src/api/rooms.ts) | MSC2666 stable endpoint |
 
