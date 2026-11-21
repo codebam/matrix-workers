@@ -10,9 +10,10 @@
 // even when the app is not running.
 
 import { Hono } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, RoomPowerLevelsContent } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { getEffectiveUserPowerLevel } from '../services/event-auth';
 
 const app = new Hono<AppEnv>();
 
@@ -95,6 +96,16 @@ const DEFAULT_OVERRIDE_RULES: PushRule[] = [
       { kind: 'event_match', key: 'type', pattern: 'm.room.member' },
     ],
     actions: ['dont_notify'],
+  },
+  {
+    rule_id: '.m.rule.suppress_edits',
+    default: true,
+    enabled: true,
+    conditions: [
+      { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+      { kind: 'event_match', key: 'content.m.new_content', pattern: '*' },
+    ],
+    actions: [],
   },
   {
     rule_id: '.m.rule.is_user_mention',
@@ -322,6 +333,49 @@ async function getUserPushRules(db: D1Database, userId: string): Promise<{
   return { global: rules };
 }
 
+interface SenderPermissionContext {
+  senderPowerLevel: number;
+  notificationLevels: Record<string, number>;
+}
+
+/** Resolve room power levels for sender_notification_permission conditions. */
+async function getSenderPermissionContext(
+  db: D1Database,
+  roomId: string,
+  sender: string
+): Promise<SenderPermissionContext> {
+  const stateQuery = `
+    SELECT e.sender, e.content
+    FROM room_state rs
+    JOIN events e ON rs.event_id = e.event_id
+    WHERE rs.room_id = ? AND rs.event_type = ? AND rs.state_key = ?
+  `;
+
+  let powerLevels: RoomPowerLevelsContent = {};
+  let createEvent: { sender?: string; content?: unknown } | null = null;
+
+  try {
+    const plRow = await db.prepare(stateQuery).bind(roomId, 'm.room.power_levels', '')
+      .first<{ sender: string; content: string }>();
+    if (plRow?.content) {
+      powerLevels = JSON.parse(plRow.content) as RoomPowerLevelsContent;
+    }
+    const createRow = await db.prepare(stateQuery).bind(roomId, 'm.room.create', '')
+      .first<{ sender: string; content: string }>();
+    if (createRow) {
+      createEvent = { sender: createRow.sender, content: createRow.content };
+    }
+  } catch {
+    // Room state can be unavailable; spec defaults then apply: sender power 0
+    // and a missing notifications.<key> threshold of 50.
+  }
+
+  return {
+    senderPowerLevel: getEffectiveUserPowerLevel(powerLevels, sender, createEvent),
+    notificationLevels: (powerLevels.notifications ?? {}) as Record<string, number>,
+  };
+}
+
 // ============================================
 // Pusher Endpoints
 // ============================================
@@ -396,11 +450,12 @@ app.post('/_matrix/client/v3/pushers/set', requireAuth(), async (c) => {
     return Errors.missingParam('app_id, app_display_name, device_display_name, lang, data').toResponse();
   }
 
-  // If not appending, remove existing pushers with same pushkey
+  // append=false replaces this app's pusher for the user; pushers registered by
+  // other apps (even with the same pushkey) must be left alone.
   if (!append) {
     await db.prepare(`
-      DELETE FROM pushers WHERE user_id = ? AND pushkey = ?
-    `).bind(userId, pushkey).run();
+      DELETE FROM pushers WHERE user_id = ? AND app_id = ?
+    `).bind(userId, app_id).run();
   }
 
   // Insert new pusher
@@ -502,6 +557,50 @@ app.get('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), asyn
   return c.json(rule);
 });
 
+/**
+ * Resolve a new rule's priority from before/after. Custom rules are emitted in
+ * descending priority order (they are unshifted in SELECT priority ASC order),
+ * so "before" takes the reference priority and "after" takes the next lower
+ * one; the reference rule and the rules following it are shifted down.
+ */
+async function resolveRulePriority(
+  db: D1Database,
+  userId: string,
+  kind: string,
+  before?: string,
+  after?: string
+): Promise<number> {
+  if (!before && !after) return 0;
+
+  const referenceId = before || after;
+  const existing = await db.prepare(`
+    SELECT rule_id, priority FROM push_rules
+    WHERE user_id = ? AND kind = ?
+    ORDER BY priority ASC
+  `).bind(userId, kind).all<{ rule_id: string; priority: number }>();
+
+  const reference = existing.results.find(r => r.rule_id === referenceId);
+  if (!reference) {
+    // Unknown rule id: fall back to appending at the end of the list.
+    return Date.now();
+  }
+
+  const referencePriority = reference.priority ?? 0;
+  if (before) {
+    await db.prepare(`
+      UPDATE push_rules SET priority = priority - 1
+      WHERE user_id = ? AND kind = ? AND priority <= ?
+    `).bind(userId, kind, referencePriority).run();
+    return referencePriority;
+  }
+
+  await db.prepare(`
+    UPDATE push_rules SET priority = priority - 1
+    WHERE user_id = ? AND kind = ? AND priority < ?
+  `).bind(userId, kind, referencePriority).run();
+  return referencePriority - 1;
+}
+
 // PUT /_matrix/client/v3/pushrules/:scope/:kind/:ruleId - Create/update rule
 app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -559,14 +658,14 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId', requireAuth(), asyn
     ruleData.pattern = pattern;
   }
 
-  // Get priority from query params
-  const before = c.req.query('before');
-  const after = c.req.query('after');
-  let priority = 0;
-
-  if (before || after) {
-    priority = Date.now();
-  }
+  // Relative positioning from before/after query params
+  const priority = await resolveRulePriority(
+    db,
+    userId,
+    kind,
+    c.req.query('before'),
+    c.req.query('after')
+  );
 
   await db.prepare(`
     INSERT INTO push_rules (user_id, kind, rule_id, conditions, actions, enabled, priority)
@@ -709,6 +808,7 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId/actions', requireAuth
 
   let ruleConditions: PushCondition[] | undefined;
   let ruleActions: any[] = body.actions;
+  let ruleEnabled = true;
 
   if (customRule) {
     try {
@@ -730,6 +830,9 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId/actions', requireAuth
     }
 
     ruleConditions = defaultRule.conditions;
+    // An actions PUT is partial: creating the override must not implicitly
+    // enable a default rule that ships disabled (e.g. .m.rule.master).
+    ruleEnabled = defaultRule.enabled;
   } else {
     return c.json({
       errcode: 'M_NOT_FOUND',
@@ -739,7 +842,7 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId/actions', requireAuth
 
   await db.prepare(`
     INSERT INTO push_rules (user_id, kind, rule_id, conditions, actions, enabled, priority)
-    VALUES (?, ?, ?, ?, ?, 1, 0)
+    VALUES (?, ?, ?, ?, ?, ?, 0)
     ON CONFLICT (user_id, kind, rule_id) DO UPDATE SET
       actions = excluded.actions
   `).bind(
@@ -747,7 +850,8 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId/actions', requireAuth
     kind,
     ruleId,
     ruleConditions ? JSON.stringify(ruleConditions) : null,
-    JSON.stringify(ruleActions)
+    JSON.stringify(ruleActions),
+    ruleEnabled ? 1 : 0
   ).run();
 
   return c.json({});
@@ -761,7 +865,7 @@ app.put('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId/actions', requireAuth
 app.get('/_matrix/client/v3/notifications', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const from = c.req.query('from');
-  const limit = parseInt(c.req.query('limit') || '20', 10);
+  const limit = parseInt(c.req.query('limit') || '50', 10);
   const only = c.req.query('only'); // 'highlight' to only show highlights
   const db = c.env.DB;
 
@@ -782,7 +886,8 @@ app.get('/_matrix/client/v3/notifications', requireAuth(), async (c) => {
   const params: any[] = [userId];
 
   if (sincePosition > 0) {
-    query += ` AND nq.id > ?`;
+    // Tokens are ids from a descending page, so the next page holds older ids.
+    query += ` AND nq.id < ?`;
     params.push(sincePosition);
   }
 
@@ -790,7 +895,7 @@ app.get('/_matrix/client/v3/notifications', requireAuth(), async (c) => {
     query += ` AND nq.notification_type = 'highlight'`;
   }
 
-  query += ` ORDER BY nq.created_at DESC LIMIT ?`;
+  query += ` ORDER BY nq.id DESC LIMIT ?`;
   params.push(Math.min(limit, 100));
 
   const notifications = await db.prepare(query).bind(...params).all<{
@@ -893,8 +998,15 @@ export async function evaluatePushRules(
     ...rules.global.underride,
   ].filter(r => r.enabled);
 
+  const needsSenderPermission = allRules.some(r =>
+    r.conditions?.some(c => c.kind === 'sender_notification_permission')
+  );
+  const senderPermission = needsSenderPermission
+    ? await getSenderPermissionContext(db, event.room_id, event.sender)
+    : undefined;
+
   for (const rule of allRules) {
-    if (matchesRule(rule, event, userId, roomMemberCount, displayName)) {
+    if (matchesRule(rule, event, userId, roomMemberCount, displayName, senderPermission)) {
       const notify = !rule.actions.includes('dont_notify') && rule.actions.some(a => a === 'notify');
       const highlight = rule.actions.some(a =>
         typeof a === 'object' && a.set_tweak === 'highlight' && a.value !== false
@@ -913,7 +1025,8 @@ export function matchesRule(
   event: any,
   userId: string,
   roomMemberCount: number,
-  displayName?: string
+  displayName?: string,
+  senderPermission?: SenderPermissionContext
 ): boolean {
   // Content rules check pattern against body
   if (rule.pattern) {
@@ -930,7 +1043,9 @@ export function matchesRule(
 
   // Check all conditions
   if (rule.conditions) {
-    return rule.conditions.every(condition => matchesCondition(condition, event, userId, roomMemberCount, displayName));
+    return rule.conditions.every(condition =>
+      matchesCondition(condition, event, userId, roomMemberCount, displayName, senderPermission)
+    );
   }
 
   return true;
@@ -942,12 +1057,13 @@ export function matchesCondition(
   event: any,
   userId: string,
   roomMemberCount: number,
-  displayName?: string
+  displayName?: string,
+  senderPermission?: SenderPermissionContext
 ): boolean {
   switch (condition.kind) {
     case 'event_match': {
       if (!condition.key || !condition.pattern) return false;
-      const value = getNestedValue(event, condition.key);
+      const value = getEventMatchValue(event, condition.key);
       if (value === undefined) return false;
 
       // Handle user_id placeholder
@@ -985,8 +1101,10 @@ export function matchesCondition(
     }
 
     case 'sender_notification_permission': {
-      // Simplified: assume sender has permission
-      return true;
+      if (!condition.key || !senderPermission) return false;
+      // Spec: key maps to power_levels.notifications[key], defaulting to 50.
+      const required = senderPermission.notificationLevels[condition.key] ?? 50;
+      return senderPermission.senderPowerLevel >= required;
     }
 
     case 'event_property_is': {
@@ -1005,6 +1123,22 @@ export function matchesCondition(
     default:
       return true;
   }
+}
+
+/** Resolve an event_match key, including Matrix content keys containing dots. */
+function getEventMatchValue(event: any, key: string): any {
+  const value = getNestedValue(event, key);
+  if (value !== undefined) return value;
+
+  const parts = key.split('.');
+  for (let i = parts.length - 1; i > 0; i--) {
+    const parent = getNestedValue(event, parts.slice(0, i).join('.'));
+    const literalKey = parts.slice(i).join('.');
+    if (parent && typeof parent === 'object' && Object.prototype.hasOwnProperty.call(parent, literalKey)) {
+      return parent[literalKey];
+    }
+  }
+  return undefined;
 }
 
 /** Exported for unit tests. */

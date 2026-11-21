@@ -14,6 +14,58 @@ const message = {
   content: { body: 'Hello Alice there', msgtype: 'm.text' },
 };
 
+/** DB stub with current room power-level state for sender permission checks. */
+function dbWithRoomPowerLevels(opts: {
+  users?: Record<string, number>;
+  usersDefault?: number;
+  notificationRoom?: number;
+  creator?: string;
+  roomVersion?: string;
+  customRules?: Array<Record<string, unknown>>;
+} = {}) {
+  const creator = opts.creator ?? '@admin:example.com';
+  const powerLevels = {
+    users: opts.users ?? {},
+    users_default: opts.usersDefault ?? 0,
+    ...(opts.notificationRoom === undefined
+      ? {}
+      : { notifications: { room: opts.notificationRoom } }),
+  };
+  return {
+    prepare(sql: string) {
+      return {
+        bind(...args: unknown[]) {
+          return {
+            async all<T>() {
+              if (sql.includes('FROM push_rules')) {
+                return { results: (opts.customRules ?? []) as T[] };
+              }
+              return { results: [] as T[] };
+            },
+            async first<T>() {
+              if (sql.includes('FROM room_state')) {
+                if (args[1] === 'm.room.power_levels') {
+                  return {
+                    sender: creator,
+                    content: JSON.stringify(powerLevels),
+                  } as T;
+                }
+                if (args[1] === 'm.room.create') {
+                  return {
+                    sender: creator,
+                    content: JSON.stringify({ room_version: opts.roomVersion ?? '10' }),
+                  } as T;
+                }
+              }
+              return null;
+            },
+          };
+        },
+      };
+    },
+  } as unknown as D1Database;
+}
+
 describe('getNestedValue', () => {
   it('reads nested paths and returns undefined for missing keys', () => {
     expect(getNestedValue(message, 'content.body')).toBe('Hello Alice there');
@@ -120,10 +172,37 @@ describe('matchesCondition', () => {
     );
   });
 
-  it('treats sender_notification_permission as always true (simplified)', () => {
+  it('fails closed for sender_notification_permission without room context', () => {
     expect(
       matchesCondition({ kind: 'sender_notification_permission' }, message, userId, 2)
-    ).toBe(true);
+    ).toBe(false);
+    expect(
+      matchesCondition(
+        { kind: 'sender_notification_permission', key: 'room' },
+        message,
+        userId,
+        2
+      )
+    ).toBe(false);
+  });
+
+  it('evaluates sender_notification_permission against notification power levels', () => {
+    const atThreshold = { senderPowerLevel: 50, notificationLevels: { room: 50 } };
+    const belowThreshold = { senderPowerLevel: 49, notificationLevels: { room: 50 } };
+    const condition: PushCondition = { kind: 'sender_notification_permission', key: 'room' };
+    expect(matchesCondition(condition, message, userId, 2, undefined, atThreshold)).toBe(true);
+    expect(matchesCondition(condition, message, userId, 2, undefined, belowThreshold)).toBe(false);
+    // A missing notifications.room threshold defaults to 50 per spec.
+    expect(
+      matchesCondition(
+        condition,
+        message,
+        userId,
+        2,
+        undefined,
+        { senderPowerLevel: 49, notificationLevels: {} }
+      )
+    ).toBe(false);
   });
 
   it('rejects event_property_contains when the value is not an array', () => {
@@ -1035,9 +1114,9 @@ describe('evaluatePushRules default underrides/overrides TOKENMAXX after #76', (
     expect(result).toMatchObject({ notify: true, highlight: false, actions: ['notify'] });
   });
 
-  it('highlights is_room_mention when nested content.m.mentions.room is true', async () => {
+  it('highlights is_room_mention when the sender can notify the room', async () => {
     const result = await evaluatePushRules(
-      pushDb(),
+      dbWithRoomPowerLevels({ users: { [bob]: 50 }, notificationRoom: 50 }),
       userId,
       {
         type: 'm.room.message',
@@ -1451,5 +1530,63 @@ describe('getUserPushRules merge via evaluatePushRules TOKENMAXX after #76', () 
       5
     );
     expect(result.notify).toBe(false);
+  });
+});
+
+describe('push conformance: suppress_edits and sender notification permission', () => {
+  const roomId = '!r:example.com';
+  const sender = '@bob:example.com';
+
+  it('suppresses only edits (empty rule actions) via .m.rule.suppress_edits', async () => {
+    const edit = await evaluatePushRules(
+      dbWithRoomPowerLevels(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender,
+        room_id: roomId,
+        content: { body: '* corrected', msgtype: 'm.text', 'm.new_content': { body: 'corrected' } },
+      },
+      2
+    );
+    expect(edit).toEqual({ notify: false, actions: [], highlight: false });
+
+    const normal = await evaluatePushRules(
+      dbWithRoomPowerLevels(),
+      userId,
+      {
+        type: 'm.room.message',
+        sender,
+        room_id: roomId,
+        content: { body: 'ordinary', msgtype: 'm.text' },
+      },
+      5
+    );
+    expect(normal).toMatchObject({ notify: true, actions: ['notify'] });
+  });
+
+  it('room mention highlights only when the sender meets notifications.room', async () => {
+    const roomMention = {
+      type: 'm.room.message',
+      sender,
+      room_id: roomId,
+      content: { body: 'attention all', msgtype: 'm.text', m: { mentions: { room: true } } },
+    };
+
+    const above = await evaluatePushRules(
+      dbWithRoomPowerLevels({ users: { [sender]: 50 }, notificationRoom: 50 }),
+      userId,
+      roomMention,
+      2
+    );
+    expect(above).toMatchObject({ notify: true, highlight: true });
+
+    const below = await evaluatePushRules(
+      dbWithRoomPowerLevels({ users: { [sender]: 49 }, notificationRoom: 50 }),
+      userId,
+      roomMention,
+      2
+    );
+    expect(below).toMatchObject({ notify: true, highlight: false });
   });
 });

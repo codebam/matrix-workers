@@ -139,8 +139,9 @@ function createPushDb(opts: {
                 sql.includes('ORDER BY priority ASC')
               ) {
                 const userId = args[0] as string;
+                const kind = args[1] as string | undefined;
                 const results = rules
-                  .filter((r) => r.user_id === userId)
+                  .filter((r) => r.user_id === userId && (!kind || r.kind === kind))
                   .sort((a, b) => a.priority - b.priority)
                   .map((r) => ({
                     kind: r.kind,
@@ -148,6 +149,7 @@ function createPushDb(opts: {
                     conditions: r.conditions,
                     actions: r.actions,
                     enabled: r.enabled,
+                    priority: r.priority,
                   }));
                 return { results } as { results: T[] };
               }
@@ -157,16 +159,16 @@ function createPushDb(opts: {
                 let rows = notifications.filter((n) => n.user_id === userId);
 
                 let argIdx = 1;
-                if (sql.includes('AND nq.id > ?')) {
+                if (sql.includes('AND nq.id < ?')) {
                   const since = args[argIdx++] as number;
-                  rows = rows.filter((n) => n.id > since);
+                  rows = rows.filter((n) => n.id < since);
                 }
                 if (sql.includes("notification_type = 'highlight'")) {
                   rows = rows.filter((n) => n.notification_type === 'highlight');
                 }
 
-                const limit = (args[argIdx] as number) ?? 20;
-                rows = [...rows].sort((a, b) => b.created_at - a.created_at).slice(0, limit);
+                const limit = (args[argIdx] as number) ?? 50;
+                rows = [...rows].sort((a, b) => b.id - a.id).slice(0, limit);
 
                 const results = rows.map((n) => ({
                   id: n.id,
@@ -297,7 +299,7 @@ function createPushDb(opts: {
                   priority: 0,
                 };
                 if (idx >= 0) {
-                  rules[idx] = { ...rules[idx], enabled, conditions, actions };
+                  rules[idx] = { ...rules[idx], enabled };
                 } else {
                   rules.push(row);
                 }
@@ -369,6 +371,22 @@ function createPushDb(opts: {
                   };
                 } else {
                   rules.push(row);
+                }
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+
+              if (sql.includes('UPDATE push_rules SET priority = priority - 1')) {
+                updates.push({ sql, args });
+                const [userId, kind, boundary] = args as [string, string, number];
+                const strict = sql.includes('priority < ?');
+                for (const r of rules) {
+                  if (
+                    r.user_id === userId &&
+                    r.kind === kind &&
+                    (strict ? r.priority < boundary : r.priority <= boundary)
+                  ) {
+                    r.priority -= 1;
+                  }
                 }
                 return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
@@ -3759,11 +3777,11 @@ describe('push leftovers lifecycles after #157', () => {
       seedNotification({ id: 2, created_at: 200, event_id: '$e2:example.com' }),
       seedNotification({ id: 3, created_at: 300, event_id: '$e3:example.com' })
     );
-    const page = await request(db, '/_matrix/client/v3/notifications?from=1&limit=2', authGet());
+    const page = await request(db, '/_matrix/client/v3/notifications?from=4&limit=2', authGet());
     expect(page.status).toBe(200);
     expect(page.body.notifications.length).toBeGreaterThan(0);
   });
-  it('lifecycle pusher append false replaces same pushkey', async () => {
+  it('lifecycle append false replaces only the same app_id', async () => {
     const db = createPushDb({
       pushers: [seedPusher({ pushkey: 'pk-append', app_id: 'a.old' })],
     });
@@ -3778,8 +3796,9 @@ describe('push leftovers lifecycles after #157', () => {
       })
     );
     expect(res.status).toBe(200);
-    expect(db.pushers.filter((p) => p.pushkey === 'pk-append')).toHaveLength(1);
-    expect(db.pushers[0].app_id).toBe('a.new');
+    expect(db.pushers).toHaveLength(2);
+    expect(db.pushers.find((p) => p.app_id === 'a.new')?.pushkey).toBe('pk-append');
+    expect(db.pushers.find((p) => p.app_id === 'a.old')?.pushkey).toBe('pk-append');
   });
   it('lifecycle default enabled override then list', async () => {
     const db = createPushDb();

@@ -141,8 +141,9 @@ function createPushDb(opts: {
                 sql.includes('ORDER BY priority ASC')
               ) {
                 const userId = args[0] as string;
+                const kind = args[1] as string | undefined;
                 const results = rules
-                  .filter((r) => r.user_id === userId)
+                  .filter((r) => r.user_id === userId && (!kind || r.kind === kind))
                   .sort((a, b) => a.priority - b.priority)
                   .map((r) => ({
                     kind: r.kind,
@@ -150,6 +151,7 @@ function createPushDb(opts: {
                     conditions: r.conditions,
                     actions: r.actions,
                     enabled: r.enabled,
+                    priority: r.priority,
                   }));
                 return { results } as { results: T[] };
               }
@@ -159,16 +161,16 @@ function createPushDb(opts: {
                 let rows = notifications.filter((n) => n.user_id === userId);
 
                 let argIdx = 1;
-                if (sql.includes('AND nq.id > ?')) {
+                if (sql.includes('AND nq.id < ?')) {
                   const since = args[argIdx++] as number;
-                  rows = rows.filter((n) => n.id > since);
+                  rows = rows.filter((n) => n.id < since);
                 }
                 if (sql.includes("notification_type = 'highlight'")) {
                   rows = rows.filter((n) => n.notification_type === 'highlight');
                 }
 
-                const limit = (args[argIdx] as number) ?? 20;
-                rows = [...rows].sort((a, b) => b.created_at - a.created_at).slice(0, limit);
+                const limit = (args[argIdx] as number) ?? 50;
+                rows = [...rows].sort((a, b) => b.id - a.id).slice(0, limit);
 
                 const results = rows.map((n) => ({
                   id: n.id,
@@ -200,6 +202,22 @@ function createPushDb(opts: {
                 for (let i = pushers.length - 1; i >= 0; i--) {
                   const p = pushers[i];
                   if (p.user_id === userId && p.pushkey === pushkey && p.app_id === appId) {
+                    pushers.splice(i, 1);
+                  }
+                }
+                return {
+                  success: true,
+                  meta: { changes: before - pushers.length, last_row_id: 0 },
+                };
+              }
+
+              if (sql.includes('DELETE FROM pushers WHERE user_id = ? AND app_id = ?')) {
+                deletes.push({ sql, args });
+                const [userId, appId] = args as [string, string];
+                const before = pushers.length;
+                for (let i = pushers.length - 1; i >= 0; i--) {
+                  const p = pushers[i];
+                  if (p.user_id === userId && p.app_id === appId) {
                     pushers.splice(i, 1);
                   }
                 }
@@ -299,7 +317,7 @@ function createPushDb(opts: {
                   priority: 0,
                 };
                 if (idx >= 0) {
-                  rules[idx] = { ...rules[idx], enabled, conditions, actions };
+                  rules[idx] = { ...rules[idx], enabled };
                 } else {
                   rules.push(row);
                 }
@@ -314,12 +332,13 @@ function createPushDb(opts: {
               ) {
                 // actions-only upsert
                 inserts.push({ sql, args });
-                const [userId, kind, ruleId, conditions, actions] = args as [
+                const [userId, kind, ruleId, conditions, actions, enabled] = args as [
                   string,
                   string,
                   string,
                   string | null,
                   string,
+                  number,
                 ];
                 const idx = rules.findIndex(
                   (r) => r.user_id === userId && r.kind === kind && r.rule_id === ruleId
@@ -333,7 +352,7 @@ function createPushDb(opts: {
                     rule_id: ruleId,
                     conditions,
                     actions,
-                    enabled: 1,
+                    enabled,
                     priority: 0,
                   });
                 }
@@ -371,6 +390,22 @@ function createPushDb(opts: {
                   };
                 } else {
                   rules.push(row);
+                }
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
+              }
+
+              if (sql.includes('UPDATE push_rules SET priority = priority - 1')) {
+                updates.push({ sql, args });
+                const [userId, kind, boundary] = args as [string, string, number];
+                const strict = sql.includes('priority < ?');
+                for (const r of rules) {
+                  if (
+                    r.user_id === userId &&
+                    r.kind === kind &&
+                    (strict ? r.priority < boundary : r.priority <= boundary)
+                  ) {
+                    r.priority -= 1;
+                  }
                 }
                 return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
@@ -674,7 +709,7 @@ describe('push POST /_matrix/client/v3/pushers/set', () => {
     }
   });
 
-  it('creates a pusher and replaces same pushkey when append is false', async () => {
+  it('append=false replaces the same app_id and leaves other apps alone', async () => {
     const db = createPushDb({
       pushers: [
         seedPusher({ pushkey: 'pk-new', app_id: 'old.app' }),
@@ -688,9 +723,15 @@ describe('push POST /_matrix/client/v3/pushers/set', () => {
     );
     expect(res.status).toBe(200);
     expect(res.body).toEqual({});
-    // old same-pushkey removed, other pushkey kept, new inserted
-    expect(db.pushers.map((p) => p.app_id).sort()).toEqual(['im.vector.app', 'keep.app']);
-    const created = db.pushers.find((p) => p.pushkey === 'pk-new');
+    // only the new app_id is replaced; pushers from other apps are kept
+    expect(db.pushers.map((p) => p.app_id).sort()).toEqual([
+      'im.vector.app',
+      'keep.app',
+      'old.app',
+    ]);
+    const created = db.pushers.find(
+      (p) => p.pushkey === 'pk-new' && p.app_id === VALID_PUSHER_BODY.app_id
+    );
     expect(created).toMatchObject({
       kind: 'http',
       app_display_name: 'Element',
@@ -1104,25 +1145,43 @@ describe('push PUT /_matrix/client/v3/pushrules/:scope/:kind/:ruleId', () => {
     expect(JSON.parse(db.rules[0].actions)).toEqual(['notify']);
   });
 
-  it('sets priority from Date.now when before/after query params present', async () => {
-    vi.spyOn(Date, 'now').mockReturnValue(1_234_567_890);
-    const db = createPushDb();
-    const res = await request(
+  it('places new rules adjacent to the named rule using before/after', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ rule_id: 'first', priority: 10 }),
+        seedRule({ rule_id: 'target', priority: 5 }),
+        seedRule({ rule_id: 'last', priority: 0 }),
+      ],
+    });
+    const beforeRes = await request(
       db,
-      '/_matrix/client/v3/pushrules/global/override/ordered?before=other',
+      '/_matrix/client/v3/pushrules/global/override/new-before?before=target',
       jsonInit('PUT', { actions: ['notify'] })
     );
-    expect(res.status).toBe(200);
-    expect(db.rules[0].priority).toBe(1_234_567_890);
+    expect(beforeRes.status).toBe(200);
+    expect(db.rules.map((r) => [r.rule_id, r.priority])).toEqual([
+      ['first', 10],
+      ['target', 4],
+      ['last', -1],
+      ['new-before', 5],
+    ]);
 
-    const res2 = await request(
+    const afterRes = await request(
       db,
-      '/_matrix/client/v3/pushrules/global/override/ordered2?after=x',
+      '/_matrix/client/v3/pushrules/global/override/new-after?after=target',
       jsonInit('PUT', { actions: ['dont_notify'] })
     );
-    expect(res2.status).toBe(200);
-    expect(db.rules[1].priority).toBe(1_234_567_890);
-    vi.restoreAllMocks();
+    expect(afterRes.status).toBe(200);
+    expect(db.rules.map((r) => [r.rule_id, r.priority])).toEqual([
+      ['first', 10],
+      ['target', 4],
+      ['last', -2],
+      ['new-before', 5],
+      ['new-after', 3],
+    ]);
+    // Descending priority is the emitted order: new-before, target, new-after, last.
+    const storedOrder = [...db.rules].sort((a, b) => b.priority - a.priority).map((r) => r.rule_id);
+    expect(storedOrder).toEqual(['first', 'new-before', 'target', 'new-after', 'last']);
   });
 
   it('decodes URL-encoded rule id on create', async () => {
@@ -1266,6 +1325,30 @@ describe('push PUT .../enabled', () => {
     expect(db.rules[0].enabled).toBe(0);
   });
 
+  it('PUT enabled preserves custom actions and conditions on a default override', async () => {
+    const conditions = [{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }];
+    const actions = ['notify', { set_tweak: 'highlight', value: true }];
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: '.m.rule.suppress_notices',
+          enabled: 1,
+          conditions: JSON.stringify(conditions),
+          actions: JSON.stringify(actions),
+        }),
+      ],
+    });
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.suppress_notices/enabled',
+      jsonInit('PUT', { enabled: false })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rules[0].enabled).toBe(0);
+    expect(JSON.parse(db.rules[0].conditions!)).toEqual(conditions);
+    expect(JSON.parse(db.rules[0].actions)).toEqual(actions);
+  });
+
   it('returns 404 for unknown default rule id', async () => {
     const db = createPushDb();
     const res = await request(
@@ -1349,6 +1432,47 @@ describe('push PUT .../actions', () => {
       expect(res.status).toBe(400);
       expect(res.body.errcode).toBe('M_MISSING_PARAM');
     }
+  });
+
+  it('PUT actions on the default master rule does not re-enable it', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.master/actions',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(res.status).toBe(200);
+    expect(db.rules).toHaveLength(1);
+    expect(db.rules[0].enabled).toBe(0);
+    const get = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.master',
+      authGet()
+    );
+    expect(get.body.enabled).toBe(false);
+    expect(get.body.actions).toEqual(['dont_notify']);
+  });
+
+  it('PUT actions preserves enabled and conditions of a disabled custom rule', async () => {
+    const conditions = [{ kind: 'event_match', key: 'type', pattern: 'm.room.message' }];
+    const db = createPushDb({
+      rules: [
+        seedRule({
+          rule_id: 'custom.disabled',
+          enabled: 0,
+          conditions: JSON.stringify(conditions),
+          actions: JSON.stringify(['notify']),
+        }),
+      ],
+    });
+    await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/custom.disabled/actions',
+      jsonInit('PUT', { actions: ['dont_notify'] })
+    );
+    expect(db.rules[0].enabled).toBe(0);
+    expect(JSON.parse(db.rules[0].conditions!)).toEqual(conditions);
+    expect(JSON.parse(db.rules[0].actions)).toEqual(['dont_notify']);
   });
 
   it('updates actions for an existing custom rule and preserves conditions', async () => {
@@ -1520,25 +1644,25 @@ describe('push GET /_matrix/client/v3/notifications', () => {
     });
     const res = await request(
       db,
-      '/_matrix/client/v3/notifications?only=highlight&from=1&limit=10',
+      '/_matrix/client/v3/notifications?only=highlight&from=4&limit=10',
       authGet()
     );
     expect(res.status).toBe(200);
     expect(res.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
       ['$h3', '$h2']
     );
-    // next_token is last row in result order (DESC by created_at) → id 2
+    // next_token is the last id in the descending page → id 2
     expect(res.body.next_token).toBe('2');
   });
 
-  it('ignores non-numeric from and defaults limit to 20', async () => {
-    const many = Array.from({ length: 25 }, (_, i) =>
+  it('ignores non-numeric from and defaults limit to 50', async () => {
+    const many = Array.from({ length: 55 }, (_, i) =>
       seedNotification({ id: i + 1, created_at: 1000 + i, event_id: `$e${i + 1}` })
     );
     const db = createPushDb({ notifications: many });
     const res = await request(db, '/_matrix/client/v3/notifications?from=abc', authGet());
     expect(res.status).toBe(200);
-    expect(res.body.notifications).toHaveLength(20);
+    expect(res.body.notifications).toHaveLength(50);
   });
 
   it('caps limit at 100', async () => {
@@ -1704,6 +1828,7 @@ describe('push API TOKENMAXX integration leftovers after #100/#101', () => {
     for (const id of [
       '.m.rule.master',
       '.m.rule.suppress_notices',
+      '.m.rule.suppress_edits',
       '.m.rule.invite_for_me',
       '.m.rule.member_event',
       '.m.rule.is_user_mention',
@@ -1725,6 +1850,26 @@ describe('push API TOKENMAXX integration leftovers after #100/#101', () => {
     ]) {
       expect(underrideIds).toContain(id);
     }
+  });
+
+  it('default .m.rule.suppress_edits has empty actions and edit-only conditions', async () => {
+    const db = createPushDb();
+    const res = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.suppress_edits',
+      authGet()
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      rule_id: '.m.rule.suppress_edits',
+      default: true,
+      enabled: true,
+      actions: [],
+      conditions: [
+        { kind: 'event_match', key: 'type', pattern: 'm.room.message' },
+        { kind: 'event_match', key: 'content.m.new_content', pattern: '*' },
+      ],
+    });
   });
 
   it('default .m.rule.is_room_mention and tombstone actions include highlight tweak', async () => {
@@ -2013,7 +2158,7 @@ describe('pushers SET — falsy required fields + delete isolation + append matr
     expect(db.deletes[0].args).toEqual([USER, 'pk-x', '']);
   });
 
-  it('append:false deletes same pushkey across app_ids then inserts', async () => {
+  it('append:false deletes only this app_id, keeping other apps with the same pushkey', async () => {
     const db = createPushDb({
       pushers: [
         seedPusher({ pushkey: 'shared', app_id: 'a1' }),
@@ -2033,11 +2178,13 @@ describe('pushers SET — falsy required fields + delete isolation + append matr
     );
     expect(db.pushers.map((p) => `${p.pushkey}:${p.app_id}`).sort()).toEqual([
       'other:a1',
+      'shared:a1',
+      'shared:a2',
       'shared:a3',
     ]);
   });
 
-  it('append truthiness: append:0 still deletes same pushkey (falsy)', async () => {
+  it('append truthiness: append:0 still replaces the same app_id (falsy)', async () => {
     const db = createPushDb({
       pushers: [seedPusher({ pushkey: 'pk-new', app_id: 'old.app' })],
     });
@@ -2046,8 +2193,11 @@ describe('pushers SET — falsy required fields + delete isolation + append matr
       '/_matrix/client/v3/pushers/set',
       jsonInit('POST', { ...VALID_PUSHER_BODY, append: 0 as unknown as boolean })
     );
-    expect(db.pushers).toHaveLength(1);
-    expect(db.pushers[0].app_id).toBe(VALID_PUSHER_BODY.app_id);
+    expect(db.pushers).toHaveLength(2);
+    expect(db.pushers.map((p) => p.app_id).sort()).toEqual([
+      VALID_PUSHER_BODY.app_id,
+      'old.app',
+    ]);
   });
 
   it('append:true keeps different app_id same pushkey and adds another', async () => {
@@ -2300,6 +2450,7 @@ describe('pushrules GET :scope/:kind/:ruleId — kind vocab + decode leftovers',
     const ids = [
       '.m.rule.master',
       '.m.rule.suppress_notices',
+      '.m.rule.suppress_edits',
       '.m.rule.invite_for_me',
       '.m.rule.member_event',
       '.m.rule.is_user_mention',
@@ -2438,22 +2589,38 @@ describe('pushrules PUT create — kinds / pattern / conditions / priority lefto
     expect(res.body.errcode).toBe('M_CANNOT_OVERWRITE_DEFAULT');
   });
 
-  it('before=x alone and after=y alone both set priority to Date.now()', async () => {
-    const db = createPushDb();
-    const t0 = Date.now();
+  it('before= alone inserts immediately ahead of the named rule', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ rule_id: 'target', priority: 7 }),
+        seedRule({ rule_id: 'follower', priority: 6 }),
+      ],
+    });
     await request(
       db,
-      '/_matrix/client/v3/pushrules/global/override/p1?before=other',
+      '/_matrix/client/v3/pushrules/global/override/p1?before=target',
       jsonInit('PUT', { actions: ['notify'] })
     );
+    expect(db.rules.find((r) => r.rule_id === 'p1')!.priority).toBe(7);
+    expect(db.rules.find((r) => r.rule_id === 'target')!.priority).toBe(6);
+    expect(db.rules.find((r) => r.rule_id === 'follower')!.priority).toBe(5);
+  });
+
+  it('after= alone inserts immediately behind the named rule', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ rule_id: 'target', priority: 7 }),
+        seedRule({ rule_id: 'follower', priority: 6 }),
+      ],
+    });
     await request(
       db,
-      '/_matrix/client/v3/pushrules/global/override/p2?after=other',
+      '/_matrix/client/v3/pushrules/global/override/p2?after=target',
       jsonInit('PUT', { actions: ['dont_notify'] })
     );
-    const t1 = Date.now();
-    expect(db.rules.find((r) => r.rule_id === 'p1')!.priority).toBeGreaterThanOrEqual(t0);
-    expect(db.rules.find((r) => r.rule_id === 'p2')!.priority).toBeLessThanOrEqual(t1);
+    expect(db.rules.find((r) => r.rule_id === 'target')!.priority).toBe(7);
+    expect(db.rules.find((r) => r.rule_id === 'p2')!.priority).toBe(6);
+    expect(db.rules.find((r) => r.rule_id === 'follower')!.priority).toBe(5);
   });
 
   it('empty before=/after= query values are falsy → priority stays 0', async () => {
@@ -2479,17 +2646,18 @@ describe('pushrules PUT create — kinds / pattern / conditions / priority lefto
   it('ON CONFLICT updates conditions/actions/priority and keeps enabled', async () => {
     const db = createPushDb({
       rules: [
+        seedRule({ rule_id: 'target', priority: 5 }),
         seedRule({
           rule_id: 'upd',
           enabled: 0,
-          priority: 5,
+          priority: 0,
           actions: JSON.stringify(['dont_notify']),
         }),
       ],
     });
     await request(
       db,
-      '/_matrix/client/v3/pushrules/global/override/upd?before=x',
+      '/_matrix/client/v3/pushrules/global/override/upd?before=target',
       jsonInit('PUT', {
         actions: ['notify'],
         conditions: [{ kind: 'contains_display_name' }],
@@ -2499,7 +2667,8 @@ describe('pushrules PUT create — kinds / pattern / conditions / priority lefto
     expect(row.enabled).toBe(0); // UPDATE SET does not touch enabled
     expect(JSON.parse(row.actions)).toEqual(['notify']);
     expect(JSON.parse(row.conditions!)).toEqual([{ kind: 'contains_display_name' }]);
-    expect(row.priority).toBeGreaterThan(5);
+    expect(row.priority).toBe(5);
+    expect(db.rules.find((r) => r.rule_id === 'target')!.priority).toBe(4);
   });
 
   it('PUT bind contract includes userId/kind/ruleId/conditions/actions/priority', async () => {
@@ -2840,7 +3009,7 @@ describe('notifications GET — limit/from/only/shape leftovers', () => {
     const db = createPushDb({
       notifications: [seedNotification({ id: 5 })],
     });
-    const res = await request(db, '/_matrix/client/v3/notifications?from=99', authGet());
+    const res = await request(db, '/_matrix/client/v3/notifications?from=5', authGet());
     expect(res.body.notifications).toEqual([]);
     expect(res.body.next_token).toBeUndefined();
   });
@@ -2869,7 +3038,7 @@ describe('notifications GET — limit/from/only/shape leftovers', () => {
     expect(res.body.notifications[0].read).toBe(false);
   });
 
-  it('orders by created_at DESC independent of id order', async () => {
+  it('orders by id DESC independent of created_at order', async () => {
     const db = createPushDb({
       notifications: [
         seedNotification({ id: 10, created_at: 100, event_id: '$old' }),
@@ -2879,9 +3048,9 @@ describe('notifications GET — limit/from/only/shape leftovers', () => {
     });
     const res = await request(db, '/_matrix/client/v3/notifications', authGet());
     expect(res.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
-      ['$new', '$mid', '$old']
+      ['$mid', '$new', '$old']
     );
-    // next_token is last in result order → oldest among page
+    // next_token is the last id in the descending page → id 10
     expect(res.body.next_token).toBe('10');
   });
 
@@ -2911,7 +3080,7 @@ describe('notifications GET — limit/from/only/shape leftovers', () => {
       authGet()
     );
     const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
-    expect(sel!.sql).toContain('nq.id > ?');
+    expect(sel!.sql).toContain('nq.id < ?');
     expect(sel!.sql).toContain("notification_type = 'highlight'");
     expect(sel?.args).toEqual([USER, 1, 10]);
   });
@@ -3519,15 +3688,14 @@ describe('notifications — pagination chain leftovers', () => {
     // last in page is id 3
     expect(page1.body.next_token).toBe('3');
 
-    // from=3 means id > 3 → only id 4, but order DESC → $d only (already seen)
-    // Spec-wise clients use opaque tokens; this server interprets as id cursor
+    // from=3 means id < 3 → older ids 2 and 1 (no repeats)
     const page2 = await request(
       db,
       `/_matrix/client/v3/notifications?limit=2&from=${page1.body.next_token}`,
       authGet()
     );
     expect(page2.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
-      ['$d']
+      ['$b', '$a']
     );
   });
 
@@ -3547,13 +3715,13 @@ describe('notifications — pagination chain leftovers', () => {
     expect(res.body.next_token).toBeUndefined();
   });
 
-  it('default limit 20 when limit omitted', async () => {
-    const many = Array.from({ length: 25 }, (_, i) =>
+  it('default limit 50 when limit omitted', async () => {
+    const many = Array.from({ length: 55 }, (_, i) =>
       seedNotification({ id: i + 1, created_at: i, event_id: `$e${i}` })
     );
     const db = createPushDb({ notifications: many });
     const res = await request(db, '/_matrix/client/v3/notifications', authGet());
-    expect(res.body.notifications).toHaveLength(20);
+    expect(res.body.notifications).toHaveLength(50);
   });
 
   it('ts and origin_server_ts both equal created_at', async () => {
@@ -3705,7 +3873,7 @@ describe('pushers SET — concurrent same-pushkey app_ids leftovers', () => {
     vi.restoreAllMocks();
   });
 
-  it('append:false after multi-app same pushkey leaves only the new insert', async () => {
+  it('append:false after multi-app same pushkey replaces only the matching app', async () => {
     const db = createPushDb({
       pushers: [
         seedPusher({ pushkey: 'pk', app_id: 'a' }),
@@ -3725,6 +3893,8 @@ describe('pushers SET — concurrent same-pushkey app_ids leftovers', () => {
     );
     expect(db.pushers.map((p) => `${p.pushkey}:${p.app_id}`).sort()).toEqual([
       'other:a',
+      'pk:a',
+      'pk:b',
       'pk:c',
     ]);
   });
@@ -3843,15 +4013,21 @@ describe('pushrules PUT — conditions-only kinds without pattern leftovers', ()
     }
   );
 
-  it('both before and after query params still set a single Date.now priority', async () => {
-    const db = createPushDb();
-    const t0 = Date.now();
+  it('before wins when both before and after query params are given', async () => {
+    const db = createPushDb({
+      rules: [
+        seedRule({ rule_id: 'a', priority: 3 }),
+        seedRule({ rule_id: 'b', priority: 1 }),
+      ],
+    });
     await request(
       db,
       '/_matrix/client/v3/pushrules/global/override/both?before=a&after=b',
       jsonInit('PUT', { actions: ['notify'] })
     );
-    expect(db.rules[0].priority).toBeGreaterThanOrEqual(t0);
+    expect(db.rules.find((r) => r.rule_id === 'both')!.priority).toBe(3);
+    expect(db.rules.find((r) => r.rule_id === 'a')!.priority).toBe(2);
+    expect(db.rules.find((r) => r.rule_id === 'b')!.priority).toBe(0);
   });
 
   it('re-PUT same rule id updates actions without duplicating rows', async () => {
@@ -3883,7 +4059,7 @@ describe('notifications Math.min limit leftovers', () => {
     expect(b.body.notifications).toHaveLength(100);
   });
 
-  it('from with highlight filter uses id cursor after type filter', async () => {
+  it('from with highlight filter returns older highlights by id cursor', async () => {
     const db = createPushDb({
       notifications: [
         seedNotification({ id: 1, notification_type: 'highlight', created_at: 1 }),
@@ -3903,11 +4079,11 @@ describe('notifications Math.min limit leftovers', () => {
     });
     const res = await request(
       db,
-      '/_matrix/client/v3/notifications?only=highlight&from=1',
+      '/_matrix/client/v3/notifications?only=highlight&from=4',
       authGet()
     );
     expect(res.body.notifications.map((n: { event: { event_id: string } }) => n.event.event_id)).toEqual(
-      ['$h3']
+      ['$h3', EVENT]
     );
   });
 
@@ -4047,7 +4223,7 @@ describe('notifications from parse leftovers', () => {
     const res = await request(db, '/_matrix/client/v3/notifications?from=', authGet());
     expect(res.body.notifications).toHaveLength(2);
     const sel = db.selects.find((s) => s.sql.includes('notification_queue'));
-    expect(sel!.sql).not.toContain('nq.id > ?');
+    expect(sel!.sql).not.toContain('nq.id < ?');
   });
 
   it('from=-1 parses to -1 which is not >0 → no cursor filter', async () => {
@@ -4145,7 +4321,7 @@ describe('pushers SET — bind delete vs insert SQL leftovers', () => {
     vi.restoreAllMocks();
   });
 
-  it('append:false issues DELETE pushkey then INSERT', async () => {
+  it('append:false issues DELETE app_id then INSERT', async () => {
     const db = createPushDb({
       pushers: [seedPusher({ pushkey: VALID_PUSHER_BODY.pushkey, app_id: 'old' })],
     });
@@ -4154,9 +4330,13 @@ describe('pushers SET — bind delete vs insert SQL leftovers', () => {
       '/_matrix/client/v3/pushers/set',
       jsonInit('POST', { ...VALID_PUSHER_BODY, append: false })
     );
-    expect(db.deletes.some((d) => d.sql.includes('DELETE FROM pushers') && d.args[1] === VALID_PUSHER_BODY.pushkey)).toBe(
-      true
-    );
+    expect(
+      db.deletes.some(
+        (d) =>
+          d.sql.includes('DELETE FROM pushers WHERE user_id = ? AND app_id = ?') &&
+          d.args[1] === VALID_PUSHER_BODY.app_id
+      )
+    ).toBe(true);
     expect(db.inserts.some((i) => i.sql.includes('INSERT INTO pushers'))).toBe(true);
   });
 
@@ -4253,6 +4433,8 @@ describe('push leftovers after #131 — pushers field + append matrix', () => {
     );
     expect(db.pushers.map((p) => `${p.pushkey}:${p.app_id}`).sort()).toEqual([
       'other:a',
+      'pk:a',
+      'pk:b',
       'pk:c',
     ]);
   });

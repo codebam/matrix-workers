@@ -264,9 +264,10 @@ function createPushDb(
                 sql.includes('ORDER BY priority ASC')
               ) {
                 const userId = args[0] as string;
+                const kind = args[1] as string | undefined;
                 rulesAllCount += 1;
                 const snapshot = rules
-                  .filter((r) => r.user_id === userId)
+                  .filter((r) => r.user_id === userId && (!kind || r.kind === kind))
                   .sort((a, b) => a.priority - b.priority)
                   .map((r) => ({
                     kind: r.kind,
@@ -274,6 +275,7 @@ function createPushDb(
                     conditions: r.conditions,
                     actions: r.actions,
                     enabled: r.enabled,
+                    priority: r.priority,
                   }));
                 if (mutateRules && rulesAllCount === mutateRules.after) {
                   rules.splice(0, rules.length, ...mutateRules.next);
@@ -286,15 +288,15 @@ function createPushDb(
                 const userId = args[0] as string;
                 let rows = notifications.filter((n) => n.user_id === userId);
                 let argIdx = 1;
-                if (sql.includes('AND nq.id > ?')) {
+                if (sql.includes('AND nq.id < ?')) {
                   const since = args[argIdx++] as number;
-                  rows = rows.filter((n) => n.id > since);
+                  rows = rows.filter((n) => n.id < since);
                 }
                 if (sql.includes("notification_type = 'highlight'")) {
                   rows = rows.filter((n) => n.notification_type === 'highlight');
                 }
-                const limit = (args[argIdx] as number) ?? 20;
-                rows = [...rows].sort((a, b) => b.created_at - a.created_at).slice(0, limit);
+                const limit = (args[argIdx] as number) ?? 50;
+                rows = [...rows].sort((a, b) => b.id - a.id).slice(0, limit);
                 const results = rows.map((n) => ({
                   id: n.id,
                   room_id: n.room_id,
@@ -339,6 +341,26 @@ function createPushDb(
                 for (let i = pushers.length - 1; i >= 0; i--) {
                   const p = pushers[i];
                   if (p.user_id === userId && p.pushkey === pushkey && p.app_id === appId) {
+                    pushers.splice(i, 1);
+                  }
+                }
+                return {
+                  success: true,
+                  meta: { changes: before - pushers.length, last_row_id: 0 },
+                };
+              }
+
+              if (sql.includes('DELETE FROM pushers WHERE user_id = ? AND app_id = ?')) {
+                deletes.push({ sql, args });
+                deleteCount += 1;
+                if (opts.failDeleteAfter !== undefined && deleteCount > opts.failDeleteAfter) {
+                  throw new Error('d1-delete-fail');
+                }
+                const [userId, appId] = args as [string, string];
+                const before = pushers.length;
+                for (let i = pushers.length - 1; i >= 0; i--) {
+                  const p = pushers[i];
+                  if (p.user_id === userId && p.app_id === appId) {
                     pushers.splice(i, 1);
                   }
                 }
@@ -445,7 +467,7 @@ function createPushDb(
                   enabled,
                   priority: 0,
                 };
-                if (idx >= 0) rules[idx] = { ...rules[idx], enabled, conditions, actions };
+                if (idx >= 0) rules[idx] = { ...rules[idx], enabled };
                 else rules.push(row);
                 return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
@@ -461,12 +483,13 @@ function createPushDb(
                 if (opts.failInsertAfter !== undefined && insertCount > opts.failInsertAfter) {
                   throw new Error('d1-insert-fail');
                 }
-                const [userId, kind, ruleId, conditions, actions] = args as [
+                const [userId, kind, ruleId, conditions, actions, enabled] = args as [
                   string,
                   string,
                   string,
                   string | null,
                   string,
+                  number,
                 ];
                 const idx = rules.findIndex(
                   (r) => r.user_id === userId && r.kind === kind && r.rule_id === ruleId
@@ -479,7 +502,7 @@ function createPushDb(
                     rule_id: ruleId,
                     conditions,
                     actions,
-                    enabled: 1,
+                    enabled,
                     priority: 0,
                   });
                 }
@@ -553,6 +576,26 @@ function createPushDb(
                   content: JSON.stringify({ body: 'hi', msgtype: 'm.text' }),
                 });
                 return { success: true, meta: { changes: 1, last_row_id: id } };
+              }
+
+              if (sql.includes('UPDATE push_rules SET priority = priority - 1')) {
+                updates.push({ sql, args });
+                updateCount += 1;
+                if (opts.failUpdateAfter !== undefined && updateCount > opts.failUpdateAfter) {
+                  throw new Error('d1-update-fail');
+                }
+                const [userId, kind, boundary] = args as [string, string, number];
+                const strict = sql.includes('priority < ?');
+                for (const r of rules) {
+                  if (
+                    r.user_id === userId &&
+                    r.kind === kind &&
+                    (strict ? r.priority < boundary : r.priority <= boundary)
+                  ) {
+                    r.priority -= 1;
+                  }
+                }
+                return { success: true, meta: { changes: 1, last_row_id: 0 } };
               }
 
               if (
@@ -825,7 +868,7 @@ describe('race pushers SET DELETE→INSERT run barrier TOCTOU after #206', () =>
 describe('race pushers GET∥SET mid-flight + ALL mutate TOCTOU after #206', () => {
   it('GET mid-flight while SET held at INSERT barrier sees pre-insert state', async () => {
     const db = createPushDb({
-      pushers: [seedPusher({ pushkey: 'pk-old' })],
+      pushers: [seedPusher({ pushkey: 'pk-old', app_id: 'org.old.app' })],
       runBarrier: {
         count: 2,
         match: (sql) => sql.includes('INSERT INTO pushers'),
@@ -839,7 +882,7 @@ describe('race pushers GET∥SET mid-flight + ALL mutate TOCTOU after #206', () 
     for (let n = 0; n < 40 && db.deletes.length < 1; n++) {
       await Promise.resolve();
     }
-    // Non-append SET deletes by pushkey first; INSERT then waits on barrier
+    // Non-append SET deletes by app_id first; INSERT then waits on barrier
     expect(db.deletes.length).toBeGreaterThanOrEqual(1);
     expect(db.inserts).toHaveLength(0);
 
@@ -1748,7 +1791,7 @@ describe('push concurrent SQL bind contracts after #206', () => {
     expect(del?.args).toEqual([USER, 'pk-del', 'app.del']);
   });
 
-  it('non-append SET deletes by pushkey before insert', async () => {
+  it('non-append SET deletes by app_id before insert', async () => {
     const db = createPushDb({
       pushers: [seedPusher({ pushkey: 'pk-na', app_id: 'old.app' })],
     });
@@ -1757,8 +1800,14 @@ describe('push concurrent SQL bind contracts after #206', () => {
       '/_matrix/client/v3/pushers/set',
       jsonInit('POST', pusherBody({ pushkey: 'pk-na', app_id: 'new.app' }))
     );
-    expect(db.deletes.some((c) => c.sql.includes('DELETE FROM pushers WHERE user_id = ? AND pushkey = ?') && !c.sql.includes('app_id'))).toBe(true);
-    expect(db.pushers.some((p) => p.app_id === 'old.app')).toBe(false);
+    expect(
+      db.deletes.some(
+        (c) =>
+          c.sql.includes('DELETE FROM pushers WHERE user_id = ? AND app_id = ?') &&
+          c.args[1] === 'new.app'
+      )
+    ).toBe(true);
+    expect(db.pushers.some((p) => p.app_id === 'old.app')).toBe(true);
     expect(db.pushers.some((p) => p.app_id === 'new.app')).toBe(true);
   });
 

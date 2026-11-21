@@ -3010,10 +3010,10 @@ describe('oauth leftovers base64Url soft padding reliability', () => {
 });
 
 describe('push leftovers matchesCondition sender_notification soft', () => {
-  it('sender_notification_permission always true regardless of event', () => {
+  it('sender_notification_permission fails closed without room permission context', () => {
     expect(
       matchesCondition({ kind: 'sender_notification_permission' }, {}, USER, 0)
-    ).toBe(true);
+    ).toBe(false);
     expect(
       matchesCondition(
         { kind: 'sender_notification_permission', key: 'room' },
@@ -3021,7 +3021,7 @@ describe('push leftovers matchesCondition sender_notification soft', () => {
         USER,
         99
       )
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it('unknown kinds remain vacuous true (soft default)', () => {

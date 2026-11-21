@@ -1180,8 +1180,8 @@ describe('oauth identity leftovers push matchesCondition soft operator flood aft
     expect(matchesCondition({ kind: 'totally_unknown' as any }, event, USER, 2)).toBe(true);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 });
 
@@ -6481,13 +6481,17 @@ describe('oauth identity leftovers push matchesCondition soft reliability after 
     ).toBe(true);
   });
 
-  for (const kind of ['future_kind', 'sender_notification_permission']) {
-    it(`condition kind soft defaultish ${kind}`, () => {
-      const r = matchesCondition({ kind: kind as any }, event, USER, 2);
-      expect(typeof r).toBe('boolean');
-      expect(r).toBe(true);
-    });
-  }
+  it('condition kind soft defaultish future_kind', () => {
+    const r = matchesCondition({ kind: 'future_kind' as any }, event, USER, 2);
+    expect(typeof r).toBe('boolean');
+    expect(r).toBe(true);
+  });
+
+  it('condition kind soft defaultish sender_notification_permission fails closed', () => {
+    const r = matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2);
+    expect(typeof r).toBe('boolean');
+    expect(r).toBe(false);
+  });
 });
 
 describe('oauth identity leftovers push matchesRule evaluate soft after #151', () => {
@@ -8799,8 +8803,8 @@ describe('oauth identity leftovers push condition soft flood round-3 after #151'
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('event_property_is soft boolean and missing key', () => {
@@ -12601,8 +12605,8 @@ describe('oauth identity leftovers push condition soft flood round-6 after #160'
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('unknown condition kind soft true', () => {
@@ -13930,8 +13934,8 @@ describe('oauth identity leftovers push condition soft flood round-7 after #160'
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('unknown condition kind soft true', () => {
@@ -15260,8 +15264,8 @@ describe('oauth identity leftovers push condition soft flood round-8 after #160'
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('unknown condition kind soft true', () => {
@@ -16590,8 +16594,8 @@ describe('oauth identity leftovers push condition soft flood round-9 after #160'
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('unknown condition kind soft true', () => {
@@ -17920,8 +17924,8 @@ describe('oauth identity leftovers push condition soft flood round-10 after #160
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('unknown condition kind soft true', () => {
@@ -19250,8 +19254,8 @@ describe('oauth identity leftovers push condition soft flood round-11 after #160
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('unknown condition kind soft true', () => {
@@ -20580,8 +20584,8 @@ describe('oauth identity leftovers push condition soft flood round-12 after #160
     ).toBe(false);
   });
 
-  it('sender_notification_permission soft always true', () => {
-    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(true);
+  it('sender_notification_permission without room permission context fails closed', () => {
+    expect(matchesCondition({ kind: 'sender_notification_permission' }, event, USER, 2)).toBe(false);
   });
 
   it('unknown condition kind soft true', () => {
