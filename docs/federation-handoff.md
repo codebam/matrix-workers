@@ -111,11 +111,12 @@ the history fetch. (User deferred rejoining #gaming:nixos.org.)
    the join) and stores oldest-first; a re-join of that room pulls history.
 
 ## Known minor gaps (documented, not blocking)
-- **Join/send race:** the client /join returns 200 while RoomJoinWorkflow
-  completes make_join/send_join (~3-4s later). Messages a resident sends in
-  that window never fan out (dev wasn't a destination yet). Synapse blocks
-  until the handshake completes. Repro scripts now wait; a product fix would
-  make /join await the workflow or re-sweep recent events on send_join.
+- **Join/send race — FIXED (`315153c`, deployed 2026-11-21):** the client /join
+  still returns 200 while RoomJoinWorkflow runs the handshake, but the durable
+  `resweep-recent-events` step now runs after `store-remote-state` registers
+  the joined remote members, covering the whole /join → send_join → state-sync
+  window; resident messages sent in that window are re-swept and fan out.
+  Repro scripts still wait on the join (Synapse blocks until it completes).
 - Repro artifacts: several `fed repro`/`fed clean repro` rooms on prod, plus
   dev test rooms with pre-fix phantom state — harmless; fresh repros mint new
   rooms.
@@ -567,9 +568,10 @@ verified. Full suite green after the wave: 45,569/45,569 (351 files).
   required_state, state_after), getEventsSince/getRoomEvents (so
   /messages), /context, /rooms/:id/event. The original `content` column
   is untouched — federation hashes/signatures stay valid over it.
-  Known remainder: stripped-state invites and relation/thread listings
-  still read raw content; redaction events themselves are not yet
-  federated outbound from performRedaction (pre-existing).
+  Client-facing reads now prefer pruned content everywhere covered here:
+  relation/thread listings were already fixed, and stripped-state invites
+  were fixed in `3185021`. Redaction events themselves are federated
+  outbound from performRedaction (fixed in `7bd715a`).
 - **Policy servers (MSC4284, spec v1.18) — the big module**:
   - src/services/policy-server.ts: config parsing (m.room.policy with
     `via` + `public_keys.ed25519`, empty state key only), the joined-
