@@ -8,7 +8,7 @@
 //   SignalRequest.offer / add_track              -> POST /sessions/{id}/tracks/new (local)
 //   SignalResponse.track_published               -> synthesized TrackInfo for the client
 //   SignalRequest.subscription                   -> POST /sessions/{id}/tracks/new (remote)
-//   join (subscriber PC)                         -> POST /sessions/{id}/tracks/new (empty) -> offer
+//   join (subscriber PC)                         -> POST /sessions/{id}/datachannels/establish -> offer
 //   SignalResponse.offer / SignalRequest.answer  -> subscriber negotiation + /renegotiate
 //
 // Wire details verified against livekit/protocol livekit_rtc.proto and
@@ -31,6 +31,7 @@ import {
   addTracks,
   closeTracks,
   createSession,
+  establishDataChannelTransport,
   renegotiate,
   type SessionDescription,
   type TrackObject,
@@ -994,8 +995,8 @@ export class LiveKitCallsShimSession {
       // session closes, so a call with muted participants appears 1:1.
       this.broadcastUpdate();
       // With subscriberPrimary=false the SDK creates a subscriber PC but waits
-      // for the server to drive negotiation. Calls only sends an SFU offer via
-      // tracks/new, so start that exchange before any subscription arrives.
+      // for the server to drive negotiation. Calls sends an SFU offer via
+      // datachannels/establish, so start that before any subscription arrives.
       // A bare upgrade without JoinRequest is a legacy socket with no PC to
       // drive, so it keeps the original publisher-only session count.
       if (joinRequest.hasJoinRequest !== false) {
@@ -1062,9 +1063,9 @@ export class LiveKitCallsShimSession {
   }
 
   /**
-   * Open the subscriber PC with a Calls-generated offer. `tracks: []` asks the
-   * SFU to produce an offer without any published publications; whatever
-   * transport m-lines Calls returns are forwarded to the SDK verbatim.
+   * Open the subscriber PC with a Calls-generated transport-only offer.
+   * `datachannels/establish` produces an m=application offer with no media
+   * tracks; `{ tracks: [] }` is rejected by Calls with HTTP 406.
    */
   private async startSubscriberOffer(): Promise<void> {
     const p = this.participant;
@@ -1075,8 +1076,14 @@ export class LiveKitCallsShimSession {
       return;
     }
     await this.enqueue('subscriber', async () => {
-      const response = await addTracks(this.env, p.subscriberSessionId!, { tracks: [] });
-      const offer = response.sessionDescription;
+      let offer: SessionDescription | undefined;
+      try {
+        offer = await establishDataChannelTransport(this.env, p.subscriberSessionId!);
+      } catch (error) {
+        console.warn('[livekit-shim] datachannels/establish failed; falling back to empty tracks:', error);
+        const response = await addTracks(this.env, p.subscriberSessionId!, { tracks: [] });
+        offer = response.sessionDescription;
+      }
       if (!offer || offer.type !== 'offer' || !offer.sdp) {
         throw new Error('Calls did not return an initial subscriber offer');
       }

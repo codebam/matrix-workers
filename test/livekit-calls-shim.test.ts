@@ -19,6 +19,10 @@ import {
   type SignalRequestJson,
 } from '../src/services/livekit-calls-shim';
 import { generateLiveKitToken } from '../src/services/livekit';
+import {
+  CloudflareCallsError,
+  establishDataChannelTransport,
+} from '../src/services/cloudflare-calls';
 import type { Env } from '../src/types';
 
 const API_KEY = 'test-api-key';
@@ -211,7 +215,7 @@ async function answerInitialOffer(ws: FakeSocket, calls: CallsCall[]): Promise<n
   return id;
 }
 
-function installCallsFetch(): { calls: CallsCall[]; restore: () => void } {
+function installCallsFetch(options: { failDatachannels?: boolean } = {}): { calls: CallsCall[]; restore: () => void } {
   const calls: CallsCall[] = [];
   let sessionCounter = 0;
   const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -223,6 +227,19 @@ function installCallsFetch(): { calls: CallsCall[]; restore: () => void } {
     if (url.endsWith('/sessions/new')) {
       sessionCounter++;
       return Response.json({ sessionId: `sess-${sessionCounter}` });
+    }
+    if (url.includes('/datachannels/establish')) {
+      if (options.failDatachannels) {
+        return new Response(JSON.stringify({
+          errorCode: 'invalid_params',
+          errorDescription: 'Datachannels unavailable',
+        }), { status: 406, headers: { 'Content-Type': 'application/json' } });
+      }
+      return Response.json({
+        sessionDescription: { type: 'offer', sdp: INITIAL_OFFER_SDP },
+        requiresImmediateRenegotiation: true,
+        dataChannel: { location: 'remote', dataChannelName: 'server-events', id: 0 },
+      });
     }
     if (url.includes('/tracks/new')) {
       const tracks = body.tracks as Array<{ location: string; trackName?: string }>;
@@ -356,8 +373,12 @@ describe('livekit-calls-shim', () => {
       expect(sessions[0]).toMatchObject({ method: 'POST' });
       expect(sessions[0]!.url).toBe(`https://rtc.live.cloudflare.com/v1/apps/${CALLS_APP_ID}/sessions/new`);
       expect(sessions[1]!.url).toBe(sessions[0]!.url);
-      const initialTracks = callsFetch.calls.find((call) => call.url.includes('/tracks/new'))!;
-      expect(initialTracks.body).toEqual({ tracks: [] });
+      const establish = callsFetch.calls.find((call) => call.url.includes('/datachannels/establish'))!;
+      expect(establish.method).toBe('POST');
+      expect(establish.url).toBe(`https://rtc.live.cloudflare.com/v1/apps/${CALLS_APP_ID}/sessions/sess-2/datachannels/establish`);
+      expect(establish.body).toEqual({ dataChannel: { location: 'remote', dataChannelName: 'server-events' } });
+      expect(callsFetch.calls.some((call) => call.url.includes('/tracks/new')
+        && (call.body.tracks as unknown[]).length === 0)).toBe(false);
       const join = decodeFrame(ws.sent[0]);
       expect(join.field).toBe(1); // SignalResponse.join
       expect(s(msgs(join.body, 1)[0]!, 2)).toBe('room_b');
@@ -551,7 +572,8 @@ describe('livekit-calls-shim', () => {
 
       subscriberWs.receive(requestFrame(6, subscriptionBody([trackSid], true)));
       await vi.waitFor(() => expect(sentFrames(subscriberWs, 3)).toHaveLength(2));
-      const remoteCall = callsFetch.calls.find((call) => JSON.stringify(call.body).includes('"remote"'));
+      const remoteCall = callsFetch.calls.find((call) => call.url.includes('/tracks/new')
+        && JSON.stringify(call.body).includes('"remote"'));
       expect(remoteCall?.url).toContain('/sessions/sess-4/tracks/new');
       expect(remoteCall?.body).toMatchObject({
         tracks: [{ location: 'remote', sessionId: 'sess-1', trackName: 'screen' }],
@@ -590,16 +612,19 @@ describe('livekit-calls-shim', () => {
       // Join creates a dedicated subscriber session and drives its PC with a
       // single Calls-generated offer, even before any track is subscribed.
       expect(callsFetch.calls.filter((call) => call.url.endsWith('/sessions/new'))).toHaveLength(4);
-      const initialTracks = callsFetch.calls.filter((call) => call.url.includes('/tracks/new')
-        && (call.body.tracks as unknown[]).length === 0).at(-1)!;
-      expect(initialTracks.url).toContain('/sessions/sess-4/tracks/new');
-      expect(initialTracks.body).toEqual({ tracks: [] });
+      const establish = callsFetch.calls.filter((call) => call.url.includes('/datachannels/establish')).at(-1)!;
+      expect(establish.url).toContain('/sessions/sess-4/datachannels/establish');
+      expect(establish.body).toEqual({ dataChannel: { location: 'remote', dataChannelName: 'server-events' } });
+      expect(callsFetch.calls.some((call) => call.url.includes('/tracks/new')
+        && (call.body.tracks as unknown[]).length === 0)).toBe(false);
       const initialOffers = sentFrames(subscriberWs, 3);
       expect(initialOffers).toHaveLength(1);
       const initial = initialOffers[0]!;
       expect(s(initial.body, 1)).toBe('offer');
       expect(s(initial.body, 2)).toBe(INITIAL_OFFER_SDP);
       expect(s(initial.body, 2)!.length).toBeGreaterThan(0);
+      // A transport-only offer has no LiveKit track mapping (SessionDescription.mid_to_track_id = 4).
+      expect(initial.body.get(4)).toBeUndefined();
 
       // The client answer is submitted to Calls on that same subscriber session.
       const initialId = n(initial.body, 3)!;
@@ -617,7 +642,8 @@ describe('livekit-calls-shim', () => {
       expect(s(offers[1]!.body, 2)).toBe(SUBSCRIBER_OFFER_SDP);
       expect(n(offers[1]!.body, 3)).toBeGreaterThan(initialId);
       expect(callsFetch.calls.filter((call) => call.url.endsWith('/sessions/new'))).toHaveLength(4);
-      const remoteCall = callsFetch.calls.find((call) => JSON.stringify(call.body).includes('"remote"'))!;
+      const remoteCall = callsFetch.calls.find((call) => call.url.includes('/tracks/new')
+        && JSON.stringify(call.body).includes('"remote"'))!;
       expect(remoteCall.url).toContain('/sessions/sess-4/tracks/new');
       expect(remoteCall.body).toMatchObject({ tracks: [{ location: 'remote', sessionId: 'sess-1' }] });
       publisher.close();
@@ -667,6 +693,67 @@ describe('livekit-calls-shim', () => {
       ws.receive(requestFrame(6, subscriptionBody(['TR_missing'], true)));
       await settled();
       expect(callsFetch.calls.some((call) => call.url.includes('/tracks/new'))).toBe(false);
+      shim.close();
+    });
+  });
+
+  describe('datachannel transport establishment', () => {
+    it('requests a transport offer from the documented Calls endpoint and returns the SDP', async () => {
+      const mock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(String(input)).toBe(`https://rtc.live.cloudflare.com/v1/apps/${CALLS_APP_ID}/sessions/sess-dc/datachannels/establish`);
+        expect(init?.method).toBe('POST');
+        expect(JSON.parse(String(init?.body))).toEqual({
+          dataChannel: { location: 'remote', dataChannelName: 'server-events' },
+        });
+        return Response.json({
+          sessionDescription: { type: 'offer', sdp: INITIAL_OFFER_SDP },
+          requiresImmediateRenegotiation: true,
+          dataChannel: { dataChannelName: 'server-events', id: 0 },
+        });
+      });
+      vi.stubGlobal('fetch', mock);
+
+      const offer = await establishDataChannelTransport(makeEnv(), 'sess-dc');
+      expect(mock).toHaveBeenCalledTimes(1);
+      expect(offer).toEqual({ type: 'offer', sdp: INITIAL_OFFER_SDP });
+    });
+
+    it('throws a clear NO_OFFER error when Calls returns no sessionDescription', async () => {
+      vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+        requiresImmediateRenegotiation: true,
+        dataChannel: { dataChannelName: 'server-events', id: 0 },
+      })));
+
+      await expect(establishDataChannelTransport(makeEnv(), 'sess-dc')).rejects.toMatchObject({
+        name: 'CloudflareCallsError',
+        code: 'NO_OFFER',
+        statusCode: 500,
+      });
+      await expect(establishDataChannelTransport(makeEnv(), 'sess-dc')).rejects.toBeInstanceOf(CloudflareCallsError);
+    });
+
+    it('falls back to empty tracks with a warning when the datachannels endpoint fails', async () => {
+      callsFetch.restore();
+      callsFetch = installCallsFetch({ failDatachannels: true });
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const ws = new FakeSocket();
+      const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_fallback'), ws.asWebSocket(), {
+        registry: new LiveKitShimRegistry(5, 5),
+      });
+      await shim.start({ addTrackRequests: [] });
+
+      expect(callsFetch.calls.some((call) => call.url.includes('/datachannels/establish'))).toBe(true);
+      const emptyTracks = callsFetch.calls.find((call) => call.url.includes('/tracks/new')
+        && (call.body.tracks as unknown[]).length === 0)!;
+      expect(emptyTracks.url).toContain('/sessions/sess-2/tracks/new');
+      expect(emptyTracks.body).toEqual({ tracks: [] });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('datachannels/establish failed'),
+        expect.anything()
+      );
+      const initial = sentFrames(ws, 3)[0]!;
+      expect(s(initial.body, 2)).toBe(INITIAL_OFFER_SDP);
+      expect(initial.body.get(4)).toBeUndefined();
       shim.close();
     });
   });

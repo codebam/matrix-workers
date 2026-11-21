@@ -28,6 +28,32 @@ export interface NewTracksRequest {
   tracks: TrackObject[];
 }
 
+/** Mirrors the Calls API DataChannelObject schema. */
+export interface DataChannelObject {
+  location: 'local' | 'remote';
+  dataChannelName: string;
+  sessionId?: string;
+  id?: number;
+  ordered?: boolean;
+  maxRetransmits?: number;
+  maxPacketLifeTime?: number;
+  waitForAck?: boolean;
+  canReply?: boolean;
+}
+
+export interface EstablishDataChannelsRequest {
+  dataChannel: DataChannelObject;
+  sessionDescription?: SessionDescription;
+}
+
+export interface EstablishDataChannelsResponse {
+  sessionDescription?: SessionDescription;
+  requiresImmediateRenegotiation?: boolean;
+  dataChannel?: DataChannelObject;
+  errorCode?: string;
+  errorDescription?: string;
+}
+
 export interface TrackResult {
   mid: string;
   trackName: string;
@@ -126,6 +152,39 @@ async function callsRequest<T>(
  */
 export async function createSession(env: Env): Promise<NewSessionResponse> {
   return callsRequest<NewSessionResponse>(env, 'POST', '/sessions/new');
+}
+
+/**
+ * Establish a data-channel-only transport on an existing session. Asking to
+ * pull the built-in `server-events` channel with no sessionDescription makes
+ * Calls return an m=application SDP offer with no media tracks.
+ * API: POST /apps/{appId}/sessions/{sessionId}/datachannels/establish
+ */
+export async function establishDataChannelTransport(
+  env: Env,
+  sessionId: string
+): Promise<SessionDescription> {
+  const request: EstablishDataChannelsRequest = {
+    dataChannel: { location: 'remote', dataChannelName: 'server-events' },
+  };
+  const response = await callsRequest<EstablishDataChannelsResponse>(
+    env,
+    'POST',
+    `/sessions/${sessionId}/datachannels/establish`,
+    request
+  );
+
+  if (response.errorCode) {
+    throw new CloudflareCallsError(
+      response.errorDescription || 'Data channel error',
+      response.errorCode,
+      400
+    );
+  }
+  if (!response.sessionDescription) {
+    throw new CloudflareCallsError('No offer received from SFU', 'NO_OFFER', 500);
+  }
+  return response.sessionDescription;
 }
 
 /**
