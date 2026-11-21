@@ -88,6 +88,9 @@ export interface Env {
   LIVEKIT_API_KEY?: string;      // LiveKit API Key (e.g., "devkey")
   LIVEKIT_API_SECRET?: string;   // LiveKit API Secret
   LIVEKIT_URL?: string;          // LiveKit WebSocket URL for clients (e.g., "wss://livekit.example.com")
+  // Comma-separated RTCIceServer URLs advertised in the LiveKit shim JoinResponse.
+  // Unset -> DEFAULT_LIVEKIT_STUN_URLS. Set as a plain var/secret; no binding required.
+  LIVEKIT_STUN_URLS?: string;
 
   // APNs Direct Push Configuration (optional - bypasses Sygnal)
   APNS_KEY_ID?: string;          // Key ID from Apple Developer Portal

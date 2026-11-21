@@ -4,11 +4,16 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  DEFAULT_LIVEKIT_STUN_URLS,
+  DEFAULT_SHIM_PING_INTERVAL_SECONDS,
+  DEFAULT_SHIM_PING_TIMEOUT_SECONDS,
   decodePb,
   handleLiveKitSignalRequest,
   inferMimeType,
+  injectTrickleCandidates,
   LiveKitShimRegistry,
   LiveKitCallsShimSession,
+  parseStunUrls,
   verifyLiveKitJwt,
   type LiveKitIdentity,
   type SignalRequestJson,
@@ -90,6 +95,12 @@ function addTrackBody(cid: string, name: string, type: number, source: number): 
 function subscriptionBody(sids: string[], subscribe: boolean): Uint8Array {
   return cat(...sids.map((sid) => fstr(1, sid)), fnum(2, subscribe));
 }
+
+function trickleBody(candidateInit: string, target: number): Uint8Array {
+  return cat(fstr(1, candidateInit), fnum(2, target));
+}
+
+const SRFLX_CANDIDATE = 'candidate:1 1 udp 2130706431 203.0.113.7 54321 typ srflx raddr 0.0.0.0 rport 0';
 
 // --- minimal response decoder ----------------------------------------------
 
@@ -327,6 +338,36 @@ describe('livekit-calls-shim', () => {
       shim.close();
     });
 
+    it('advertises ICE servers, sane ping timers and protocol 17 in the binary JoinResponse', async () => {
+      const ws = new FakeSocket();
+      const env = makeEnv();
+      env.LIVEKIT_STUN_URLS = 'stun:one.example:3478, stun:two.example:3478';
+      const shim = new LiveKitCallsShimSession(env, await identityFor('room_transport'), ws.asWebSocket(), {
+        registry: new LiveKitShimRegistry(5, 5),
+      });
+      // SDK 2.25 sends protocol 18; the shim deliberately answers 17 so the
+      // SDK falls back from negotiated to in-band data channels.
+      await shim.start({
+        addTrackRequests: [],
+        clientInfo: { sdk: 1, version: '2.25.0', protocol: 18, clientProtocol: 3 },
+      });
+
+      const join = decodeFrame(ws.sent[0]);
+      expect(n(join.body, 10)).toBe(DEFAULT_SHIM_PING_TIMEOUT_SECONDS);
+      expect(n(join.body, 11)).toBe(DEFAULT_SHIM_PING_INTERVAL_SECONDS);
+      const serverInfo = msgs(join.body, 12)[0]!;
+      expect(n(serverInfo, 3)).toBe(17);
+      expect(n(join.body, 6)).toBe(0); // subscriberPrimary = false
+
+      const iceServers = msgs(join.body, 5); // JoinResponse.ice_servers = 5
+      expect(iceServers).toHaveLength(1);
+      expect(iceServers[0]!.get(1)?.map((entry) => decoder.decode(entry.bytes!))).toEqual([
+        'stun:one.example:3478',
+        'stun:two.example:3478',
+      ]);
+      shim.close();
+    });
+
     it('forwards authenticated upgrades to the room DO and rejects bad requests', async () => {
       const doResponse = new Response(null, { status: 200 });
       const doFetch = vi.fn(async () => doResponse);
@@ -391,6 +432,30 @@ describe('livekit-calls-shim', () => {
       expect(s(track, 3)).toBe('camera');
       expect(s(track, 11)).toBe('video/vp8');
       expect(s(track, 12)).toBe('0');
+      shim.close();
+    });
+
+    it('folds trickled publisher candidates into the SDP sent to Calls', async () => {
+      const ws = new FakeSocket();
+      const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_trickle'), ws.asWebSocket(), {
+        registry: new LiveKitShimRegistry(5, 5),
+      });
+      await shim.start({ addTrackRequests: [] });
+
+      ws.receive(requestFrame(4, addTrackBody('cid-trickle', 'camera', 1, 1)));
+      ws.receive(requestFrame(1, sdBody('offer', OFFER_SDP, 7)));
+      ws.receive(requestFrame(3, trickleBody(JSON.stringify({
+        candidate: SRFLX_CANDIDATE,
+        sdpMid: '0',
+        sdpMLineIndex: 0,
+      }), 0)));
+      await vi.waitFor(() => expect(lastSent(ws, 2)).toBeDefined());
+
+      const tracksCall = callsFetch.calls.find((call) => call.url.includes('/tracks/new'))!;
+      const outboundSdp = (tracksCall.body.sessionDescription as { sdp: string }).sdp;
+      expect(outboundSdp).toContain(SRFLX_CANDIDATE);
+      // Calls' answer is still passed through verbatim: it already carries its own candidates.
+      expect(s(lastSent(ws, 2)!.body, 2)).toBe(ANSWER_SDP);
       shim.close();
     });
 
@@ -472,6 +537,39 @@ describe('livekit-calls-shim', () => {
       const renegotiate = callsFetch.calls.find((call) => call.url.includes('/renegotiate'))!;
       expect(renegotiate.method).toBe('PUT');
       expect(renegotiate.body).toEqual({ sessionDescription: { type: 'answer', sdp: ANSWER_SDP } });
+      publisher.close();
+      subscriber.close();
+    });
+
+    it('folds trickled subscriber candidates into the answer sent to Calls', async () => {
+      const registry = new LiveKitShimRegistry(5, 5);
+      const env = makeEnv();
+      const publisherWs = new FakeSocket();
+      const publisher = new LiveKitCallsShimSession(env, await identityFor('room_sub_trickle'), publisherWs.asWebSocket(), { registry });
+      await publisher.start({ addTrackRequests: [] });
+      publisherWs.receive(requestFrame(4, addTrackBody('cid-pub', 'screen', 1, 3)));
+      publisherWs.receive(requestFrame(1, sdBody('offer', OFFER_SDP, 3)));
+      await vi.waitFor(() => expect(lastSent(publisherWs, 6)).toBeDefined());
+      const trackSid = s(msgs(lastSent(publisherWs, 6)!.body, 2)[0]!, 1)!;
+
+      const subscriberWs = new FakeSocket();
+      const subscriber = new LiveKitCallsShimSession(env, {
+        identity: '@dave:example.org', room: 'room_sub_trickle', canPublish: true, canSubscribe: true, canPublishData: false,
+      }, subscriberWs.asWebSocket(), { registry });
+      await subscriber.start({ addTrackRequests: [] });
+      subscriberWs.receive(requestFrame(6, subscriptionBody([trackSid], true)));
+      await vi.waitFor(() => expect(lastSent(subscriberWs, 3)).toBeDefined());
+      const offerId = n(lastSent(subscriberWs, 3)!.body, 3)!;
+
+      subscriberWs.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, offerId)));
+      subscriberWs.receive(requestFrame(3, trickleBody(JSON.stringify({
+        candidate: SRFLX_CANDIDATE,
+        sdpMid: '0',
+        sdpMLineIndex: 0,
+      }), 1)));
+      await vi.waitFor(() => expect(callsFetch.calls.some((call) => call.url.includes('/renegotiate'))).toBe(true));
+      const renegotiate = callsFetch.calls.find((call) => call.url.includes('/renegotiate'))!;
+      expect((renegotiate.body.sessionDescription as { sdp: string }).sdp).toContain(SRFLX_CANDIDATE);
       publisher.close();
       subscriber.close();
     });
@@ -563,9 +661,43 @@ describe('livekit-calls-shim', () => {
       expect(ws.closeCode).toBeUndefined();
       shim.close();
     });
+
+    it('answers binary pingReq frames with pongResp', async () => {
+      const ws = new FakeSocket();
+      const shim = new LiveKitCallsShimSession(makeEnv(), await identityFor('room_ping_req'), ws.asWebSocket(), {
+        registry: new LiveKitShimRegistry(5, 5),
+      });
+      await shim.start({ addTrackRequests: [] });
+      ws.receive(requestFrame(16, cat(fnum(1, 1234), fnum(2, 7))));
+      await settled();
+      const frame = decodeFrame(ws.sent.at(-1));
+      expect(frame.field).toBe(20); // SignalResponse.pong_resp = 20
+      const pongResp = frame.body;
+      expect(n(pongResp, 1)).toBe(1234);
+      expect(n(pongResp, 2)).toBeGreaterThan(0);
+      expect(ws.closeCode).toBeUndefined();
+      shim.close();
+    });
   });
 
   describe('helpers', () => {
+    it('parses STUN URL overrides and falls back to the default', () => {
+      expect(parseStunUrls(undefined)).toEqual([DEFAULT_LIVEKIT_STUN_URLS]);
+      expect(parseStunUrls('')).toEqual([DEFAULT_LIVEKIT_STUN_URLS]);
+      expect(parseStunUrls(' stun:a:3478,,stun:b:3478 ')).toEqual(['stun:a:3478', 'stun:b:3478']);
+    });
+
+    it('injects trickled candidates into the matching SDP m-section', () => {
+      const twoMediaSdp = [
+        'v=0', 'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:0', 'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:1', '',
+      ].join('\r\n');
+      const result = injectTrickleCandidates(twoMediaSdp, [
+        { line: SRFLX_CANDIDATE, mid: '1' },
+      ]);
+      expect(result).toContain(`a=mid:1\r\n${SRFLX_CANDIDATE}`);
+      expect(result.indexOf(SRFLX_CANDIDATE)).toBeGreaterThan(result.indexOf('m=video'));
+    });
+
     it('infers mime types for local tracks from SDP m-lines', () => {
       expect(inferMimeType(OFFER_SDP, '0', 1)).toBe('video/vp8');
       const audio = OFFER_SDP.replace('m=video 9 UDP/TLS/RTP/SAVPF 96', 'm=audio 9 UDP/TLS/RTP/SAVPF 111')

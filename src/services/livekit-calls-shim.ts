@@ -20,8 +20,10 @@
 // Room state lives in LiveKitShimDurableObject (one instance per Matrix room);
 // the Worker only verifies the JWT and forwards the upgrade to that DO, which
 // owns every participant socket. Deliberate gaps: data channels, simulcast
-// layers, E2EE/SIF trailer, recording/egress, ICE trickle forwarding, and
-// reconnect/resume. See the report for details.
+// layers, E2EE/SIF trailer, recording/egress, and reconnect/resume. LiveKit
+// trickled candidates are buffered for a short window and folded into the SDP
+// sent to Calls, because the Calls REST API has no trickle endpoint; see
+// TRICKLE_GATHER_MS below.
 
 import type { Env } from '../types';
 import {
@@ -45,6 +47,17 @@ export const DEFAULT_MAX_PER_ROOM = 10;
 export const DEFAULT_MAX_TRACKS_PER_PARTICIPANT = 4;
 /** Refuse absurd SDPs before they reach the Calls API. */
 export const MAX_SDP_BYTES = 128_000;
+/** Default ICE server advertised to LiveKit clients (Cloudflare's public STUN). */
+export const DEFAULT_LIVEKIT_STUN_URLS = 'stun:stun.cloudflare.com:3478';
+/** LiveKit ping fields are seconds; the SDK multiplies them by 1000. */
+export const DEFAULT_SHIM_PING_TIMEOUT_SECONDS = 15;
+export const DEFAULT_SHIM_PING_INTERVAL_SECONDS = 30;
+/**
+ * LiveKit's JS SDK trickles candidates after sending an offer/answer, but
+ * Cloudflare Calls requires gathered SDP in its REST `sessionDescription`.
+ * Buffer trickles for this bounded window before injecting them into the SDP.
+ */
+export const TRICKLE_GATHER_MS = 250;
 
 export class ShimAuthError extends Error {
   constructor(message: string) {
@@ -244,6 +257,8 @@ export interface JoinResponseJson {
   participant: ParticipantInfoJson;
   otherParticipants?: ParticipantInfoJson[];
   serverVersion?: string;
+  /** JoinResponse.ice_servers = 5; each ICEServer has urls = 1. */
+  iceServers?: Array<{ urls: string[]; username?: string; credential?: string }>;
   subscriberPrimary?: boolean;
   pingTimeout?: number;
   pingInterval?: number;
@@ -344,6 +359,11 @@ function encodeJoinResponse(join: JoinResponseJson): Bytes {
     pbMsg(2, encodeParticipant(join.participant)),
     ...(join.otherParticipants ?? []).map((p) => pbMsg(3, encodeParticipant(p))),
     pbStr(4, join.serverVersion),
+    ...(join.iceServers ?? []).map((server) => pbMsg(5, concatBytes(
+      ...server.urls.map((url) => pbStr(1, url)),
+      pbStr(2, server.username),
+      pbStr(3, server.credential)
+    ))),
     pbNum(6, join.subscriberPrimary),
     pbNum(10, join.pingTimeout),
     pbNum(11, join.pingInterval),
@@ -352,6 +372,93 @@ function encodeJoinResponse(join: JoinResponseJson): Bytes {
       pbMsg(14, concatBytes(pbStr(1, codec.mime), pbStr(2, codec.fmtpLine)))
     )
   );
+}
+
+/** Parse the optional LIVEKIT_STUN_URLS var; a blank override falls back to the default. */
+export function parseStunUrls(value: string | undefined): string[] {
+  const urls = (value ?? '')
+    .split(',')
+    .map((url) => url.trim())
+    .filter(Boolean);
+  return urls.length ? urls : [DEFAULT_LIVEKIT_STUN_URLS];
+}
+
+export interface TrickleCandidate {
+  line: string;
+  mid?: string;
+  index?: number;
+}
+
+/** LiveKit sends `candidateInit: JSON.stringify(RTCIceCandidateInit)`, not a raw SDP line. */
+function parseTrickleCandidate(candidateInit: string | undefined): TrickleCandidate | undefined {
+  if (!candidateInit) return undefined;
+  let init: { candidate?: unknown; sdpMid?: unknown; sdpMLineIndex?: unknown };
+  try {
+    init = JSON.parse(candidateInit) as typeof init;
+  } catch {
+    return undefined;
+  }
+  const raw = typeof init.candidate === 'string' ? init.candidate.trim().replace(/^a=/, '') : '';
+  if (!raw.startsWith('candidate:')) return undefined;
+  return {
+    line: raw,
+    mid: typeof init.sdpMid === 'string' ? init.sdpMid : undefined,
+    index: typeof init.sdpMLineIndex === 'number' ? init.sdpMLineIndex : undefined,
+  };
+}
+
+/**
+ * Fold trickled candidates into an SDP before handing it to the Calls REST API,
+ * which has no trickle endpoint and expects gathered session descriptions.
+ * Candidates are appended to their m-section (matched by mid, then m-line index).
+ */
+export function injectTrickleCandidates(sdp: string, candidates: TrickleCandidate[]): string {
+  const usable = candidates.filter((candidate) => candidate.line.startsWith('candidate:'));
+  if (!usable.length) return sdp;
+  const eol = sdp.includes('\r\n') ? '\r\n' : '\n';
+  const lines = sdp.split(/\r?\n/);
+  const sections: number[] = [];
+  const mids = new Map<string, number>();
+  lines.forEach((line, index) => {
+    if (line.startsWith('m=')) sections.push(index);
+    else if (line.startsWith('a=mid:')) mids.set(line.slice(6).trim(), index);
+  });
+  if (!sections.length) return sdp;
+
+  const sectionOf = (lineIndex: number): number => {
+    let section = 0;
+    for (const start of sections) {
+      if (start > lineIndex) break;
+      section = start;
+    }
+    return section;
+  };
+  const sectionEnd = (start: number): number => {
+    const next = sections.find((candidate) => candidate > start);
+    let end = next ?? lines.length;
+    while (end > start + 1 && lines[end - 1]!.trim() === '') end--;
+    return end;
+  };
+
+  const inserts = new Map<number, string[]>();
+  for (const candidate of usable) {
+    if (lines.includes(candidate.line)) continue;
+    let start = sections[0]!;
+    if (candidate.mid !== undefined && mids.has(candidate.mid)) {
+      start = sectionOf(mids.get(candidate.mid)!);
+    } else if (candidate.index !== undefined && sections[candidate.index] !== undefined) {
+      start = sections[candidate.index]!;
+    }
+    const at = sectionEnd(start);
+    const existing = inserts.get(at) ?? [];
+    if (!existing.includes(candidate.line)) existing.push(candidate.line);
+    inserts.set(at, existing);
+  }
+  const out = [...lines];
+  for (const [at, additions] of [...inserts.entries()].sort((a, b) => b[0] - a[0])) {
+    out.splice(at, 0, ...additions);
+  }
+  return out.join(eol);
 }
 
 /** Encode a SignalResponse as protobuf binary (the LiveKit SDK default). */
@@ -655,7 +762,8 @@ interface ShimParticipant {
   pendingOffers: Map<number, { trackSid: string; needsRenegotiation: boolean }>;
   subscribedMids: Map<string, string>;
   queues: Map<string, Promise<void>>;
-  tricklesDropped: number;
+  /** JSON-encoded LiveKit trickles, keyed by SignalTarget (PUBLISHER=0, SUBSCRIBER=1). */
+  trickleCandidates: Map<number, TrickleCandidate[]>;
   jsonMode: boolean;
 }
 
@@ -764,7 +872,11 @@ export interface ShimOptions {
   registry: LiveKitShimRegistry;
   maxTracksPerParticipant?: number;
   now?: () => number;
-  /** Server protocol advertised to clients; 17 avoids negotiated data channels. */
+  /**
+   * Server protocol advertised to clients. Stay at 17: SDK >=18 would keep
+   * negotiated data channels in single-PC mode, which Calls' media SDP does
+   * not promise. 17 makes the SDK fall back to in-band channels.
+   */
   serverProtocol?: number;
 }
 
@@ -805,6 +917,7 @@ export class LiveKitCallsShimSession {
   private readonly maxTracks: number;
   private readonly now: () => number;
   private readonly serverProtocol: number;
+  private readonly stunUrls: string[];
   private closed = false;
 
   constructor(
@@ -817,6 +930,7 @@ export class LiveKitCallsShimSession {
     this.maxTracks = options.maxTracksPerParticipant ?? DEFAULT_MAX_TRACKS_PER_PARTICIPANT;
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.serverProtocol = options.serverProtocol ?? 17;
+    this.stunUrls = parseStunUrls(env.LIVEKIT_STUN_URLS);
     this.participant = {
       sid: randomId('PA'),
       room: identity.room,
@@ -831,7 +945,7 @@ export class LiveKitCallsShimSession {
       pendingOffers: new Map(),
       subscribedMids: new Map(),
       queues: new Map(),
-      tricklesDropped: 0,
+      trickleCandidates: new Map(),
       jsonMode: false,
     };
   }
@@ -902,9 +1016,13 @@ export class LiveKitCallsShimSession {
         participant: participantInfo(p, 1), // JOINED
         otherParticipants: others.map((other) => participantInfo(other, other.tracks.length ? 2 : 1)),
         serverVersion: 'livekit-calls-shim',
-        subscriberPrimary: false, // publisher PC first; server offers drive subscriber PC
-        pingTimeout: 0,
-        pingInterval: 0,
+        // JoinResponse.ice_servers = 5. Without this the browser only gathers
+        // host candidates and never completes ICE with the Calls SFU.
+        iceServers: [{ urls: this.stunUrls }],
+        subscriberPrimary: false, // SDK still starts publisher negotiation on join
+        // Seconds, not milliseconds: livekit-client multiplies both by 1000.
+        pingTimeout: DEFAULT_SHIM_PING_TIMEOUT_SECONDS,
+        pingInterval: DEFAULT_SHIM_PING_INTERVAL_SECONDS,
         serverInfo: { version: 'shim-1', protocol: this.serverProtocol, nodeId: 'calls-shim' },
         enabledPublishCodecs: [
           { mime: 'audio/opus' },
@@ -944,8 +1062,9 @@ export class LiveKitCallsShimSession {
           await this.handleAnswer(request.value);
           break;
         case 'trickle':
-          // Calls has no REST trickle endpoint; its SDP carries candidates.
-          this.participant.tricklesDropped++;
+          // Calls has no REST trickle endpoint; buffer these and fold them
+          // into the next SDP handed to Calls.
+          this.recordTrickle(request.value);
           break;
         case 'ping':
           this.send({ message: 'pong', value: request.value });
@@ -967,6 +1086,24 @@ export class LiveKitCallsShimSession {
       console.error('[livekit-shim] message failed:', error);
       this.fail(error);
     }
+  }
+
+  private recordTrickle(value: Extract<SignalRequestJson, { message: 'trickle' }>['value']): void {
+    const candidate = parseTrickleCandidate(value.candidateInit);
+    if (!candidate) return;
+    const target = value.target ?? 0; // SignalTarget.PUBLISHER
+    const list = this.participant.trickleCandidates.get(target) ?? [];
+    if (!list.some((existing) => existing.line === candidate.line)) list.push(candidate);
+    this.participant.trickleCandidates.set(target, list);
+  }
+
+  /** Wait briefly for SDK trickles, then return an SDP Calls can consume as-is. */
+  private async gatherTrickleCandidates(target: number, sdp: string): Promise<string> {
+    await new Promise<void>((resolve) => setTimeout(resolve, TRICKLE_GATHER_MS));
+    if (this.closed) return sdp;
+    const candidates = this.participant.trickleCandidates.get(target) ?? [];
+    this.participant.trickleCandidates.set(target, []);
+    return injectTrickleCandidates(sdp, candidates);
   }
 
   private handleAddTrack(track: Extract<SignalRequestJson, { message: 'addTrack' }>['value']): void {
@@ -993,12 +1130,13 @@ export class LiveKitCallsShimSession {
     const sdp = sd.sdp ?? '';
     if (sdp.length > MAX_SDP_BYTES) throw new ShimCapacityError('SDP too large');
     if (!sdp) return;
+    const gatheredSdp = await this.gatherTrickleCandidates(0, sdp); // SignalTarget.PUBLISHER
     const p = this.participant;
     await this.enqueue('publisher', async () => {
       const pending = [...p.pending.values()];
       const tracks: TrackObject[] = pending.map((track) => ({ location: 'local', trackName: track.trackName }));
       const response = await addTracks(this.env, p.publisherSessionId, {
-        sessionDescription: { type: 'offer', sdp } as SessionDescription,
+        sessionDescription: { type: 'offer', sdp: gatheredSdp } as SessionDescription,
         tracks,
       });
       const answer = response.sessionDescription;
@@ -1084,9 +1222,10 @@ export class LiveKitCallsShimSession {
     if (!pending || !p.subscriberSessionId) return;
     if ((sd.sdp ?? '').length > MAX_SDP_BYTES) throw new ShimCapacityError('SDP too large');
     p.pendingOffers.delete(sd.id!);
+    const gatheredSdp = await this.gatherTrickleCandidates(1, sd.sdp ?? ''); // SignalTarget.SUBSCRIBER
     await this.enqueue('subscriber', async () => {
       const response = await renegotiate(this.env, p.subscriberSessionId!, {
-        sessionDescription: { type: 'answer', sdp: sd.sdp ?? '' } as SessionDescription,
+        sessionDescription: { type: 'answer', sdp: gatheredSdp } as SessionDescription,
       });
       if (response.sessionDescription?.type === 'offer') {
         this.sendCallsOffer(response.sessionDescription, undefined, true, pending.trackSid || undefined);
@@ -1108,6 +1247,7 @@ export class LiveKitCallsShimSession {
     this.closed = true;
     const p = this.participant;
     p.closed = true;
+    p.trickleCandidates.clear();
     this.registry.remove(p.sid);
     for (const other of this.registry.inRoom(p.room)) {
       sendFrame(other.ws, { message: 'update', value: { participants: [participantInfo(p, 3)] } }, other.jsonMode);
