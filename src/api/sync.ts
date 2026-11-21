@@ -904,7 +904,24 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
 
     joinedRoom.timeline!.events = timelineEvents;
-    joinedRoom.timeline!.prev_batch = sincePosition.toString();
+    // prev_batch must point at the START of the returned timeline window so
+    // clients paginate backwards into older history. Using sincePosition
+    // here (0 on initial sync) made /messages?from=0 return the NEWEST events
+    // again — today's messages got prepended in front of yesterday's and
+    // clients appeared to have almost no history after a cache clear.
+    let prevBatch = sincePosition;
+    if (timelineEvents.length > 0) {
+      try {
+        const oldest = await c.env.DB.prepare(
+          `SELECT stream_ordering FROM events WHERE event_id = ?`
+        ).bind(timelineEvents[0].event_id).first<{ stream_ordering: number }>();
+        if (oldest?.stream_ordering != null) prevBatch = oldest.stream_ordering;
+      } catch {
+        // A position lookup must never fail the whole sync; fall back to the
+        // stream token already available.
+      }
+    }
+    joinedRoom.timeline!.prev_batch = prevBatch.toString();
 
     // MSC4222 (opt-in via ?org.matrix.msc4222.use_state_after=true): the room
     // state AFTER the timeline window rides INSIDE the timeline object
