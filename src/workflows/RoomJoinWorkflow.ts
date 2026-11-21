@@ -244,8 +244,12 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           // timeline serving). The echoed join event was already persisted
           // with a real position in the `persist` step, so the idempotent
           // insert simply skips it here.
-          for (const ev of remoteEvents) {
-            await this.storeRemoteStateEvent(ev, roomId, roomVersion, true);
+          if (typeof this.env.DB.batch === 'function') {
+            await this.storeRemoteStateEventsBulk(remoteEvents, roomId, roomVersion, true);
+          } else {
+            for (const ev of remoteEvents) {
+              await this.storeRemoteStateEvent(ev, roomId, roomVersion, true);
+            }
           }
 
           // Some residents return a partial snapshot (missing create/name), so
@@ -275,8 +279,13 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
               );
               if (resp.ok) {
                 const data = (await resp.json()) as { pdus?: any[]; auth_chain?: any[] };
-                for (const ev of [...(data.auth_chain ?? []), ...(data.pdus ?? [])]) {
-                  await this.storeRemoteStateEvent(ev, roomId, roomVersion, true);
+                const fetched = [...(data.auth_chain ?? []), ...(data.pdus ?? [])];
+                if (typeof this.env.DB.batch === 'function') {
+                  await this.storeRemoteStateEventsBulk(fetched, roomId, roomVersion, true);
+                } else {
+                  for (const ev of fetched) {
+                    await this.storeRemoteStateEvent(ev, roomId, roomVersion, true);
+                  }
                 }
               }
             } catch (e) {
@@ -333,8 +342,13 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
             // reproduce exactly) and keeps memberships/state in sync.
             // Real history: stateOnly stays false so backfilled messages
             // keep ascending stream positions and appear in the timeline.
-            for (const ev of [...pdus].reverse()) {
-              await this.storeRemoteStateEvent(ev, roomId, roomVersion);
+            const history = [...pdus].reverse();
+            if (typeof this.env.DB.batch === 'function') {
+              await this.storeRemoteStateEventsBulk(history, roomId, roomVersion, false);
+            } else {
+              for (const ev of history) {
+                await this.storeRemoteStateEvent(ev, roomId, roomVersion);
+              }
             }
             console.log('[RoomJoinWorkflow] timeline backfill stored', {
               roomId, count: pdus.length,
@@ -812,6 +826,82 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       console.warn('[RoomJoinWorkflow] Skipping remote state event', {
         error: storeErr instanceof Error ? storeErr.message : 'Unknown error',
       });
+    }
+  }
+
+  /**
+   * Store a large federation state snapshot with D1 batches. The per-event
+   * path costs ~3 round trips per event and took >30 minutes for a 19k-event
+   * public room; batching keeps the same INSERT OR IGNORE / state and
+   * membership upsert semantics in far fewer round trips.
+   */
+  private async storeRemoteStateEventsBulk(
+    events: any[],
+    roomId: string,
+    roomVersion?: string,
+    stateOnly = true
+  ): Promise<void> {
+    const valid = events.filter((ev) => ev && typeof ev === 'object' && typeof ev.type === 'string');
+    if (!valid.length) return;
+
+    const normalized = await Promise.all(valid.map(async (ev) => {
+      const copy: Record<string, unknown> = { ...ev };
+      if (typeof copy.event_id !== 'string' || !copy.event_id) {
+        copy.event_id = await computeWireEventId(copy, roomVersion);
+      }
+      if (ev.type === 'm.room.create' && typeof copy.room_id !== 'string') {
+        copy.room_id = `!${String(copy.event_id).slice(1)}`;
+      }
+      return copy;
+    }));
+
+    const CHUNK = 80;
+    for (let offset = 0; offset < normalized.length; offset += CHUNK) {
+      const chunk = normalized.slice(offset, offset + CHUNK);
+      const position = await this.env.DB.prepare(
+        `UPDATE stream_positions SET position = position + ? WHERE stream_name = 'events' RETURNING position`
+      ).bind(chunk.length).first<{ position: number }>();
+      const first = (position?.position ?? chunk.length) - chunk.length + 1;
+      const statements: Array<ReturnType<typeof this.env.DB.prepare>> = [];
+      chunk.forEach((ev, i) => {
+        const streamOrdering = stateOnly ? -(first + i) : first + i;
+        statements.push(this.env.DB.prepare(
+          `INSERT OR IGNORE INTO events (event_id, room_id, sender, event_type, state_key, content,
+           origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(
+          String(ev.event_id), String(ev.room_id ?? roomId), String(ev.sender ?? ''), String(ev.type),
+          typeof ev.state_key === 'string' ? ev.state_key : null,
+          JSON.stringify(ev.content ?? {}), Number(ev.origin_server_ts ?? 0),
+          ev.unsigned ? JSON.stringify(ev.unsigned) : null, Number(ev.depth ?? 0),
+          JSON.stringify(ev.auth_events ?? []), JSON.stringify(ev.prev_events ?? []),
+          ev.hashes ? JSON.stringify(ev.hashes) : null,
+          ev.signatures ? JSON.stringify(ev.signatures) : null,
+          streamOrdering
+        ));
+        if (typeof ev.state_key === 'string') {
+          statements.push(this.env.DB.prepare(
+            `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id) VALUES (?, ?, ?, ?)`
+          ).bind(roomId, String(ev.type), ev.state_key, String(ev.event_id)));
+        }
+        const membership = (ev.content as { membership?: unknown } | undefined)?.membership;
+        if (ev.type === 'm.room.member' && typeof ev.state_key === 'string'
+          && ['join', 'invite', 'leave', 'ban', 'knock'].includes(String(membership))) {
+          statements.push(this.env.DB.prepare(
+            `INSERT INTO room_memberships (room_id, user_id, membership, event_id) VALUES (?, ?, ?, ?)
+             ON CONFLICT(room_id, user_id) DO UPDATE SET membership = excluded.membership, event_id = excluded.event_id`
+          ).bind(roomId, ev.state_key, String(membership), String(ev.event_id)));
+        }
+      });
+      await this.env.DB.batch(statements);
+    }
+
+    // Redactions need the live prune side effects; they are rare in a state
+    // snapshot, so the per-event helper is fine for those.
+    for (const ev of normalized) {
+      if (ev.type === 'm.room.redaction') {
+        await this.storeRemoteStateEvent(ev, roomId, roomVersion, stateOnly);
+      }
     }
   }
 

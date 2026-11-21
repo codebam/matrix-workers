@@ -131,6 +131,31 @@ function createSyncEnv(opts?: { failUsers?: Set<string> }) {
   };
 }
 
+function createBulkDb() {
+  const batches: Array<Array<{ sql: string; args: unknown[] }>> = [];
+  const db = {
+    prepare(sql: string) {
+      return {
+        bind(...args: unknown[]) {
+          return {
+            sql,
+            args,
+            first: async () => ({ position: Number(args[0] ?? 1) }),
+            run: async () => ({ meta: { changes: 1 } }),
+          };
+        },
+        first: async () => ({ position: 1 }),
+        run: async () => ({ meta: { changes: 1 } }),
+      };
+    },
+    async batch(statements: Array<{ sql: string; args: unknown[] }>) {
+      batches.push(statements.map((statement) => ({ sql: statement.sql, args: statement.args })));
+      return [];
+    },
+  };
+  return { db, batches };
+}
+
 function validRemoteTemplate(overrides: Record<string, unknown> = {}) {
   return {
     room_version: '10',
@@ -442,6 +467,43 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     // The store step consumed the payload and cleaned up the R2 object.
     expect(env.r2Objects.size).toBe(0);
     expect(storeEventIdempotent).toHaveBeenCalledTimes(state.length);
+  });
+
+  it('stores large remote state snapshots in D1 batches when available', async () => {
+    federationGet.mockResolvedValue(
+      new Response(JSON.stringify(validRemoteTemplate()), { status: 200 })
+    );
+    const state = Array.from({ length: 200 }, (_, i) => ({
+      event_id: `$bulk${i}:remote.example`,
+      type: 'm.room.member',
+      room_id: ROOM,
+      sender: `@u${i}:remote.example`,
+      state_key: `@u${i}:remote.example`,
+      content: { membership: 'join' },
+      origin_server_ts: 1,
+      depth: 1,
+      auth_events: [],
+      prev_events: [],
+    }));
+    federationPut.mockResolvedValue(
+      new Response(JSON.stringify({ origin: 'remote.example', auth_chain: [], state }), { status: 200 })
+    );
+    const { db, batches } = createBulkDb();
+    const env = { ...createSyncEnv(), DB: db as unknown as D1Database };
+    const wf = new RoomJoinWorkflow({} as any, env as any);
+    const result = await wf.run(
+      {
+        payload: { roomId: ROOM, userId: USER, isRemote: true, remoteServer: 'remote.example' },
+      } as any,
+      mockStep() as any
+    );
+
+    expect(result.success).toBe(true);
+    // 200 events / 80 per chunk = 3 batches, each with event + state + membership rows.
+    expect(batches).toHaveLength(3);
+    expect(batches[0][0].sql).toContain('INSERT OR IGNORE INTO events');
+    expect(batches[0].some((s) => s.sql.includes('INTO room_state'))).toBe(true);
+    expect(batches[0].some((s) => s.sql.includes('INTO room_memberships'))).toBe(true);
   });
 
   it('modern room (v12) join uses v4+ wire format: no event_id, reference-hash id, derived remote state ids', async () => {
