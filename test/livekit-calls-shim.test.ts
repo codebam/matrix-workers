@@ -8,6 +8,7 @@ import {
   DEFAULT_SHIM_PING_INTERVAL_SECONDS,
   DEFAULT_SHIM_PING_TIMEOUT_SECONDS,
   decodePb,
+  findRecvMid,
   findSendMid,
   handleLiveKitSignalRequest,
   inferMimeType,
@@ -52,6 +53,31 @@ const OFFER_AV_SDP = [
   'v=0', 'o=- 0 0 IN IP4 127.0.0.1', 's=-', 't=0 0',
   'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:0', 'a=sendonly', 'a=rtpmap:111 opus/48000/2', '',
   'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:1', 'a=sendonly', 'a=rtpmap:96 VP8/90000', '',
+].join('\r\n');
+
+// Single-PC (publisher-only) livekit-client offers carry sendonly sections for
+// local tracks plus three recvonly placeholders per kind for subscriptions.
+const RECVONLY_PUBLISHER_SDP = [
+  'v=0', 'o=- 4 4 IN IP4 127.0.0.1', 's=-', 't=0 0',
+  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:0', 'a=sendonly', 'a=rtpmap:111 opus/48000/2', '',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:1', 'a=sendonly', 'a=rtpmap:96 VP8/90000', '',
+  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:2', 'a=recvonly', '',
+  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:3', 'a=recvonly', '',
+  'm=audio 9 UDP/TLS/RTP/SAVPF 111', 'a=mid:4', 'a=recvonly', '',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:5', 'a=recvonly', '',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:6', 'a=recvonly', '',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:7', 'a=recvonly', '',
+].join('\r\n');
+
+const TWO_VIDEO_OFFER_SDP = [
+  'v=0', 'o=- 5 5 IN IP4 127.0.0.1', 's=-', 't=0 0',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:0', 'a=sendonly', 'a=rtpmap:96 VP8/90000', '',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:1', 'a=sendonly', 'a=rtpmap:96 VP8/90000', '',
+].join('\r\n');
+
+const ONE_VIDEO_RECVONLY_SDP = [
+  'v=0', 'o=- 6 6 IN IP4 127.0.0.1', 's=-', 't=0 0',
+  'm=video 9 UDP/TLS/RTP/SAVPF 96', 'a=mid:5', 'a=recvonly', '',
 ].join('\r\n');
 
 // --- minimal protobuf encoder for test-side SignalRequest frames ------------
@@ -213,15 +239,6 @@ function localTracksCall(calls: CallsCall[]): CallsCall | undefined {
     && (call.body.tracks as Array<{ location?: string }>).some((track) => track.location === 'local'));
 }
 
-async function answerInitialOffer(ws: FakeSocket, calls: CallsCall[]): Promise<number> {
-  const initial = sentFrames(ws, 3)[0]!;
-  const id = n(initial.body, 3)!;
-  ws.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, id)));
-  await vi.waitFor(() => expect(calls.some((call) => call.url.includes('/datachannels/establish')
-    && call.body.sessionDescription?.type === 'answer')).toBe(true));
-  return id;
-}
-
 function installCallsFetch(options: { failDatachannels?: boolean; failSubscriberAnswerOnce?: boolean } = {}): { calls: CallsCall[]; restore: () => void } {
   const calls: CallsCall[] = [];
   let sessionCounter = 0;
@@ -271,7 +288,8 @@ function installCallsFetch(options: { failDatachannels?: boolean; failSubscriber
           sdp: isLocal ? ANSWER_SDP : initialOffer ? INITIAL_OFFER_SDP : SUBSCRIBER_OFFER_SDP,
         },
         tracks: tracks.map((track, index) => ({
-          mid: isLocal ? String(index) : '1',
+          // Calls echoes the requested mid for a remote track bound by mid.
+          mid: isLocal ? String(index) : track.mid ?? '1',
           trackName: track.trackName ?? 'remote',
         })),
         requiresImmediateRenegotiation: false,
@@ -487,26 +505,28 @@ describe('livekit-calls-shim', () => {
       ws.receive(requestFrame(1, sdBody('offer', OFFER_SDP, 7)));
       await vi.waitFor(() => expect(lastSent(ws, 6)).toBeDefined());
 
+      const published = lastSent(ws, 6)!;
+      expect(s(published.body, 1)).toBe('cid-1');
+      const track = msgs(published.body, 2)[0]!;
+      const trackSid = s(track, 1)!;
+      expect(trackSid).toMatch(/^TR_/);
+      expect(s(track, 3)).toBe('camera');
+      expect(s(track, 11)).toBe('video/vp8');
+      expect(s(track, 12)).toBe('0');
+
       const tracksCall = localTracksCall(callsFetch.calls)!;
       expect(tracksCall.method).toBe('POST');
       expect(tracksCall.body).toMatchObject({
         sessionDescription: { type: 'offer', sdp: OFFER_SDP },
-        // Calls 406s without the mid of the track's own m-section.
-        tracks: [{ location: 'local', trackName: 'camera', mid: '0' }],
+        // Calls 406s without the mid of the track's own m-section, and the
+        // Calls track name is the TR sid so the RTP msid maps back to it.
+        tracks: [{ location: 'local', trackName: trackSid, mid: '0' }],
       });
 
       const answer = lastSent(ws, 2)!;
       expect(s(answer.body, 1)).toBe('answer');
       expect(s(answer.body, 2)).toBe(ANSWER_SDP);
       expect(n(answer.body, 3)).toBe(7); // offer id echoed
-
-      const published = lastSent(ws, 6)!;
-      expect(s(published.body, 1)).toBe('cid-1');
-      const track = msgs(published.body, 2)[0]!;
-      expect(s(track, 1)).toMatch(/^TR_/);
-      expect(s(track, 3)).toBe('camera');
-      expect(s(track, 11)).toBe('video/vp8');
-      expect(s(track, 12)).toBe('0');
       shim.close();
     });
 
@@ -545,7 +565,9 @@ describe('livekit-calls-shim', () => {
       });
       await vi.waitFor(() => expect(localTracksCall(callsFetch.calls)).toBeDefined());
       const tracksCall = localTracksCall(callsFetch.calls)!;
-      expect(tracksCall.body.tracks).toEqual([{ location: 'local', trackName: 'mic', mid: '0' }]);
+      expect(tracksCall.body.tracks).toEqual([{
+        location: 'local', trackName: expect.stringMatching(/^TR_/), mid: '0',
+      }]);
       shim.close();
     });
 
@@ -630,7 +652,7 @@ describe('livekit-calls-shim', () => {
   });
 
   describe('subscribing', () => {
-    it('pulls a published track from Calls and forwards the answer via renegotiate', async () => {
+    it('binds a published track into an SDK recvonly placeholder without a server offer', async () => {
       const registry = new LiveKitShimRegistry(5, 5);
       const env = makeEnv();
       const publisherWs = new FakeSocket();
@@ -641,32 +663,84 @@ describe('livekit-calls-shim', () => {
       await vi.waitFor(() => expect(lastSent(publisherWs, 6)).toBeDefined());
       const published = lastSent(publisherWs, 6)!;
       const trackSid = s(msgs(published.body, 2)[0]!, 1)!;
+      // The calls track name is exactly the TR sid the SDK looks for in the msid.
+      const localCall = localTracksCall(callsFetch.calls)!;
+      expect((localCall.body.tracks as Array<{ trackName: string }>)[0]!.trackName).toBe(trackSid);
 
       const subscriberWs = new FakeSocket();
       const subscriber = new LiveKitCallsShimSession(env, {
         identity: '@bob:example.org', room: 'room_f', canPublish: true, canSubscribe: true, canPublishData: false,
       }, subscriberWs.asWebSocket(), { registry });
-      await subscriber.start({ addTrackRequests: [] });
-      await answerInitialOffer(subscriberWs, callsFetch.calls);
+      await subscriber.start({
+        addTrackRequests: [],
+        publisherOffer: { type: 'offer', sdp: RECVONLY_PUBLISHER_SDP, id: 9 },
+      });
 
+      const offersBefore = sentFrames(subscriberWs, 3).length;
+      const updatesBefore = sentFrames(subscriberWs, 5).length;
       subscriberWs.receive(requestFrame(6, subscriptionBody([trackSid], true)));
-      await vi.waitFor(() => expect(sentFrames(subscriberWs, 3)).toHaveLength(2));
+      await vi.waitFor(() => expect(sentFrames(subscriberWs, 5).length).toBe(updatesBefore + 1));
+
+      // (a) Remote tracks/new: publisher session, TR-sid trackName, placeholder
+      // mid, and no sessionDescription (so no renegotiation is implied).
       const remoteCall = callsFetch.calls.find((call) => call.url.includes('/tracks/new')
         && JSON.stringify(call.body).includes('"remote"'));
-      expect(remoteCall?.url).toContain('/sessions/sess-4/tracks/new');
-      expect(remoteCall?.body).toMatchObject({
-        tracks: [{ location: 'remote', sessionId: 'sess-1', trackName: 'screen' }],
+      expect(remoteCall?.method).toBe('POST');
+      expect(remoteCall?.url).toContain('/sessions/sess-3/tracks/new');
+      expect(remoteCall?.body).toEqual({
+        tracks: [{ location: 'remote', sessionId: 'sess-1', trackName: trackSid, mid: '5' }],
       });
-      const offer = lastSent(subscriberWs, 3)!;
-      expect(s(offer.body, 2)).toBe(SUBSCRIBER_OFFER_SDP);
-      const offerId = n(offer.body, 3)!;
-      expect(offerId).toBeGreaterThan(0);
 
-      subscriberWs.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, offerId)));
-      await vi.waitFor(() => expect(callsFetch.calls.filter((call) => call.url.includes('/renegotiate'))).toHaveLength(1));
-      const renegotiate = callsFetch.calls.filter((call) => call.url.includes('/renegotiate')).at(-1)!;
-      expect(renegotiate.method).toBe('PUT');
-      expect(renegotiate.body).toEqual({ sessionDescription: { type: 'answer', sdp: ANSWER_SDP } });
+      // (b) The update binds that sid to the same placeholder mid.
+      const update = lastSent(subscriberWs, 5)!;
+      const owner = msgs(update.body, 1)[0]!;
+      expect(s(owner, 1)).toBe(publisher.participantSid);
+      const bound = msgs(owner, 4).find((entry) => s(entry, 1) === trackSid)!;
+      expect(s(bound, 3)).toBe('screen');
+      expect(s(bound, 12)).toBe('5');
+
+      // (c) No offer frame and no /renegotiate call came from the subscription.
+      expect(sentFrames(subscriberWs, 3)).toHaveLength(offersBefore);
+      expect(callsFetch.calls.some((call) => call.url.includes('/renegotiate'))).toBe(false);
+      expect(callsFetch.calls.some((call) => call.url.includes('/tracks/new')
+        && (call.body.tracks as unknown[]).length === 0)).toBe(false);
+      expect(subscriberWs.closeCode).toBeUndefined();
+      publisher.close();
+      subscriber.close();
+    });
+
+    it('claims a placeholder and degrades gracefully when no placeholder is left', async () => {
+      const registry = new LiveKitShimRegistry(5, 5);
+      const env = makeEnv();
+      const publisherWs = new FakeSocket();
+      const publisher = new LiveKitCallsShimSession(env, await identityFor('room_full'), publisherWs.asWebSocket(), { registry });
+      await publisher.start({ addTrackRequests: [] });
+      publisherWs.receive(requestFrame(4, addTrackBody('cid-a', 'cam-a', 1, 1)));
+      publisherWs.receive(requestFrame(4, addTrackBody('cid-b', 'cam-b', 1, 1)));
+      publisherWs.receive(requestFrame(1, sdBody('offer', TWO_VIDEO_OFFER_SDP, 3)));
+      await vi.waitFor(() => expect(sentFrames(publisherWs, 6)).toHaveLength(2));
+      const [trackA, trackB] = sentFrames(publisherWs, 6).map((frame) => s(msgs(frame.body, 2)[0]!, 1)!);
+
+      // Only one video placeholder, so the second subscription cannot bind.
+      const subscriberWs = new FakeSocket();
+      const subscriber = new LiveKitCallsShimSession(env, {
+        identity: '@bob:example.org', room: 'room_full', canPublish: true, canSubscribe: true, canPublishData: false,
+      }, subscriberWs.asWebSocket(), { registry });
+      await subscriber.start({
+        addTrackRequests: [], publisherOffer: { type: 'offer', sdp: ONE_VIDEO_RECVONLY_SDP, id: 9 },
+      });
+      const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+      subscriberWs.receive(requestFrame(6, subscriptionBody([trackA!, trackB!], true)));
+      await vi.waitFor(() => expect(sentFrames(subscriberWs, 5).length).toBeGreaterThan(0));
+      const remoteCalls = callsFetch.calls.filter((call) => call.url.includes('/tracks/new')
+        && JSON.stringify(call.body).includes('"remote"'));
+      expect(remoteCalls).toHaveLength(1);
+      expect(remoteCalls[0]!.body).toEqual({
+        tracks: [{ location: 'remote', sessionId: 'sess-1', trackName: trackA, mid: '5' }],
+      });
+      expect(log).toHaveBeenCalledWith(expect.stringContaining('no free recvonly placeholder'), trackB);
+      expect(subscriberWs.closeCode).toBeUndefined();
       publisher.close();
       subscriber.close();
     });
@@ -694,7 +768,7 @@ describe('livekit-calls-shim', () => {
       shim.close();
     });
 
-    it('starts the subscriber PC with one Calls offer, applies its answer, and reuses that session for subscriptions', async () => {
+    it('keeps the join-time transport offer separate from client-driven subscriptions', async () => {
       const registry = new LiveKitShimRegistry(5, 5);
       const env = makeEnv();
       const publisherWs = new FakeSocket();
@@ -709,13 +783,16 @@ describe('livekit-calls-shim', () => {
       const subscriber = new LiveKitCallsShimSession(env, {
         identity: '@bob:example.org', room: 'room_initial_offer', canPublish: true, canSubscribe: true, canPublishData: false,
       }, subscriberWs.asWebSocket(), { registry });
-      await subscriber.start({ addTrackRequests: [] });
+      await subscriber.start({
+        addTrackRequests: [],
+        publisherOffer: { type: 'offer', sdp: RECVONLY_PUBLISHER_SDP, id: 9 },
+      });
 
       // Join creates a dedicated subscriber session and drives its PC with a
       // single Calls-generated offer, even before any track is subscribed.
       expect(callsFetch.calls.filter((call) => call.url.endsWith('/sessions/new'))).toHaveLength(4);
-      const establish = callsFetch.calls.filter((call) => call.url.includes('/datachannels/establish')).at(-1)!;
-      expect(establish.url).toContain('/sessions/sess-4/datachannels/establish');
+      const establish = callsFetch.calls.find((call) => call.url.includes('/sessions/sess-4/datachannels/establish'))!;
+      expect(establish).toBeDefined();
       expect(establish.body).toEqual({ dataChannel: { location: 'remote', dataChannelName: 'server-events' } });
       expect(callsFetch.calls.some((call) => call.url.includes('/tracks/new')
         && (call.body.tracks as unknown[]).length === 0)).toBe(false);
@@ -740,53 +817,42 @@ describe('livekit-calls-shim', () => {
       expect(initialAnswer.body.sessionDescription).toEqual({ type: 'answer', sdp: ANSWER_SDP });
       expect(callsFetch.calls.some((call) => call.url.includes('/renegotiate'))).toBe(false);
 
-      // A later subscription reuses sess-4: it adds one new offer (new id),
-      // never a second subscriber session or a duplicate initial offer.
+      // A later subscription binds into the single publisher PC (sess-3):
+      // no new offer, no second subscriber session, no renegotiation.
+      const offersBefore = sentFrames(subscriberWs, 3).length;
       subscriberWs.receive(requestFrame(6, subscriptionBody([trackSid], true)));
-      await vi.waitFor(() => expect(sentFrames(subscriberWs, 3)).toHaveLength(2));
-      const offers = sentFrames(subscriberWs, 3);
-      expect(s(offers[1]!.body, 2)).toBe(SUBSCRIBER_OFFER_SDP);
-      expect(n(offers[1]!.body, 3)).toBeGreaterThan(initialId);
+      await vi.waitFor(() => expect(sentFrames(subscriberWs, 5).length).toBeGreaterThan(0));
+      expect(sentFrames(subscriberWs, 3)).toHaveLength(offersBefore);
       expect(callsFetch.calls.filter((call) => call.url.endsWith('/sessions/new'))).toHaveLength(4);
+      expect(callsFetch.calls.some((call) => call.url.includes('/renegotiate'))).toBe(false);
       const remoteCall = callsFetch.calls.find((call) => call.url.includes('/tracks/new')
         && JSON.stringify(call.body).includes('"remote"'))!;
-      expect(remoteCall.url).toContain('/sessions/sess-4/tracks/new');
-      expect(remoteCall.body).toMatchObject({ tracks: [{ location: 'remote', sessionId: 'sess-1' }] });
+      expect(remoteCall.url).toContain('/sessions/sess-3/tracks/new');
+      expect(remoteCall.body).toMatchObject({
+        tracks: [{ location: 'remote', sessionId: 'sess-1', mid: '5' }],
+      });
+      expect(remoteCall.body.sessionDescription).toBeUndefined();
       publisher.close();
       subscriber.close();
     });
 
-    it('folds trickled subscriber candidates into the answer sent to Calls', async () => {
-      const registry = new LiveKitShimRegistry(5, 5);
-      const env = makeEnv();
-      const publisherWs = new FakeSocket();
-      const publisher = new LiveKitCallsShimSession(env, await identityFor('room_sub_trickle'), publisherWs.asWebSocket(), { registry });
-      await publisher.start({ addTrackRequests: [] });
-      publisherWs.receive(requestFrame(4, addTrackBody('cid-pub', 'screen', 1, 3)));
-      publisherWs.receive(requestFrame(1, sdBody('offer', OFFER_SDP, 3)));
-      await vi.waitFor(() => expect(lastSent(publisherWs, 6)).toBeDefined());
-      const trackSid = s(msgs(lastSent(publisherWs, 6)!.body, 2)[0]!, 1)!;
-
-      const subscriberWs = new FakeSocket();
-      const subscriber = new LiveKitCallsShimSession(env, {
+    it('folds trickled subscriber candidates into the transport answer sent to Calls', async () => {
+      const ws = new FakeSocket();
+      const subscriber = new LiveKitCallsShimSession(makeEnv(), {
         identity: '@dave:example.org', room: 'room_sub_trickle', canPublish: true, canSubscribe: true, canPublishData: false,
-      }, subscriberWs.asWebSocket(), { registry });
+      }, ws.asWebSocket(), { registry: new LiveKitShimRegistry(5, 5) });
       await subscriber.start({ addTrackRequests: [] });
-      await answerInitialOffer(subscriberWs, callsFetch.calls);
-      subscriberWs.receive(requestFrame(6, subscriptionBody([trackSid], true)));
-      await vi.waitFor(() => expect(sentFrames(subscriberWs, 3)).toHaveLength(2));
-      const offerId = n(sentFrames(subscriberWs, 3).at(-1)!.body, 3)!;
+      const offerId = n(sentFrames(ws, 3)[0]!.body, 3)!;
 
-      subscriberWs.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, offerId)));
-      subscriberWs.receive(requestFrame(3, trickleBody(JSON.stringify({
+      ws.receive(requestFrame(3, trickleBody(JSON.stringify({
         candidate: SRFLX_CANDIDATE,
         sdpMid: '0',
         sdpMLineIndex: 0,
       }), 1)));
-      await vi.waitFor(() => expect(callsFetch.calls.filter((call) => call.url.includes('/renegotiate'))).toHaveLength(1));
-      const renegotiate = callsFetch.calls.filter((call) => call.url.includes('/renegotiate')).at(-1)!;
-      expect((renegotiate.body.sessionDescription as { sdp: string }).sdp).toContain(SRFLX_CANDIDATE);
-      publisher.close();
+      ws.receive(requestFrame(2, sdBody('answer', ANSWER_SDP, offerId)));
+      await vi.waitFor(() => expect(callsFetch.calls.some((call) => call.url.includes('/datachannels/establish')
+        && (call.body.sessionDescription as { sdp?: string } | undefined)?.sdp?.includes(SRFLX_CANDIDATE))).toBe(true));
+      expect(callsFetch.calls.some((call) => call.url.includes('/renegotiate'))).toBe(false);
       subscriber.close();
     });
 
@@ -991,6 +1057,17 @@ describe('livekit-calls-shim', () => {
       expect(findSendMid(sdp, 'video', new Set())).toBe('1');
       expect(findSendMid(sdp, 'video', new Set(['1']))).toBe('2');
       expect(findSendMid(sdp, 'audio', new Set())).toBeUndefined();
+    });
+
+    it('maps subscriptions to unclaimed explicit recvonly m-lines', () => {
+      expect(findRecvMid(RECVONLY_PUBLISHER_SDP, 'audio', new Set())).toBe('2');
+      expect(findRecvMid(RECVONLY_PUBLISHER_SDP, 'audio', new Set(['2']))).toBe('3');
+      expect(findRecvMid(RECVONLY_PUBLISHER_SDP, 'video', new Set())).toBe('5');
+      expect(findRecvMid(RECVONLY_PUBLISHER_SDP, 'video', new Set(['5', '6', '7']))).toBeUndefined();
+      // An SDP section without a direction defaults to sendrecv, not recvonly.
+      expect(findRecvMid(OFFER_SDP, 'video', new Set())).toBeUndefined();
+      const blocked = 'v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:9\r\na=inactive\r\n';
+      expect(findRecvMid(blocked, 'video', new Set())).toBeUndefined();
     });
 
     it('decodes JSON-mode SignalRequests', async () => {

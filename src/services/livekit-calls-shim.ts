@@ -7,9 +7,10 @@
 //   join_request (query) + SignalResponse.join   -> one Calls session per publisher PC
 //   SignalRequest.offer / add_track              -> POST /sessions/{id}/tracks/new (local)
 //   SignalResponse.track_published               -> synthesized TrackInfo for the client
-//   SignalRequest.subscription                   -> POST /sessions/{id}/tracks/new (remote)
+//   SignalRequest.subscription                   -> POST /sessions/{id}/tracks/new (remote, by mid)
+//                                                   + SignalResponse.update with TrackInfo.mid
 //   join (subscriber PC)                         -> POST /sessions/{id}/datachannels/establish -> offer
-//   SignalResponse.offer / SignalRequest.answer  -> subscriber negotiation + /renegotiate
+//   SignalResponse.offer / SignalRequest.answer  -> subscriber transport answer (establish only)
 //
 // Wire details verified against livekit/protocol livekit_rtc.proto and
 // livekit/client-sdk-js SignalClient.ts (see the report accompanying this
@@ -803,6 +804,12 @@ interface ShimParticipant {
    * the whole session.
    */
   publisherTransportAnswer?: string;
+  /**
+   * Latest gathered publisher offer. In single-PC (publisher-only) mode the
+   * SDK pre-populates this SDP with recvonly placeholder m-sections, which
+   * Calls can bind remote tracks into without generating a server offer.
+   */
+  publisherOfferSdp?: string;
   queues: Map<string, Promise<void>>;
   /** JSON-encoded LiveKit trickles, keyed by SignalTarget (PUBLISHER=0, SUBSCRIBER=1). */
   trickleCandidates: Map<number, TrickleCandidate[]>;
@@ -822,6 +829,8 @@ interface PendingTrack {
 
 interface PublishedTrack {
   sid: string;
+  /** Calls track name: the generated LiveKit TR sid, so the RTP msid maps back to it. */
+  callsTrackName: string;
   cid: string;
   trackName: string;
   type: number;
@@ -928,6 +937,36 @@ export function findSendMid(sdp: string, kind: 'audio' | 'video', claimed: Set<s
       sendCapable = false;
     } else if (line.startsWith('a=sendonly') || line.startsWith('a=sendrecv')) {
       if (sectionKind === kind) sendCapable = true;
+    }
+  }
+  return consider();
+}
+
+/**
+ * First explicitly recvonly m-line of `kind` whose mid is not already claimed,
+ * in section order. The SDK's single-PC publisher offer carries a fixed set of
+ * recvonly placeholders; Calls can bind a remote track into one by mid. A
+ * section without a direction attribute defaults to sendrecv (send-capable),
+ * so it is deliberately not a placeholder.
+ */
+export function findRecvMid(sdp: string, kind: 'audio' | 'video', claimed: Set<string>): string | undefined {
+  let sectionKind = '';
+  let mid: string | undefined;
+  let recvonly = false;
+  const consider = (): string | undefined => (mid && recvonly && !claimed.has(mid) ? mid : undefined);
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith('m=')) {
+      const found = consider();
+      if (found) return found;
+      sectionKind = line.slice(2).split(' ')[0] ?? '';
+      mid = undefined;
+      recvonly = false;
+    } else if (line.startsWith('a=mid:')) {
+      mid = line.slice(6).trim();
+    } else if (line.startsWith('a=recvonly')) {
+      if (sectionKind === kind) recvonly = true;
+    } else if (line.startsWith('a=sendonly') || line.startsWith('a=sendrecv') || line.startsWith('a=inactive')) {
+      recvonly = false;
     }
   }
   return consider();
@@ -1262,6 +1301,9 @@ export class LiveKitCallsShimSession {
     if (!sdp) return;
     const gatheredSdp = await this.gatherTrickleCandidates(0, sdp); // SignalTarget.PUBLISHER
     const p = this.participant;
+    // Keep the SDK's own m-lines: client-driven subscriptions bind remote
+    // Calls tracks into the recvonly placeholders in this offer.
+    p.publisherOfferSdp = gatheredSdp;
     await this.enqueue('publisher', async () => {
       const pending = [...p.pending.values()];
       // Calls rejects a local track without the mid of its own m-section
@@ -1269,12 +1311,17 @@ export class LiveKitCallsShimSession {
       // first unclaimed send-capable m-line of matching kind. The SDK adds
       // one sendonly section per new track, in pending order.
       const claimedMids = new Set(p.tracks.map((published) => published.mid));
-      const tracks: TrackObject[] = pending.map((track) => {
+      // Calls track names are the LiveKit TR sids: the SFU puts the track
+      // name in the RTP msid, which is how the SDK maps media back to a
+      // publication. Generate them before the REST call so the subscription
+      // path can reference the exact same name.
+      const prepared = pending.map((track) => ({ track, sid: randomId('TR') }));
+      const tracks: TrackObject[] = prepared.map(({ track, sid }) => {
         const mid = findSendMid(gatheredSdp, track.type === 0 ? 'audio' : 'video', claimedMids);
         if (mid) claimedMids.add(mid);
         return mid
-          ? { location: 'local', trackName: track.trackName, mid }
-          : { location: 'local', trackName: track.trackName };
+          ? { location: 'local', trackName: sid, mid }
+          : { location: 'local', trackName: sid };
       });
       if (tracks.length === 0) {
         // The SDK sends a trackless initial publisher offer on join, then a
@@ -1306,16 +1353,18 @@ export class LiveKitCallsShimSession {
       if (!answer || answer.type !== 'answer') throw new Error('Calls did not return an answer');
       const published: PublishedTrack[] = [];
       response.tracks.forEach((result, index) => {
-        const pendingTrack = pending[index];
-        if (!pendingTrack) return;
+        const preparedTrack = prepared[index];
+        if (!preparedTrack) return;
         if (result.errorCode) {
           console.error('[livekit-shim] track rejected:', result.errorCode, result.errorDescription);
           return;
         }
+        const pendingTrack = preparedTrack.track;
         p.pending.delete(pendingTrack.cid);
         const track: PublishedTrack = {
           ...pendingTrack,
-          sid: randomId('TR'),
+          sid: preparedTrack.sid,
+          callsTrackName: preparedTrack.sid,
           mimeType: inferMimeType(answer.sdp, result.mid, pendingTrack.type),
           mid: result.mid,
           ownerSid: p.sid,
@@ -1338,35 +1387,58 @@ export class LiveKitCallsShimSession {
     });
   }
 
+  /**
+   * Client-driven subscription. In publisher-only mode the SDK owns the only
+   * PeerConnection and silently drops server-generated offers, so instead of
+   * forwarding a Calls offer we pull the remote track into one of the SDK's
+   * own recvonly placeholder m-sections and tell the SDK about the binding
+   * with a TrackInfo.mid in an `update` frame.
+   */
   private async handleSubscription(value: Extract<SignalRequestJson, { message: 'subscription' }>['value']): Promise<void> {
     const p = this.participant;
     if (!p.identity.canSubscribe || value.subscribe === false) return;
-    // Calls rejects a second mutation on this session before the first
-    // SFU offer has been answered (HTTP 406). Wait for the initial answer.
-    if (p.pendingInitialOfferId !== undefined) {
-      await p.subscriberReady;
-      if (this.closed) return;
-    }
     for (const trackSid of value.trackSids ?? []) {
       const found = this.registry.findTrack(trackSid);
-      if (!found || found.owner.sid === p.sid) continue;
+      if (!found || found.owner.sid === p.sid || p.subscribedMids.has(trackSid)) continue;
       await this.enqueue('subscriber', async () => {
-        if (!p.subscriberSessionId) {
-          const session = await createSession(this.env);
-          p.subscriberSessionId = session.sessionId;
+        if (this.closed || !p.publisherSessionId) return;
+        const sdp = p.publisherOfferSdp;
+        if (!sdp) {
+          console.log('[livekit-shim] no publisher offer SDP to bind subscription', trackSid);
+          return;
         }
-        const response = await addTracks(this.env, p.subscriberSessionId, {
-          tracks: [{
-            location: 'remote',
-            sessionId: found.track.publisherSessionId,
-            trackName: found.track.trackName,
-          }],
-        });
-        const offer = response.sessionDescription;
-        if (!offer || offer.type !== 'offer') throw new Error('Calls did not return an offer');
-        const mid = response.tracks[0]?.mid;
-        p.subscribedMids.set(trackSid, mid ?? '');
-        this.sendCallsOffer(offer, mid ? { [mid]: trackSid } : undefined, response.requiresImmediateRenegotiation, trackSid);
+        // Local track mids come from Calls' answer and the already-bound
+        // placeholders are in subscribedMids; neither may be reused.
+        const claimed = new Set([...p.subscribedMids.values(), ...p.tracks.map((track) => track.mid)]);
+        const mid = findRecvMid(sdp, found.track.type === 0 ? 'audio' : 'video', claimed);
+        if (!mid) {
+          // Placeholder capacity is bounded by the SDK's offer. A failed
+          // subscription must not tear down the socket or other tracks.
+          console.log('[livekit-shim] no free recvonly placeholder for subscription', trackSid);
+          return;
+        }
+        try {
+          await addTracks(this.env, p.publisherSessionId, {
+            tracks: [{
+              location: 'remote',
+              sessionId: found.track.publisherSessionId,
+              trackName: found.track.callsTrackName,
+              mid,
+            }],
+          });
+        } catch (error) {
+          console.error('[livekit-shim] remote track bind failed:', error instanceof Error ? error.message : String(error));
+          return;
+        }
+        p.subscribedMids.set(trackSid, mid);
+        const owner = participantInfo(found.owner, 2);
+        owner.tracks = found.owner.tracks.map((track) => ({
+          ...participantTrackInfo(track),
+          // Preserve mids of tracks this client already bound; a partial
+          // update still has to describe all of the owner's publications.
+          mid: track.sid === trackSid ? mid : (p.subscribedMids.get(track.sid) ?? track.mid),
+        }));
+        this.send({ message: 'update', value: { participants: [owner] } });
       });
     }
   }
