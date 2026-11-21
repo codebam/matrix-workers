@@ -63,6 +63,37 @@ function toClientEvent(row: StoredEventRow): ClientEvent {
   return event;
 }
 
+// getRoomState returns the raw `content` column (redaction prunes into a
+// separate column), so load the pruned bodies for the room's state events.
+// Both invite stripped state and joined state use the same client-facing
+// content rule as sliding sync: redacted_content when present, else content.
+async function getStateRedactedContent(
+  db: D1Database,
+  roomId: string
+): Promise<Map<string, string>> {
+  const result = await db.prepare(
+    `SELECT e.event_id, e.redacted_content FROM room_state rs
+     JOIN events e ON rs.event_id = e.event_id
+     WHERE rs.room_id = ? AND e.redacted_content IS NOT NULL`
+  ).bind(roomId).all<{ event_id: string; redacted_content: string | null }>();
+  const pruned = new Map<string, string>();
+  for (const row of result.results) {
+    if (row.redacted_content) pruned.set(row.event_id, row.redacted_content);
+  }
+  return pruned;
+}
+
+function stateContent(content: unknown, redactedContent?: string | null): unknown {
+  if (redactedContent) {
+    try {
+      return JSON.parse(redactedContent);
+    } catch {
+      // Ignore malformed pruned content and fall back to the raw content.
+    }
+  }
+  return content;
+}
+
 const EVENT_COLUMNS =
   'event_id, room_id, sender, event_type, state_key, content, origin_server_ts, unsigned, redacted_content, stream_ordering';
 
@@ -107,9 +138,15 @@ async function buildRoomInfo(
   membership: string,
   messageLimit: number
 ): Promise<RoomInfo> {
+  const redacted = await getStateRedactedContent(db, roomId);
   const state = (await getRoomState(db, roomId)).map(e => ({
     type: e.type,
-    content: e.content,
+    // getRoomState drops redacted_content, so prefer the value fetched above;
+    // also honour it when a caller supplies it on the state row itself.
+    content: stateContent(
+      e.content,
+      redacted.get(e.event_id) ?? (e as typeof e & { redacted_content?: string | null }).redacted_content
+    ),
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,
