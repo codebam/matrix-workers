@@ -849,3 +849,29 @@ migration rows (names + applied_at), so `d1 migrations list` now reports
 Account-UIA live check was limited by stale dev test credentials; its
 401-challenge paths are covered by the account unit suites (623 tests
 across both flagged areas passed).
+
+#### The actual signature bug (found by durable PDU capture, `eaff5c9`)
+
+Two more messages posted by the user in #linux_group were still rejected
+after the first two fixes. A temporary fail-open build captured the exact
+failing wire PDU into CACHE KV (`diag:fed-pdu-signature`): a v9 m.room.redaction
+from @codebam:matrix.org with a valid matrix.org signature. Verifying its
+bytes locally against matrix.org's published key showed our canonical form
+VERIFIED — as long as `hashes` was included. The /send handler had been
+stripping `hashes` before verifyPdu ('avoid verifying twice'), so production
+verified a different byte string than Synapse signed, while self-signed
+fixtures that also stripped hashes stayed green. Fixed in `eaff5c9`: keep
+hashes in the verification view, add skipContentHash so the handler's
+existing hash check is not duplicated, fixture signers include hashes,
+strict rejection restored. Full suite 45,750/45,750.
+
+After that fix, new PDUs cleared signatures but failed the auth check with
+'Sender is not joined to the room': the earlier outage had dropped the
+sender's join event, leaving @codebam:matrix.org recorded as `invite`. With
+the user's approval a server-side state resync was applied to prod D1
+(adapted `/tmp/resync-room.py`: /state at our accepted join event, four
+sanity gates on real IDs, slot updates from authoritative pdus only, 83
+statements scoped to the one room). Both codebam accounts now read `join`
+with real event IDs. The user cannot rejoin from their matrix.org client
+because #linux_group is invite-only and it was nighttime. Final live
+confirmation awaits their next message in the room.
