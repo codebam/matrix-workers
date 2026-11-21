@@ -31,6 +31,9 @@ const oidcMocks = vi.hoisted(() => ({
   jwks: vi.fn(),
   exchange: vi.fn(),
   validate: vi.fn(),
+  buildOAuthAuthorizationUrl: vi.fn(),
+  exchangeOAuthCode: vi.fn(),
+  fetchOAuthUserInfo: vi.fn(),
 }));
 
 vi.mock('../src/services/oidc', async (importOriginal) => {
@@ -41,6 +44,9 @@ vi.mock('../src/services/oidc', async (importOriginal) => {
     fetchJWKS: oidcMocks.jwks,
     exchangeCodeForTokens: oidcMocks.exchange,
     validateIDToken: oidcMocks.validate,
+    buildOAuthAuthorizationUrl: oidcMocks.buildOAuthAuthorizationUrl,
+    exchangeOAuthCode: oidcMocks.exchangeOAuthCode,
+    fetchOAuthUserInfo: oidcMocks.fetchOAuthUserInfo,
   };
 });
 
@@ -100,6 +106,11 @@ interface ProviderRow {
   username_claim: string;
   display_order: number;
   icon_url: string | null;
+  provider_type?: string;
+  authorization_endpoint?: string | null;
+  token_endpoint?: string | null;
+  userinfo_endpoint?: string | null;
+  emails_endpoint?: string | null;
 }
 
 interface TokenRow {
@@ -263,6 +274,18 @@ beforeEach(() => {
   oidcMocks.jwks.mockReset().mockResolvedValue({ keys: [] });
   oidcMocks.exchange.mockReset().mockResolvedValue({ id_token: 'fake-id-token' });
   oidcMocks.validate.mockReset().mockResolvedValue({ sub: 'ext-1', email: 'alice@example.com', name: 'Alice' });
+  oidcMocks.buildOAuthAuthorizationUrl
+    .mockReset()
+    .mockReturnValue('https://github.com/login/oauth/authorize?client_id=client-id&state=oauth-state');
+  oidcMocks.exchangeOAuthCode
+    .mockReset()
+    .mockResolvedValue({ access_token: 'github-access-token', token_type: 'bearer' });
+  oidcMocks.fetchOAuthUserInfo.mockReset().mockResolvedValue({
+    sub: 'gh-42',
+    email: 'octocat@example.com',
+    name: 'Octocat',
+    preferred_username: 'octocat',
+  });
   emailMocks.createSession.mockReset().mockResolvedValue({ sessionId: 'sid-1', token: '123456' });
   emailMocks.sendEmail.mockReset().mockResolvedValue({ success: true });
   vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -399,6 +422,89 @@ describe('SSO callback → loginToken → POST /login integration', () => {
     const res = await oidcAuth.request(`http://localhost/auth/oidc/google/callback?code=authcode&state=${state}`, { method: 'GET' }, env);
     expect(res.status).toBe(200);
     expect(await res.text()).toContain('Login Successful');
+  });
+
+  it('OAuth2 provider runs the identical SSO loginToken flow using userinfo claims', async () => {
+    const endpoints = {
+      authorization_endpoint: 'https://github.com/login/oauth/authorize',
+      token_endpoint: 'https://github.com/login/oauth/access_token',
+      userinfo_endpoint: 'https://api.github.com/user',
+      emails_endpoint: 'https://api.github.com/user/emails',
+    };
+    const oauthProvider: ProviderRow = {
+      ...(await providerRow('github')),
+      provider_type: 'oauth2',
+      ...endpoints,
+    };
+    const kv = mockKv();
+    const db = createDb({ providers: [oauthProvider] });
+    const env = envFor(db, kv);
+    // Echo the real generated state into the mocked authorize URL so the
+    // callback can pick the stored OAuthState up by that same key.
+    oidcMocks.buildOAuthAuthorizationUrl.mockImplementation(
+      (_endpoints, _clientId, _redirectUri, _scopes, state: string) =>
+        `${endpoints.authorization_endpoint}?client_id=client-id&state=${state}`
+    );
+
+    const redirect = await get(
+      login,
+      `/_matrix/client/v3/login/sso/redirect/github?redirectUrl=${encodeURIComponent(CLIENT_REDIRECT)}`,
+      env
+    );
+    expect(redirect.status).toBe(302);
+    expect(oidcMocks.discovery).not.toHaveBeenCalled();
+    const location = redirect.headers.get('location')!;
+    expect(location.startsWith(endpoints.authorization_endpoint)).toBe(true);
+    const state = new URL(location).searchParams.get('state')!;
+    const storedState = JSON.parse(kv.data[`oidc_state:${state}`]);
+    expect(storedState.providerId).toBe('github');
+    expect(storedState.ssoRedirectUrl).toBe(CLIENT_REDIRECT);
+    expect(storedState.redirectUri).toContain('/auth/oidc/github/callback');
+    expect(oidcMocks.buildOAuthAuthorizationUrl).toHaveBeenCalledWith(
+      endpoints,
+      'client-id',
+      storedState.redirectUri,
+      'openid profile email',
+      state
+    );
+
+    const callback = await oidcAuth.request(
+      `http://localhost/auth/oidc/github/callback?code=ghcode&state=${state}`,
+      { method: 'GET' },
+      env
+    );
+    expect(callback.status).toBe(302);
+    const callbackLocation = new URL(callback.headers.get('location')!);
+    expect(callbackLocation.origin + callbackLocation.pathname).toBe(CLIENT_REDIRECT);
+    const loginToken = callbackLocation.searchParams.get('loginToken')!;
+    expect(loginToken).toBeTruthy();
+
+    expect(oidcMocks.exchangeOAuthCode).toHaveBeenCalledWith(
+      endpoints,
+      'client-id',
+      'client-secret',
+      'ghcode',
+      storedState.redirectUri
+    );
+    expect(oidcMocks.fetchOAuthUserInfo).toHaveBeenCalledWith(
+      endpoints,
+      'github-access-token'
+    );
+    expect(oidcMocks.validate).not.toHaveBeenCalled();
+    const tokenData = JSON.parse(kv.data[`login_token:${await hashToken(loginToken)}`]);
+    expect(tokenData.user_id).toBe(`@octocat:${SERVER}`);
+    expect(db.users.has(`@octocat:${SERVER}`)).toBe(true);
+
+    // Same client exchange as the OIDC case: POST /login with m.login.token.
+    const exchanged = await post(login, '/_matrix/client/v3/login', {
+      type: 'm.login.token',
+      token: loginToken,
+      device_id: 'CLIENTDEVICE',
+      initial_device_display_name: 'Element',
+    }, env);
+    expect(exchanged.status).toBe(200);
+    expect(exchanged.body.user_id).toBe(`@octocat:${SERVER}`);
+    expect(exchanged.body.device_id).toBe('CLIENTDEVICE');
   });
 });
 
