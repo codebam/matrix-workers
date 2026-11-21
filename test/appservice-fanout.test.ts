@@ -70,6 +70,9 @@ function asRow(id: string, roomRegex: string): AsRow {
 }
 
 type ToDeviceRow = {
+  id?: number;
+  stream_position?: number;
+  delivered?: number;
   recipient_user_id: string;
   sender_user_id: string;
   event_type: string;
@@ -85,12 +88,22 @@ function createDb(opts: {
   const appservices = opts.appservices ?? [];
   const roomVersion = opts.roomVersion ?? '10';
   const remoteMember = opts.remoteMember ?? false;
-  const toDevice = opts.toDevice ?? [];
+  const toDevice = (opts.toDevice ?? []).map((row, i) => ({
+    id: row.id ?? i + 1,
+    stream_position: row.stream_position ?? i + 1,
+    delivered: row.delivered ?? 0,
+    recipient_user_id: row.recipient_user_id,
+    sender_user_id: row.sender_user_id,
+    event_type: row.event_type,
+    content: row.content,
+  }));
   let stream = 10;
   let txnCounter = 0;
   const transactions: Array<{ id: number; asId: string; events: string }> = [];
   const sentUpdates: unknown[][] = [];
   const retryUpdates: unknown[][] = [];
+  const consumedIds: number[] = [];
+  const ackBatchSizes: number[] = [];
   const storedEvents: Array<Record<string, unknown>> = [];
 
   const stateEvents = [
@@ -160,7 +173,11 @@ function createDb(opts: {
           return { results: stateEvents as T[] };
         }
         if (sql.includes('FROM to_device_messages')) {
-          return { results: toDevice as T[] };
+          const pending = toDevice
+            .filter(row => row.delivered === 0)
+            .sort((a, b) => a.stream_position - b.stream_position)
+            .slice(0, 100);
+          return { results: pending as T[] };
         }
         return { results: [] as T[] };
       },
@@ -182,6 +199,18 @@ function createDb(opts: {
           retryUpdates.push(args);
           return { success: true, meta: { changes: 1 } };
         }
+        if (sql.includes('UPDATE to_device_messages SET delivered = 1')) {
+          ackBatchSizes.push(args.length);
+          let changes = 0;
+          for (const row of toDevice) {
+            if (row.delivered === 0 && args.includes(row.id)) {
+              row.delivered = 1;
+              consumedIds.push(row.id);
+              changes += 1;
+            }
+          }
+          return { success: true, meta: { changes } };
+        }
         return { success: true, meta: { changes: 1 } };
       },
     });
@@ -192,6 +221,9 @@ function createDb(opts: {
     transactions,
     sentUpdates,
     retryUpdates,
+    consumedIds,
+    ackBatchSizes,
+    toDevice,
     storedEvents,
     prepare: (sql: string) => stmt(sql),
   };
@@ -366,6 +398,110 @@ describe('fanoutEventToAppServices (service)', () => {
         content: { algorithm: 'm.megolm.v1.aes-sha2' },
       },
     ]);
+    // Only the namespace-matched row is consumed; the outside-namespace row
+    // stays pending for its own owner.
+    expect(db.consumedIds).toEqual([1]);
+    expect(db.toDevice.find(row => row.id === 2)?.delivered).toBe(0);
+  });
+
+  it('does not repeat the same to-device event on a second successful transaction', async () => {
+    const bot = '@_bridge_bot:example.com';
+    const bridge = {
+      ...asRow('bridge', '^!r:example\\.com$'),
+      namespaces: JSON.stringify({
+        users: [{ exclusive: true, regex: '^@_bridge_.*:example\\.com$' }],
+        rooms: [{ exclusive: false, regex: '^!r:example\\.com$' }],
+        aliases: [],
+      }),
+    };
+    const db = createDb({
+      appservices: [bridge],
+      toDevice: [{
+        recipient_user_id: bot,
+        sender_user_id: ALICE,
+        event_type: 'm.room_key',
+        content: JSON.stringify({ k: 1 }),
+      }],
+    });
+    const env = envFor(db);
+    const sentToDevice = (call: number) => {
+      const [, init] = fetchMock.mock.calls[call] as [string, RequestInit];
+      return (JSON.parse(String(init.body)) as { to_device: unknown[] }).to_device;
+    };
+
+    await fanoutEventToAppServices(env, EVENT);
+    expect(sentToDevice(0)).toEqual([{ type: 'm.room_key', sender: ALICE, content: { k: 1 } }]);
+    expect(db.consumedIds).toEqual([1]);
+
+    await fanoutEventToAppServices(env, EVENT);
+    expect(sentToDevice(1)).toEqual([]);
+    expect(db.consumedIds).toEqual([1]);
+  });
+
+  it('leaves to-device messages pending when the transaction PUT fails', async () => {
+    const bot = '@_bridge_bot:example.com';
+    const bridge = {
+      ...asRow('bridge', '^!r:example\\.com$'),
+      namespaces: JSON.stringify({
+        users: [{ exclusive: true, regex: '^@_bridge_.*:example\\.com$' }],
+        rooms: [{ exclusive: false, regex: '^!r:example\\.com$' }],
+        aliases: [],
+      }),
+    };
+    const db = createDb({
+      appservices: [bridge],
+      toDevice: [{
+        recipient_user_id: bot,
+        sender_user_id: ALICE,
+        event_type: 'm.room_key',
+        content: JSON.stringify({ k: 2 }),
+      }],
+    });
+    const env = envFor(db);
+    const sentToDevice = (call: number) => {
+      const [, init] = fetchMock.mock.calls[call] as [string, RequestInit];
+      return (JSON.parse(String(init.body)) as { to_device: unknown[] }).to_device;
+    };
+
+    fetchMock.mockImplementationOnce(async () => new Response('bridge down', { status: 500 }));
+    await fanoutEventToAppServices(env, EVENT);
+    expect(sentToDevice(0)).toEqual([{ type: 'm.room_key', sender: ALICE, content: { k: 2 } }]);
+    expect(db.consumedIds).toEqual([]);
+    expect(db.retryUpdates).toHaveLength(1);
+
+    await fanoutEventToAppServices(env, EVENT);
+    expect(sentToDevice(1)).toEqual([{ type: 'm.room_key', sender: ALICE, content: { k: 2 } }]);
+    expect(db.consumedIds).toEqual([1]);
+  });
+
+  it('caps to-device delivery at 100 and acknowledges in D1-safe batches', async () => {
+    const bot = '@_bridge_bot:example.com';
+    const bridge = {
+      ...asRow('bridge', '^!r:example\\.com$'),
+      namespaces: JSON.stringify({
+        users: [{ exclusive: true, regex: '^@_bridge_.*:example\\.com$' }],
+        rooms: [{ exclusive: false, regex: '^!r:example\\.com$' }],
+        aliases: [],
+      }),
+    };
+    const db = createDb({
+      appservices: [bridge],
+      toDevice: Array.from({ length: 120 }, (_, i) => ({
+        recipient_user_id: bot,
+        sender_user_id: ALICE,
+        event_type: 'm.room_key',
+        content: JSON.stringify({ n: i }),
+      })),
+    });
+
+    await fanoutEventToAppServices(envFor(db), EVENT);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const sent = JSON.parse(String(init.body)) as { to_device: unknown[] };
+    expect(sent.to_device).toHaveLength(100);
+    expect(db.consumedIds).toHaveLength(100);
+    expect(db.ackBatchSizes).toEqual([90, 10]);
+    expect(db.toDevice.filter(row => row.delivered === 1)).toHaveLength(100);
   });
 
   it('does nothing when no appservices are registered', async () => {
