@@ -64,11 +64,24 @@ vi.mock('../src/api/account-data', async (importOriginal) => {
   };
 });
 
+const getUserRooms = vi.fn();
+const getEventsSince = vi.fn();
+
+vi.mock('../src/services/database', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/services/database')>();
+  return {
+    ...actual,
+    getUserRooms: (...args: unknown[]) => getUserRooms(...args),
+    getEventsSince: (...args: unknown[]) => getEventsSince(...args),
+  };
+});
+
 import slidingSyncApp from '../src/api/sliding-sync';
 
 const USER = '@alice:example.com';
 const BOB = '@bob:example.com';
 const CAROL = '@carol:example.com';
+const REMOTE = '@bob:remote.example';
 const DEVICE = 'DEVICEA';
 
 const MSC3575 = '/_matrix/client/unstable/org.matrix.msc3575/sync';
@@ -128,6 +141,7 @@ function createSlidingDb(opts: {
   sharedRoomUsers?: string[];
   otkCounts?: Array<{ algorithm: string; count: number }>;
   fallbackAlgos?: Array<{ algorithm: string }>;
+  leftRoomMembers?: string[];
 } = {}) {
   const maxStreamPos = opts.maxStreamPos === undefined ? 42 : opts.maxStreamPos;
   const deviceKeyChanges = opts.deviceKeyChanges ?? [];
@@ -142,6 +156,9 @@ function createSlidingDb(opts: {
     }
     if (sql.includes('FROM fallback_keys') && sql.includes('DISTINCT algorithm')) {
       return fallbackAlgos;
+    }
+    if (sql.includes("membership IN ('join', 'leave', 'ban')")) {
+      return (opts.leftRoomMembers ?? []).map(user_id => ({ user_id }));
     }
     if (
       sql.includes('FROM device_key_changes dkc') &&
@@ -255,6 +272,8 @@ function e2eeLists(body: Record<string, unknown>): { changed: string[]; left: st
 
 beforeEach(() => {
   vi.clearAllMocks();
+  getUserRooms.mockReset().mockResolvedValue([]);
+  getEventsSince.mockReset().mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -430,11 +449,11 @@ describe.each(PATHS)('%s sliding e2ee — empty / initial maps', (_label, path) 
 });
 
 // ---------------------------------------------------------------------------
-// left always empty + OTK alongside
+// left stays empty without membership transitions + OTK alongside
 // ---------------------------------------------------------------------------
 
 describe.each(PATHS)('%s sliding e2ee — left + OTK co-presence', (_label, path) => {
-  it('always returns left: [] even when peers changed', async () => {
+  it('returns left: [] when only device keys changed (no room departures)', async () => {
     const env = createEnv({
       db: createSlidingDb({
         maxStreamPos: 50,
@@ -452,5 +471,42 @@ describe.each(PATHS)('%s sliding e2ee — left + OTK co-presence', (_label, path
     expect(e2ee.device_lists).toEqual({ changed: [BOB], left: [] });
     expect(e2ee.device_one_time_keys_count).toEqual({ signed_curve25519: 7 });
     expect(e2ee.device_unused_fallback_key_types).toEqual(['signed_curve25519']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// device_lists.left after the caller leaves a shared room
+// ---------------------------------------------------------------------------
+
+describe.each(PATHS)('%s sliding e2ee — device_lists.left', (_label, path) => {
+  it('lists remote members of a room the caller left since pos', async () => {
+    getUserRooms.mockImplementation(async (_db: unknown, _u: string, membership?: string) =>
+      membership === 'leave' ? ['!left:example.com'] : []
+    );
+    getEventsSince.mockResolvedValue([
+      { type: 'm.room.member', state_key: USER, content: { membership: 'leave' } },
+    ]);
+    const env = createEnv({
+      db: createSlidingDb({
+        maxStreamPos: 60,
+        leftRoomMembers: [REMOTE, BOB], // BOB is local and must be excluded
+      }),
+    });
+    const { body } = await postSync(path, env, {
+      pos: '50',
+      extensions: { e2ee: { enabled: true } },
+    });
+    expect(e2eeLists(body).left).toEqual([REMOTE]);
+  });
+
+  it('keeps left empty when no membership transition is in the window', async () => {
+    const env = createEnv({
+      db: createSlidingDb({ maxStreamPos: 60, leftRoomMembers: [BOB] }),
+    });
+    const { body } = await postSync(path, env, {
+      pos: '50',
+      extensions: { e2ee: {} },
+    });
+    expect(e2eeLists(body).left).toEqual([]);
   });
 });

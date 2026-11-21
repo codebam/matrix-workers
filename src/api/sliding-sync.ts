@@ -9,6 +9,7 @@ import { getTypingForRooms } from './typing';
 import { getReceiptsForRooms } from './receipts';
 import { countNotificationsWithRules } from '../services/push-rule-evaluator';
 import { getInvitePermission } from '../services/database';
+import { getDeviceListRemovals } from './sync';
 // Room cache helper available for future optimizations
 // import { getRoomMetadata, invalidateRoomCache, type RoomMetadata } from '../services/room-cache';
 
@@ -1338,10 +1339,16 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
       }
 
+      // device_lists.left uses the event stream (rooms the caller left / was
+      // banned from), not the device-key stream position.
+      const deviceListLeft = sincePos > 0
+        ? await getDeviceListRemovals(db, userId, sincePos, c.env.SERVER_NAME)
+        : [];
+
       response.extensions.e2ee = {
         device_lists: {
           changed: deviceListChanged,
-          left: [],
+          left: deviceListLeft,
         },
         device_one_time_keys_count: keyCounts,
         device_unused_fallback_key_types: unusedFallbackTypes,
@@ -2035,8 +2042,14 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         deviceListChanged.push(...(changes.results as { user_id: string }[]).map(row => row.user_id));
       }
 
+      // device_lists.left uses the event stream (rooms the caller left / was
+      // banned from), not the device-key stream position.
+      const deviceListLeft = sincePos > 0
+        ? await getDeviceListRemovals(db, userId, sincePos, c.env.SERVER_NAME)
+        : [];
+
       response.extensions.e2ee = {
-        device_lists: { changed: deviceListChanged, left: [] },
+        device_lists: { changed: deviceListChanged, left: deviceListLeft },
         device_one_time_keys_count: keyCounts,
         device_unused_fallback_key_types: unusedFallbackTypes,
       };

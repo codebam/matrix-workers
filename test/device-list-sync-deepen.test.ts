@@ -312,8 +312,9 @@ describe('GET /sync device_lists — added deltas', () => {
     expect(body.device_lists).toEqual({ changed: [BOB, USER], left: [] });
   });
 
-  it('never puts deleted peers into left (implementation returns left:[])', async () => {
-    // Sync path does not read change_type — even if peers "left", left stays empty
+  it('never puts deleted peers into left from device_key_changes alone', async () => {
+    // left derives from membership transitions in rooms.leave, not change_type
+    // on a device-key row (which may be a deletion/replacement).
     const env = createEnv({
       db: createSyncDb({
         deviceKeyChanges: [{ user_id: BOB, stream_position: 50 }],

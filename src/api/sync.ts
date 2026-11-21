@@ -9,6 +9,10 @@ import type {
   LeftRoom,
   KnockedRoom,
   StrippedStateEvent,
+  RoomSummary,
+  PresenceEvent,
+  PresenceState,
+  PDU,
   Env,
 } from '../types';
 import { requireAuth } from '../middleware/auth';
@@ -51,6 +55,10 @@ interface EventFilter {
   /** MSC2732: only send the user's own + timeline senders' memberships. */
   lazy_load_members?: boolean;
   include_leave?: boolean;
+  /** Spec filter.event_format: 'client' strips federation-only PDU fields. */
+  event_format?: 'client' | 'federation';
+  /** Spec filter.event_fields: project each event to these top-level fields. */
+  event_fields?: string[];
 }
 
 interface RoomFilter {
@@ -146,7 +154,67 @@ export function applyEventFilter(events: any[], filter?: EventFilter): any[] {
     result = result.slice(0, filter.limit);
   }
 
-  return result;
+  // Spec event_format / event_fields: the filter may be set globally (on the
+  // filter object) or on an individual room/event section; either way the
+  // projection happens here, after matching and limiting.
+  if (!filter.event_format && !(filter.event_fields && filter.event_fields.length > 0)) {
+    return result;
+  }
+  return result.map(event => projectEvent(event, filter));
+}
+
+// Fields that only exist on federation-format PDUs. Client sync events must
+// not carry them; federation format keeps whatever the event already has.
+const FEDERATION_ONLY_EVENT_FIELDS = [
+  'auth_events',
+  'prev_events',
+  'depth',
+  'hashes',
+  'signatures',
+] as const;
+
+function projectEvent(event: any, filter: EventFilter): any {
+  let projected = event;
+  if (filter.event_format === 'client') {
+    if (FEDERATION_ONLY_EVENT_FIELDS.some(field => field in projected)) {
+      projected = { ...event };
+      for (const field of FEDERATION_ONLY_EVENT_FIELDS) delete projected[field];
+    }
+  }
+  if (filter.event_fields && filter.event_fields.length > 0) {
+    const picked: Record<string, unknown> = {};
+    for (const field of filter.event_fields) {
+      if (Object.prototype.hasOwnProperty.call(projected, field)) {
+        picked[field] = projected[field];
+      }
+    }
+    projected = picked;
+  }
+  return projected;
+}
+
+// The spec puts event_format / event_fields at the top level of the filter,
+// while the section filters carry the type/sender rules. Merge the two so a
+// single applyEventFilter call handles both.
+function withEventFormat(filter: SyncFilter | null, section?: EventFilter): EventFilter | undefined {
+  if (!filter) return section;
+  if (!section && !filter.event_format && !filter.event_fields) return undefined;
+  const merged: EventFilter = { ...(section ?? {}) };
+  if (filter.event_format) merged.event_format = filter.event_format;
+  if (filter.event_fields) merged.event_fields = filter.event_fields;
+  return merged;
+}
+
+// PDU-only fields are not part of the client event shape; keep them out of
+// the response unless the client explicitly asked for federation format.
+function federationEventFields(event: PDU): Record<string, unknown> {
+  return {
+    depth: event.depth,
+    auth_events: event.auth_events,
+    prev_events: event.prev_events,
+    ...(event.hashes ? { hashes: event.hashes } : {}),
+    ...(event.signatures ? { signatures: event.signatures } : {}),
+  };
 }
 
 // Check if a room should be included based on room filter
@@ -202,11 +270,67 @@ async function getUnusedFallbackKeyTypes(
   return keys.results.map(row => row.algorithm);
 }
 
+// A user belongs to another server when the MXID's domain differs from ours.
+// We only advertise device_lists.left for those users: local users remain
+// reachable through the local /keys API and must not be dropped.
+function isRemoteUser(userId: string, serverName: string): boolean {
+  const colon = userId.indexOf(':');
+  return colon > 0 && userId.slice(colon + 1) !== serverName;
+}
+
+// device_lists.left: users we no longer share a room with because the CALLER
+// left or was banned from rooms since the token. Reuses the rooms.leave
+// detection mechanism (getUserRooms + membership events since `since`), and
+// reads the room's membership rows for the users who were in those rooms.
+// Remote membership rows survive the departure locally, so they can be
+// enumerated from room_memberships without another table. Exported for tests.
+export async function getDeviceListRemovals(
+  db: D1Database,
+  userId: string,
+  sincePosition: number,
+  serverName: string
+): Promise<string[]> {
+  if (sincePosition <= 0 || !serverName) return [];
+
+  const [leftRoomIds, bannedRoomIds] = await Promise.all([
+    getUserRooms(db, userId, 'leave'),
+    getUserRooms(db, userId, 'ban'),
+  ]);
+  const roomIds = [...new Set([...leftRoomIds, ...bannedRoomIds])];
+  const left: string[] = [];
+  const seen = new Set<string>();
+
+  for (const roomId of roomIds) {
+    const events = await getEventsSince(db, roomId, sincePosition);
+    const departure = events.find(event => {
+      if (event.type !== 'm.room.member' || event.state_key !== userId) return false;
+      const membership = (event.content as { membership?: unknown } | undefined)?.membership;
+      return membership === 'leave' || membership === 'ban';
+    });
+    if (!departure) continue;
+
+    const members = await db.prepare(`
+      SELECT user_id FROM room_memberships
+      WHERE room_id = ? AND user_id != ? AND membership IN ('join', 'leave', 'ban')
+    `).bind(roomId, userId).all<{ user_id: string }>();
+
+    for (const member of members.results) {
+      if (!isRemoteUser(member.user_id, serverName) || seen.has(member.user_id)) continue;
+      seen.add(member.user_id);
+      left.push(member.user_id);
+    }
+  }
+
+  return left;
+}
+
 // Helper to get device list changes (users whose keys have changed since last sync)
 async function getDeviceListChanges(
   db: D1Database,
   userId: string,
-  sincePosition: number
+  sinceDeviceKeysPosition: number,
+  sinceEventsPosition: number,
+  serverName: string
 ): Promise<{ changed: string[]; left: string[] }> {
   // Get users in shared rooms whose device keys have changed
   // Note: We now include the user's own changes as well, because
@@ -222,7 +346,7 @@ async function getDeviceListChanges(
         WHERE rm1.user_id = ? AND rm1.membership = 'join'
           AND rm2.user_id = dkc.user_id AND rm2.membership = 'join'
       )
-  `).bind(sincePosition, userId, userId).all<{ user_id: string }>();
+  `).bind(sinceDeviceKeysPosition, userId, userId).all<{ user_id: string }>();
 
   // Check if the user's own keys have changed (for cross-signing signatures)
   const selfChanged = await db.prepare(`
@@ -230,7 +354,7 @@ async function getDeviceListChanges(
     FROM device_key_changes dkc
     WHERE dkc.stream_position > ?
       AND dkc.user_id = ?
-  `).bind(sincePosition, userId).first<{ count: number }>();
+  `).bind(sinceDeviceKeysPosition, userId).first<{ count: number }>();
 
   const changedUsers = otherUsersChanged.results.map(row => row.user_id);
 
@@ -239,10 +363,9 @@ async function getDeviceListChanges(
     changedUsers.push(userId);
   }
 
-  // For left, we'd track users who left shared rooms, but for simplicity return empty for now
   return {
     changed: changedUsers,
-    left: [],
+    left: await getDeviceListRemovals(db, userId, sinceEventsPosition, serverName),
   };
 }
 
@@ -260,6 +383,119 @@ async function getPrunedContentMap(
   return new Map(
     redactedRows.results.map(r => [r.event_id, JSON.parse(r.redacted_content)] as const)
   );
+}
+
+// rooms.join.<roomId>.summary. Spec: heroes are only needed for rooms with no
+// m.room.name, so named rooms omit the whole summary object. Heroes mirror the
+// sliding-sync logic: up to five other joined members.
+async function getRoomSummary(
+  db: D1Database,
+  roomId: string,
+  userId: string
+): Promise<RoomSummary | undefined> {
+  const named = await db.prepare(`
+    SELECT event_id FROM room_state WHERE room_id = ? AND event_type = 'm.room.name'
+  `).bind(roomId).all<{ event_id: string }>();
+  if (named.results.length > 0) return undefined;
+
+  const [counts, heroes] = await Promise.all([
+    db.prepare(`
+      SELECT membership, COUNT(*) as count FROM room_memberships
+      WHERE room_id = ? AND membership IN ('join', 'invite')
+      GROUP BY membership
+    `).bind(roomId).all<{ membership: string; count: number }>(),
+    db.prepare(`
+      SELECT user_id, display_name, avatar_url FROM room_memberships
+      WHERE room_id = ? AND membership = 'join' AND user_id != ?
+      LIMIT 5
+    `).bind(roomId, userId).all<{
+      user_id: string;
+      display_name: string | null;
+      avatar_url: string | null;
+    }>(),
+  ]);
+
+  let joined = 0;
+  let invited = 0;
+  for (const row of counts.results) {
+    if (row.membership === 'join') joined = row.count;
+    if (row.membership === 'invite') invited = row.count;
+  }
+
+  return {
+    'm.heroes': heroes.results.map(h => h.user_id),
+    'm.joined_member_count': joined,
+    'm.invited_member_count': invited,
+  };
+}
+
+const PRESENCE_TIMEOUT_MS = 5 * 60 * 1000;
+
+// PARTIAL presence implementation for legacy /sync.
+//
+// The `presence` table stores current state only. The `stream_positions` row
+// named 'presence' exists but no code ever advances it, and there is no
+// presence-change table/column, so we cannot know which users changed since a
+// sync token. Rather than fake incremental deltas, this emits the caller's own
+// and shared-room users' CURRENT presence on initial sync only; incremental
+// syncs return no presence events. It does not cover: changes after the first
+// sync, users who stop sharing a room, or presence-derived transitions
+// (online -> unavailable after the inactivity timeout). See the report for
+// the schema change that would enable real per-token deltas.
+/** Exported for unit tests. */
+export async function getInitialPresenceEvents(
+  db: D1Database,
+  userId: string,
+  roomIds: string[]
+): Promise<PresenceEvent[]> {
+  const userIds = new Set<string>([userId]);
+  for (const roomId of roomIds) {
+    const members = await db.prepare(`
+      SELECT user_id FROM room_memberships WHERE room_id = ? AND membership = 'join'
+    `).bind(roomId).all<{ user_id: string }>();
+    for (const member of members.results) userIds.add(member.user_id);
+  }
+
+  // Chunk the IN clause: large rooms can exceed SQLite's bind-variable limit.
+  const ids = [...userIds];
+  const rows: Array<{
+    user_id: string;
+    presence: string;
+    status_msg: string | null;
+    last_active_ts: number | null;
+  }> = [];
+  for (let i = 0; i < ids.length; i += 500) {
+    const chunk = ids.slice(i, i + 500);
+    const placeholders = chunk.map(() => '?').join(',');
+    const result = await db.prepare(`
+      SELECT user_id, presence, status_msg, last_active_ts
+      FROM presence WHERE user_id IN (${placeholders})
+    `).bind(...chunk).all<{
+      user_id: string;
+      presence: string;
+      status_msg: string | null;
+      last_active_ts: number | null;
+    }>();
+    rows.push(...result.results);
+  }
+
+  const now = Date.now();
+  return rows.map(row => {
+    const lastActiveTs = row.last_active_ts ?? 0;
+    const isActive = lastActiveTs > 0 && now - lastActiveTs < PRESENCE_TIMEOUT_MS;
+    const effectivePresence: PresenceState =
+      row.presence === 'online' && !isActive ? 'unavailable' : row.presence as PresenceState;
+    return {
+      type: 'm.presence' as const,
+      sender: row.user_id,
+      content: {
+        presence: effectivePresence,
+        ...(row.status_msg ? { status_msg: row.status_msg } : {}),
+        last_active_ago: Math.max(0, now - lastActiveTs),
+        currently_active: isActive && effectivePresence === 'online',
+      },
+    };
+  });
 }
 
 const app = new Hono<AppEnv>();
@@ -354,6 +590,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   if (filterParam && !filter) {
     console.log('[sync] Using no filter (filter not found or invalid)');
   }
+  const federationFormat = filter?.event_format === 'federation';
 
   // Parse composite sync token (separate positions per stream)
   const {
@@ -441,7 +678,13 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
   // Get device list changes (users whose keys have changed since last sync)
   if (hasSinceToken) {
-    const deviceListChanges = await getDeviceListChanges(c.env.DB, userId, sinceDeviceKeysPos);
+    const deviceListChanges = await getDeviceListChanges(
+      c.env.DB,
+      userId,
+      sinceDeviceKeysPos,
+      sincePosition,
+      c.env.SERVER_NAME
+    );
     if (deviceListChanges.changed.length > 0 || deviceListChanges.left.length > 0) {
       response.device_lists = deviceListChanges;
     }
@@ -465,7 +708,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     hasSinceToken ? sinceAccountDataPos : undefined
   );
   // Apply account_data filter to global account data
-  globalAccountData = applyEventFilter(globalAccountData, filter?.account_data);
+  globalAccountData = applyEventFilter(globalAccountData, withEventFormat(filter, filter?.account_data));
   response.account_data!.events = globalAccountData;
 
   // Debug: Log global account_data that will be returned (for initial sync)
@@ -516,6 +759,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         event_id: event.event_id,
         room_id: event.room_id,
         unsigned: event.unsigned,
+        ...(federationFormat ? federationEventFields(event) : {}),
       };
 
       if (event.state_key !== undefined) {
@@ -553,6 +797,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
             origin_server_ts: event.origin_server_ts,
             event_id: event.event_id,
             room_id: event.room_id,
+            ...(federationFormat ? federationEventFields(event) : {}),
           };
           if (!stateEvents.find(e => e.event_id === event.event_id)) {
             stateEvents.push(clientEvent);
@@ -573,6 +818,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
           origin_server_ts: event.origin_server_ts,
           event_id: event.event_id,
           room_id: event.room_id,
+          ...(federationFormat ? federationEventFields(event) : {}),
         };
         // Only add if not already in state events from timeline
         if (!stateEvents.find(e => e.event_id === event.event_id)) {
@@ -582,8 +828,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
 
     // Apply filters to state and timeline events
-    stateEvents = applyEventFilter(stateEvents, filter?.room?.state);
-    timelineEvents = applyEventFilter(timelineEvents, filter?.room?.timeline);
+    stateEvents = applyEventFilter(stateEvents, withEventFormat(filter, filter?.room?.state));
+    timelineEvents = applyEventFilter(timelineEvents, withEventFormat(filter, filter?.room?.timeline));
 
     // MSC2732 lazy loading: clients (Element Web by default) ask for only
     // their own membership plus the memberships of timeline senders, instead
@@ -640,6 +886,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
           origin_server_ts: e.origin_server_ts,
           event_id: e.event_id,
           room_id: e.room_id,
+          ...(federationFormat ? federationEventFields(e) : {}),
         })),
       };
     }
@@ -653,7 +900,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       hasSinceToken ? sinceAccountDataPos : undefined
     );
     // Apply account_data filter to room account data
-    roomAccountData = applyEventFilter(roomAccountData, filter?.room?.account_data);
+    roomAccountData = applyEventFilter(
+      roomAccountData,
+      withEventFormat(filter, filter?.room?.account_data)
+    );
     joinedRoom.account_data!.events = roomAccountData;
 
     // Get read receipts for this room (from Room Durable Object)
@@ -675,8 +925,11 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     // Apply ephemeral filter
     joinedRoom.ephemeral!.events = applyEventFilter(
       joinedRoom.ephemeral!.events,
-      filter?.room?.ephemeral
+      withEventFormat(filter, filter?.room?.ephemeral)
     );
+
+    const summary = await getRoomSummary(c.env.DB, roomId, userId);
+    if (summary) joinedRoom.summary = summary;
 
     response.rooms!.join![roomId] = joinedRoom;
   }
@@ -717,7 +970,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }));
 
     // Apply state filter to invited room state
-    strippedState = applyEventFilter(strippedState, filter?.room?.state);
+    strippedState = applyEventFilter(strippedState, withEventFormat(filter, filter?.room?.state));
 
     const invitedRoom: InvitedRoom = {
       invite_state: {
@@ -752,7 +1005,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         sender: event.sender,
       }));
 
-    strippedState = applyEventFilter(strippedState, filter?.room?.state);
+    strippedState = applyEventFilter(strippedState, withEventFormat(filter, filter?.room?.state));
 
     const knockedRoom: KnockedRoom = {
       knock_state: {
@@ -802,6 +1055,20 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         response.rooms!.leave![roomId] = leftRoom;
       }
     }
+  }
+
+  // Presence (partial fallback — see getInitialPresenceEvents above): only
+  // initial sync can be populated truthfully without a presence-change stream.
+  if (!hasSinceToken) {
+    const presenceEvents = await getInitialPresenceEvents(
+      c.env.DB,
+      userId,
+      Object.keys(response.rooms!.join!)
+    );
+    response.presence!.events = applyEventFilter(
+      presenceEvents,
+      withEventFormat(filter, filter?.presence)
+    );
   }
 
   // Check if there are any changes to return

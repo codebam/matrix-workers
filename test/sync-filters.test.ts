@@ -299,6 +299,64 @@ describe('sync filters TOKENMAXX edge paths after #55', () => {
   });
 });
 
+describe('applyEventFilter event_format / event_fields', () => {
+  const pdu = {
+    type: 'm.room.message',
+    sender: '@alice:example.com',
+    content: { body: 'hi' },
+    event_id: '$1:example.com',
+    origin_server_ts: 1,
+    depth: 3,
+    auth_events: ['$auth:example.com'],
+    prev_events: ['$prev:example.com'],
+    hashes: { sha256: 'abc' },
+    signatures: { 'example.com': { ed25519: 'sig' } },
+  };
+
+  it('event_format: client strips federation-only PDU fields', () => {
+    const result = applyEventFilter([pdu], { event_format: 'client' });
+    expect(Object.keys(result[0]).sort()).toEqual([
+      'content',
+      'event_id',
+      'origin_server_ts',
+      'sender',
+      'type',
+    ]);
+    // input is not mutated
+    expect(pdu).toHaveProperty('depth', 3);
+  });
+
+  it('event_format: federation keeps the PDU fields already present', () => {
+    expect(applyEventFilter([pdu], { event_format: 'federation' })[0]).toEqual(pdu);
+  });
+
+  it('event_fields projects to top-level fields only', () => {
+    expect(
+      applyEventFilter([pdu], { event_fields: ['type', 'event_id', 'content', 'missing'] })[0]
+    ).toEqual({ type: 'm.room.message', event_id: '$1:example.com', content: { body: 'hi' } });
+  });
+
+  it('empty or missing event_fields keeps all fields', () => {
+    expect(applyEventFilter([pdu], { event_fields: [] })[0]).toEqual(pdu);
+    expect(applyEventFilter([pdu], {})[0]).toEqual(pdu);
+  });
+
+  it('event_fields is applied after event_format', () => {
+    expect(
+      applyEventFilter([pdu], { event_format: 'client', event_fields: ['type', 'depth'] })[0]
+    ).toEqual({ type: 'm.room.message' });
+  });
+
+  it('event_fields combines with type/sender filters and limit', () => {
+    expect(
+      applyEventFilter(
+        [pdu, { ...pdu, type: 'm.reaction', event_id: '$2:example.com' }],
+        { types: ['m.reaction'], limit: 1, event_fields: ['event_id'] }
+      )
+    ).toEqual([{ event_id: '$2:example.com' }]);
+  });
+});
+
 describe('sync filters TOKENMAXX leftovers after #78 (client sync filter helpers)', () => {
   it('matches any type pattern in a multi-entry whitelist (OR)', () => {
     expect(

@@ -2290,6 +2290,12 @@ describe('GET /sync — room account_data since + empty join scaffolding', () =>
       state: { events: [] },
       ephemeral: { events: [] },
       account_data: { events: [] },
+      // Unnamed room → summary with zero heroes/counts (spec).
+      summary: {
+        'm.heroes': [],
+        'm.joined_member_count': 0,
+        'm.invited_member_count': 0,
+      },
     });
   });
 
