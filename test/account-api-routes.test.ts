@@ -944,18 +944,21 @@ describe('POST /_matrix/client/v3/account/deactivate', () => {
     expect(res.status).toBe(401);
   });
 
-  it('forbids deactivation with wrong password when hash exists', async () => {
-    const env = createEnv();
+  it('challenges UIA and does not deactivate when password is wrong', async () => {
+    const db = createAccountDb();
+    const env = createEnv({ db });
     const res = await request(
       env,
       '/_matrix/client/v3/account/deactivate',
       jsonInit('POST', { auth: passwordAuth('nope') })
     );
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
     expect(res.body).toMatchObject({
-      errcode: 'M_FORBIDDEN',
-      error: 'Invalid password',
+      flows: [{ stages: ['m.login.password'] }],
+      params: {},
+      session: 'pinned-uia-session-16',
     });
+    expect(db.users.get(USER)?.is_deactivated).toBe(0);
   });
 
   it('deactivates and deletes tokens without erase', async () => {
@@ -1015,7 +1018,7 @@ describe('POST /_matrix/client/v3/account/deactivate', () => {
     expect(db.users.get(USER)?.avatar_url).toBeNull();
   });
 
-  it('allows deactivation when no password hash is set (skips verify)', async () => {
+  it('rejects the bare password stage for a passwordless account', async () => {
     const db = createAccountDb({ passwordHashes: new Map([[USER, null]]) });
     const env = createEnv({ db });
     const res = await request(
@@ -1025,13 +1028,17 @@ describe('POST /_matrix/client/v3/account/deactivate', () => {
         auth: { type: 'm.login.password', session: 's', password: 'anything' },
       })
     );
-    expect(res.status).toBe(200);
-    expect(db.users.get(USER)?.is_deactivated).toBe(1);
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({
+      flows: [{ stages: ['m.login.password'] }],
+      params: {},
+      session: 'pinned-uia-session-16',
+    });
+    expect(db.users.get(USER)?.is_deactivated).toBe(0);
     expect(verifyPassword).not.toHaveBeenCalled();
   });
 
-  it('allows deactivation when auth.password is omitted but hash exists', async () => {
-    // Product path only verifies when both storedHash and auth.password are truthy
+  it('challenges UIA when auth.password is omitted but hash exists', async () => {
     const db = createAccountDb();
     const env = createEnv({ db });
     const res = await request(
@@ -1041,8 +1048,13 @@ describe('POST /_matrix/client/v3/account/deactivate', () => {
         auth: { type: 'm.login.password', session: 's' },
       })
     );
-    expect(res.status).toBe(200);
-    expect(db.users.get(USER)?.is_deactivated).toBe(1);
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({
+      flows: [{ stages: ['m.login.password'] }],
+      params: {},
+      session: 'pinned-uia-session-16',
+    });
+    expect(db.users.get(USER)?.is_deactivated).toBe(0);
     expect(verifyPassword).not.toHaveBeenCalled();
   });
 
@@ -1190,6 +1202,66 @@ describe('POST /_matrix/client/v3/account/3pid/add', () => {
     expect(res.status).toBe(401);
   });
 
+  it('rejects a bare password stage with no credential', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/add',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        sid: 'sid-1',
+        auth: { type: 'm.login.password', session: 's' },
+      })
+    );
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({
+      flows: [{ stages: ['m.login.password'] }],
+      params: {},
+      session: 'pinned-uia-session-16',
+    });
+    expect(verifyPassword).not.toHaveBeenCalled();
+  });
+
+  it('rejects a wrong UIA password', async () => {
+    const env = createEnv();
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/add',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        sid: 'sid-1',
+        auth: passwordAuth('nope'),
+      })
+    );
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({
+      flows: [{ stages: ['m.login.password'] }],
+      session: 'pinned-uia-session-16',
+    });
+    expect(verifyPassword).toHaveBeenCalledWith('nope', `mockok:${CURRENT_PW}`);
+  });
+
+  it('rejects a passwordless account even with a bare password stage', async () => {
+    const db = createAccountDb({ passwordHashes: new Map([[USER, null]]) });
+    const env = createEnv({ db });
+    const res = await request(
+      env,
+      '/_matrix/client/v3/account/3pid/add',
+      jsonInit('POST', {
+        client_secret: 'sec',
+        sid: 'sid-1',
+        auth: passwordAuth('anything'),
+      })
+    );
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({
+      flows: [{ stages: ['m.login.password'] }],
+      session: 'pinned-uia-session-16',
+    });
+    expect(db.threepids).toEqual([]);
+    expect(verifyPassword).not.toHaveBeenCalled();
+  });
+
   it('fails when email verification session is not validated', async () => {
     emailMocks.getValidatedSession.mockResolvedValueOnce(null);
     const env = createEnv();
@@ -1199,7 +1271,7 @@ describe('POST /_matrix/client/v3/account/3pid/add', () => {
       jsonInit('POST', {
         client_secret: 'sec',
         sid: 'sid-1',
-        auth: { type: 'm.login.password', session: 's' },
+        auth: passwordAuth(),
       })
     );
     expect(res.status).toBe(400);
@@ -1235,7 +1307,7 @@ describe('POST /_matrix/client/v3/account/3pid/add', () => {
       jsonInit('POST', {
         client_secret: 'sec',
         sid: 'sid-1',
-        auth: { type: 'm.login.password', session: 's' },
+        auth: passwordAuth(),
       })
     );
     expect(res.status).toBe(400);
@@ -1281,7 +1353,7 @@ describe('POST /_matrix/client/v3/account/3pid/add', () => {
       jsonInit('POST', {
         client_secret: 'sec',
         sid: 'sid-1',
-        auth: { type: 'm.login.password', session: 's' },
+        auth: passwordAuth(),
       })
     );
     expect(res.status).toBe(200);
@@ -1317,7 +1389,7 @@ describe('POST /_matrix/client/v3/account/3pid/add', () => {
       jsonInit('POST', {
         client_secret: 'c',
         sid: 'sid-new',
-        auth: { type: 'm.login.password', session: 's' },
+        auth: passwordAuth(),
       })
     );
     expect(res.status).toBe(200);
@@ -2351,7 +2423,7 @@ describe('account TOKENMAXX empty-string + truthiness edges after #103', () => {
     });
   });
 
-  it('deactivate with empty-string auth.password skips verifyPassword', async () => {
+  it('deactivate with empty-string auth.password returns UIA challenge', async () => {
     const db = createAccountDb();
     const env = createEnv({ db });
     const res = await request(
@@ -2361,9 +2433,12 @@ describe('account TOKENMAXX empty-string + truthiness edges after #103', () => {
         auth: { type: 'm.login.password', session: 's', password: '' },
       })
     );
-    expect(res.status).toBe(200);
-    expect(res.body).toEqual({ id_server_unbind_result: 'no-support' });
-    expect(db.users.get(USER)?.is_deactivated).toBe(1);
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({
+      flows: [{ stages: ['m.login.password'] }],
+      session: 'pinned-uia-session-16',
+    });
+    expect(db.users.get(USER)?.is_deactivated).toBe(0);
     expect(verifyPassword).not.toHaveBeenCalled();
   });
 
@@ -2710,15 +2785,15 @@ describe('account deactivate — erase membership + bind leftovers', () => {
     expect(upd?.args).toEqual([USER]);
   });
 
-  it('skips password verify when stored hash exists but auth.password empty string', async () => {
-    // `storedHash && auth.password` — empty string is falsy → skip verify
+  it('rejects empty-string auth.password even when stored hash exists', async () => {
     const env = createEnv();
     const res = await request(
       env,
       '/_matrix/client/v3/account/deactivate',
       jsonInit('POST', { auth: { type: 'm.login.password', password: '' } })
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(401);
+    expect(res.body).toMatchObject({ flows: [{ stages: ['m.login.password'] }] });
   });
 });
 
@@ -2772,7 +2847,7 @@ describe('account 3pid — list/add/delete bind leftovers', () => {
       jsonInit('POST', {
         client_secret: 'sec',
         sid: 'sid-1',
-        auth: { type: 'm.login.password' },
+        auth: passwordAuth(),
       })
     );
     const after = Date.now();
@@ -3082,11 +3157,8 @@ describe('account TOKENMAXX soft-cap lifecycles', () => {
     expect(pw.status).toBe(200);
     expect(db.tokens).toHaveLength(2);
 
-    // password hash changed — update mock so deactivate can still verify with CURRENT_PW?
-    // deactivate uses getPasswordHash + verifyPassword(auth.password, storedHash)
-    // storedHash is now hashed:STRONG_PW; verifyPassword mock checks mockok:password
-    // so deactivate with CURRENT_PW would fail. Use auth without password (skip verify)
-    // OR reset hash. Reset hash for deactivate path:
+    // Deactivate verifies the current password against the stored hash; reset
+    // the hash to the mock-known value after the password-change step.
     db.users.get(USER)!.password_hash = `mockok:${CURRENT_PW}`;
 
     const deact = await request(
@@ -3139,7 +3211,7 @@ describe('account TOKENMAXX soft-cap lifecycles', () => {
       jsonInit('POST', {
         client_secret: 'flow-sec',
         sid: 'sid-flow',
-        auth: { type: 'm.login.password' },
+        auth: passwordAuth(),
       })
     );
     expect(add.status).toBe(200);

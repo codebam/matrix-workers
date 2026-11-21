@@ -2418,7 +2418,7 @@ describe('account leftovers deactivate erase matrix', () => {
     expect(res.body.flows[0].stages).toEqual(['m.login.password']);
   });
 
-  it('allows deactivate when no password hash set', async () => {
+  it('rejects the bare password stage when no password hash is set', async () => {
     const db = createAccountDb({
       users: new Map([
         [USER, { user_id: USER, password_hash: null, is_deactivated: 0, display_name: 'A', avatar_url: null }],
@@ -2430,8 +2430,9 @@ describe('account leftovers deactivate erase matrix', () => {
       '/_matrix/client/v3/account/deactivate',
       jsonInit('POST', { auth: { type: 'm.login.password', session: 's' } })
     );
-    expect(res.status).toBe(200);
-    expect(db.users.get(USER)!.is_deactivated).toBe(1);
+    expect(res.status).toBe(401);
+    expect(res.body.flows[0].stages).toEqual(['m.login.password']);
+    expect(db.users.get(USER)!.is_deactivated).toBe(0);
   });
 });
 

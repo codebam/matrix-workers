@@ -135,23 +135,21 @@ app.post('/_matrix/client/v3/account/deactivate', requireAuth(), async (c) => {
 
   const { erase = false, auth } = body;
 
-  // Require UIA for account deactivation
-  if (!auth || auth.type !== 'm.login.password') {
+  // Require a completed UIA password stage. A bare `m.login.password` stage is
+  // NOT sufficient: the account must actually have a password to verify, and
+  // the supplied password must match it. Passwordless accounts (OIDC, bots)
+  // cannot complete this flow here; use the admin API instead.
+  const storedHash = await getPasswordHash(db, userId);
+  const passwordValid = storedHash && auth?.password
+    ? await verifyPassword(auth.password, storedHash)
+    : false;
+  if (!auth || auth.type !== 'm.login.password' || !passwordValid) {
     const sessionId = await generateOpaqueId(16);
     return c.json({
       flows: [{ stages: ['m.login.password'] }],
       params: {},
       session: sessionId,
     }, 401);
-  }
-
-  // Verify password
-  const storedHash = await getPasswordHash(db, userId);
-  if (storedHash && auth.password) {
-    const valid = await verifyPassword(auth.password, storedHash);
-    if (!valid) {
-      return Errors.forbidden('Invalid password').toResponse();
-    }
   }
 
   // Mark user as deactivated
@@ -225,7 +223,7 @@ app.post('/_matrix/client/v3/account/3pid/add', requireAuth(), async (c) => {
   let body: {
     client_secret: string;
     sid: string;
-    auth?: { type: string; session?: string };
+    auth?: { type: string; session?: string; password?: string };
   };
 
   try {
@@ -240,8 +238,14 @@ app.post('/_matrix/client/v3/account/3pid/add', requireAuth(), async (c) => {
     return Errors.missingParam('client_secret and sid are required').toResponse();
   }
 
-  // Require UIA for adding 3PID
-  if (!auth || auth.type !== 'm.login.password') {
+  // Require a completed UIA password stage, not just a bare stage declaration
+  // (same rule as /account/deactivate). Passwordless accounts cannot add a
+  // 3PID through this route with an unverified stage.
+  const storedHash = await getPasswordHash(db, userId);
+  const passwordValid = storedHash && auth?.password
+    ? await verifyPassword(auth.password, storedHash)
+    : false;
+  if (!auth || auth.type !== 'm.login.password' || !passwordValid) {
     const sessionId = await generateOpaqueId(16);
     return c.json({
       flows: [{ stages: ['m.login.password'] }],

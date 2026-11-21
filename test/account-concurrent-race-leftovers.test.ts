@@ -903,9 +903,10 @@ describe('race 3PID add∥delete concurrent after #208', () => {
     emailMocks.getValidatedSession.mockResolvedValue({ email: 'taken@example.com' });
     const db = createAccountRaceDb({
       mutateThreepidsAfterSelects: {
-        after: 1,
-        // first() for binding check is the SELECT — inject bob ownership after snapshot?
-        // mutate after read means first request still sees null; second sees bob.
+        // SELECT 1 is getPasswordHash (UIA), SELECT 2 is the 3PID binding check.
+        // Inject bob ownership after the binding check so the first request
+        // still sees no owner and the second sees bob.
+        after: 2,
         next: [seedThreepid({ user_id: BOB, address: 'taken@example.com' })],
       },
     });
