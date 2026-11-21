@@ -824,3 +824,28 @@ Final deploy state: prod `51f25ea` / version `95d8b7a0-a7f0-465f-a6e3-f6cfe52b63
 dev `51f25ea` / version `16702267-ce27-44eb-8ed6-8b05763f01b7`. Full suite
 after: 45,750/45,750 (367 files). HITL review remains advised on the
 account-UIA and federation-key-handling commits.
+
+### Live review of the HITL flags (2026-11-21, `fa5b24d`)
+
+Testing the federation key-handling flag found a REAL regression: two
+nixos.org PDUs in v10 rooms (`!…:nixos.org`, `!…:0upti.me`) were rejected
+at 07:24 UTC with 'invalid signature from nixos.org' shortly after c4fdfa7
+deployed. Root cause: the new gate forced v1-2 redaction rules for any PDU
+carrying an explicit event_id — a test-fixture accommodation — while
+Synapse signs modern PDUs with the room version's rules; key resolution
+was verified correct (cached nixos.org key matches its published key).
+Fixed in `fa5b24d`: /send and send_leave verify with room?.room_version,
+and verifyPdu tolerates (ignores) an explicit event_id on modern PDUs —
+redaction already excludes it from the canonical signature and reference
+hash. The shared fixture signer now signs with the room's version from
+env.DB, so the 974-test federation suite covers the real-peer shape.
+Redeployed prod `d39dd861` / dev `51c66c18`; live re-confirmation awaits
+the next inbound peer PDU (none arrived in the first two minutes).
+
+The prod d1_migrations tracker was also repaired: seeded with dev's 32
+migration rows (names + applied_at), so `d1 migrations list` now reports
+'No migrations to apply!' and future applies work normally there.
+
+Account-UIA live check was limited by stale dev test credentials; its
+401-challenge paths are covered by the account unit suites (623 tests
+across both flagged areas passed).
