@@ -874,4 +874,19 @@ sanity gates on real IDs, slot updates from authoritative pdus only, 83
 statements scoped to the one room). Both codebam accounts now read `join`
 with real event IDs. The user cannot rejoin from their matrix.org client
 because #linux_group is invite-only and it was nighttime. Final live
-confirmation awaits their next message in the room.
+confirmation arrived: the user's next message was accepted (08:11:43).
+
+#### Cache-clear / history fallout from the presence feature
+
+Clearing Element Web's cache produced "Unable to connect. Retrying…": the
+presence initial-sync branch chunked shared-room IDs by 500 but D1 allows
+~100 bind variables, so fresh initial syncs 500'd (`36750d5`, chunk 90).
+Then the user reported short, out-of-order history: initial sync sliced the
+timeline to 20 events with `limited:true` but set `prev_batch` to
+`sincePosition` (0), so /messages?from=0 re-served the NEWEST events and
+Element prepended today's messages in front of older ones. `447ccc4` sets
+prev_batch to the oldest returned event's stream position (best-effort).
+Verified live with the user's token: 20-event window, prev_batch=13685,
+pagination returning strictly older messages. The Nix/NixOS room has 114
+timeline events back to 2026-11-19 (our join); older pre-join history would
+need a separate federation backfill. No messages were sent into that room.
