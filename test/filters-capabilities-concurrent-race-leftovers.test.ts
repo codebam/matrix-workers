@@ -1600,6 +1600,7 @@ describe('race capabilities exhaustive key bind after #214', () => {
     'm.3pid_changes',
     'm.get_login_token',
     'm.profile_fields',
+    'm.forget_forced_upon_leave',
     'org.matrix.msc4140.delayed_events',
   ] as const;
 
@@ -2300,6 +2301,7 @@ describe('race capabilities HEAD + key-set bind after #241', () => {
     'm.3pid_changes',
     'm.get_login_token',
     'm.profile_fields',
+    'm.forget_forced_upon_leave',
     'org.matrix.msc4140.delayed_events',
   ].sort();
 

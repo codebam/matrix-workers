@@ -322,6 +322,150 @@ app.post('/admin/api/users/:userId/reset-password', requireAuth(), requireAdmin,
   return c.json({ success: true });
 });
 
+// ============================================================================
+// MSC4323 (stable since spec v1.18): standard account lock/suspend admin
+// endpoints. Authorisation is always checked before any account lookup so
+// callers cannot enumerate users; locked/suspended state never touches
+// sessions or credentials.
+// ============================================================================
+
+// Shared validation for the four moderation endpoints. Returns either the
+// target row or an error response; ordering follows the spec: 403 for
+// non-admins (handled by requireAdmin), then 400 for non-local user IDs,
+// then 404 for unknown/deactivated users, then 403 for self/other-admin
+// targets on PUT.
+async function moderationTarget(
+  c: { env: import('../types').Env; get: (key: string) => unknown },
+  userId: string,
+  opts: { forWrite: boolean }
+): Promise<
+  | {
+      row: {
+        user_id: string;
+        admin: number;
+        is_deactivated: number;
+        locked: number;
+        suspended: number;
+      };
+    }
+  | { error: Response }
+> {
+  const db = c.env.DB;
+  const requester = c.get('userId');
+  const serverName = c.env.SERVER_NAME;
+
+  const userMatch = userId.match(/^@([^:]+):(.+)$/);
+  if (!userMatch || userMatch[2] !== serverName) {
+    return {
+      error: Errors.invalidParam('userId', 'User does not belong to the local server.').toResponse(),
+    };
+  }
+
+  const row = await db
+    .prepare(
+      `SELECT user_id, admin, is_deactivated, locked, suspended FROM users WHERE user_id = ?`
+    )
+    .bind(userId)
+    .first<{
+      user_id: string;
+      admin: number;
+      is_deactivated: number;
+      locked: number;
+      suspended: number;
+    }>();
+
+  if (!row || row.is_deactivated === 1) {
+    return { error: Errors.notFound('User not found.').toResponse() };
+  }
+
+  if (opts.forWrite && (userId === requester || row.admin === 1)) {
+    return {
+      error: Errors.forbidden('Cannot moderate yourself or another administrator.').toResponse(),
+    };
+  }
+
+  return { row };
+}
+
+// GET /_matrix/client/v1/admin/lock/:userId - Lock status of a local user
+app.get('/_matrix/client/v1/admin/lock/:userId', requireAuth(), requireAdmin, async (c) => {
+  const userId = decodeURIComponent(c.req.param('userId'));
+  const target = await moderationTarget(c, userId, { forWrite: false });
+  if ('error' in target) return target.error;
+
+  return c.json({ locked: target.row.locked === 1 });
+});
+
+// PUT /_matrix/client/v1/admin/lock/:userId - Set lock status
+app.put('/_matrix/client/v1/admin/lock/:userId', requireAuth(), requireAdmin, async (c) => {
+  const userId = decodeURIComponent(c.req.param('userId'));
+
+  let body: { locked?: boolean };
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+  if (typeof body.locked !== 'boolean') {
+    return Errors.missingParam('locked').toResponse();
+  }
+
+  const target = await moderationTarget(c, userId, { forWrite: true });
+  if ('error' in target) return target.error;
+
+  await c.env.DB.prepare(
+    `UPDATE users SET locked = ?, updated_at = ? WHERE user_id = ?`
+  ).bind(body.locked ? 1 : 0, Date.now(), userId).run();
+
+  await logAdminAction(c, {
+    action: 'user.lock',
+    target: userId,
+    details: { locked: body.locked },
+  });
+
+  // Sessions are intentionally left intact (soft logout semantics).
+  return c.json({ locked: body.locked });
+});
+
+// GET /_matrix/client/v1/admin/suspend/:userId - Suspension status
+app.get('/_matrix/client/v1/admin/suspend/:userId', requireAuth(), requireAdmin, async (c) => {
+  const userId = decodeURIComponent(c.req.param('userId'));
+  const target = await moderationTarget(c, userId, { forWrite: false });
+  if ('error' in target) return target.error;
+
+  return c.json({ suspended: target.row.suspended === 1 });
+});
+
+// PUT /_matrix/client/v1/admin/suspend/:userId - Set suspension status
+app.put('/_matrix/client/v1/admin/suspend/:userId', requireAuth(), requireAdmin, async (c) => {
+  const userId = decodeURIComponent(c.req.param('userId'));
+
+  let body: { suspended?: boolean };
+  try {
+    body = await c.req.json();
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+  if (typeof body.suspended !== 'boolean') {
+    return Errors.missingParam('suspended').toResponse();
+  }
+
+  const target = await moderationTarget(c, userId, { forWrite: true });
+  if ('error' in target) return target.error;
+
+  await c.env.DB.prepare(
+    `UPDATE users SET suspended = ?, updated_at = ? WHERE user_id = ?`
+  ).bind(body.suspended ? 1 : 0, Date.now(), userId).run();
+
+  await logAdminAction(c, {
+    action: 'user.suspend',
+    target: userId,
+    details: { suspended: body.suspended },
+  });
+
+  return c.json({ suspended: body.suspended });
+});
+
 // GET /admin/api/rooms - List all rooms
 app.get('/admin/api/rooms', requireAuth(), requireAdmin, async (c) => {
   const db = c.env.DB;
@@ -2113,9 +2257,14 @@ app.get('/_synapse/admin/v2/users/:userId', requireAuth(), requireAdmin, async (
   const db = c.env.DB;
 
   const user = await db.prepare(`
-    SELECT user_id as name, display_name as displayname, avatar_url, is_guest, is_deactivated as deactivated, admin, created_at as creation_ts
+    SELECT user_id as name, display_name as displayname, avatar_url, is_guest,
+           is_deactivated as deactivated, admin, created_at as creation_ts,
+           locked, suspended
     FROM users WHERE user_id = ?
-  `).bind(userId).first();
+  `).bind(userId).first<{
+    locked?: number;
+    suspended?: number;
+  }>();
 
   if (!user) {
     return Errors.notFound('User not found').toResponse();
@@ -2125,8 +2274,13 @@ app.get('/_synapse/admin/v2/users/:userId', requireAuth(), requireAdmin, async (
   // Note: We may not have a full threepid table, returning empty for now
   const threepids: any[] = [];
 
+  // MSC4323: surface the real moderation state (Synapse's field shape).
+  const locked = user.locked === 1;
+  const suspended = user.suspended === 1;
+  const { locked: _locked, suspended: _suspended, ...userFields } = user;
+
   return c.json({
-    ...user,
+    ...userFields,
     threepids,
     consent_version: null,
     consent_server_notice_sent: null,
@@ -2134,7 +2288,8 @@ app.get('/_synapse/admin/v2/users/:userId', requireAuth(), requireAdmin, async (
     consent_ts: null,
     user_type: null,
     is_shadow_banned: false,
-    locked: false,
+    locked,
+    suspended,
   });
 });
 

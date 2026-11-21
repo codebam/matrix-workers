@@ -119,6 +119,9 @@ export type Variables = {
     userId: string;
     deviceId: string | null;
     accessToken: string;
+    // MSC4323 account moderation state, set only when moderated.
+    locked?: boolean;
+    suspended?: boolean;
   };
 };
 

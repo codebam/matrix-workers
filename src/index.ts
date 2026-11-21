@@ -48,7 +48,7 @@ import oidcAuth from './api/oidc-auth';
 import oauth from './api/oauth';
 import { adminDashboardHtml } from './admin/dashboard';
 import { rateLimitMiddleware } from './middleware/rate-limit';
-import { requireAuth } from './middleware/auth';
+import { requireAuth, optionalAuth } from './middleware/auth';
 import { analyticsMiddleware } from './middleware/analytics';
 import { federationGet, federationPost } from './services/federation-keys';
 
@@ -167,9 +167,12 @@ app.route('/', identity);
 app.route('/', federation);
 
 // Capabilities endpoint
-app.get('/_matrix/client/v3/capabilities', (c) => {
-  return c.json({
-    capabilities: {
+// MSC4323 (spec v1.18): m.account_moderation is included only for admins —
+// the spec says to omit it entirely when lock and suspend would be false.
+// optionalAuth (no error on missing/invalid tokens) keeps the endpoint
+// usable by clients that probe capabilities before login.
+app.get('/_matrix/client/v3/capabilities', optionalAuth(), async (c) => {
+  const capabilities: Record<string, unknown> = {
       'm.change_password': {
         enabled: true,
       },
@@ -202,6 +205,12 @@ app.get('/_matrix/client/v3/capabilities', (c) => {
       'm.get_login_token': {
         enabled: true,
       },
+      // MSC4267 (spec v1.18): the server auto-forgets rooms on every local
+      // membership end (leave/kick/ban/unban, incl. remote-initiated), so
+      // clients skip their own /forget call.
+      'm.forget_forced_upon_leave': {
+        enabled: true,
+      },
       // Custom profile fields (Matrix v1.16+): arbitrary keys are accepted
       // by the profile endpoints, so no allowed/disallowed restriction.
       'm.profile_fields': {
@@ -213,8 +222,24 @@ app.get('/_matrix/client/v3/capabilities', (c) => {
         max_delay_ms: 86400000,
         max_scheduled: 10,
       },
-    },
-  });
+  };
+
+  const requester = c.get('userId');
+  if (requester) {
+    try {
+      const adminRow = await c.env.DB.prepare(
+        'SELECT admin FROM users WHERE user_id = ?'
+      ).bind(requester).first<{ admin: number }>();
+      if (adminRow?.admin === 1) {
+        capabilities['m.account_moderation'] = { lock: true, suspend: true };
+      }
+    } catch {
+      // Lookup failures leave the capability omitted; capabilities must
+      // never 500.
+    }
+  }
+
+  return c.json({ capabilities });
 });
 
 // Push rules now handled by push.ts
