@@ -45,7 +45,8 @@ export async function verifyPdu(
   pdu: PDU,
   origin: string,
   roomVersion: string,
-  keys: VerifyKey[]
+  keys: VerifyKey[],
+  skipContentHash = false
 ): Promise<{ eventId: string } | { error: string }> {
   const num = parseInt(roomVersion, 10);
   const modern = !Number.isFinite(num) || num >= 3;
@@ -99,7 +100,7 @@ export async function verifyPdu(
   if (!sigOk) return { error: `invalid signature from ${origin}` };
 
   const hashes = wire['hashes'] as { sha256?: string } | undefined;
-  if (hashes?.sha256) {
+  if (!skipContentHash && hashes?.sha256) {
     const expect = await calculateContentHash(wire);
     if (expect.replace(/=+$/, '') !== hashes.sha256.replace(/=+$/, '')) {
       return { error: 'content hash mismatch' };

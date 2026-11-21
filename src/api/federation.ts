@@ -889,16 +889,24 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       // an explicit event_id: real Synapse PDUs in modern rooms carry
       // event_id and are signed over the room version's redacted shape, so
       // forcing v1-2 rules rejects legitimate peers. Unknown rooms default
-      // to a modern version. Content hashing is enforced above, so we drop
-      // `hashes` from the verification view to avoid verifying it twice.
+      // to a modern version.
+      //
+      // Keep `hashes` in the verification view: the signature covers the
+      // redacted event INCLUDING hashes (it is a retained top-level field).
+      // Stripping it here made every real Synapse signature fail while
+      // self-signed fixtures that also stripped it stayed green.
       const verificationVersion = room?.room_version ?? '10';
-      const { hashes: _verifiedHashes, ...verificationView } = pdu as Record<string, unknown>;
+      const verificationView = pdu as Record<string, unknown>;
       const verifyKeys = await resolvePduVerifyKeys(c.env, pduOrigin);
       const verification = await verifyPdu(
         verificationView as unknown as PDU,
         pduOrigin,
         verificationVersion,
-        verifyKeys
+        verifyKeys,
+        // The /send handler already enforced hashes.sha256 above; don't
+        // duplicate that check here (it would compare against a different
+        // wire view for legacy/soft-accepted fixtures).
+        true
       );
       if ('error' in verification) {
         const reason = `PDU from origin server ${pduOrigin} without valid signature: ${verification.error}`;

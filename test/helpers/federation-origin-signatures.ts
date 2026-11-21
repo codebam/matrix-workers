@@ -94,10 +94,9 @@ export async function signPduForOrigin<T extends Record<string, unknown>>(
   const pair = await fixtureKeyPair();
   // Sign over the room version's redaction rules, matching the /send handler
   // (which no longer keys the version off the presence of an event_id).
-  // The /send handler verifies the content hash separately and passes the
-  // event without `hashes` to verifyPdu, so sign that same view here.
-  const { hashes: _hashes, ...forSignature } = pdu;
-  const redacted = redactEventForSigning(forSignature, version);
+  // `hashes` is a retained top-level field and MUST be included: real
+  // Synapse signs it, so stripping it only makes self-signed fixtures pass.
+  const redacted = redactEventForSigning(pdu, version);
   const signed = await signJson(redacted, origin, pair.keyId, pair.privateKeyJwk);
   const originSigs = (signed.signatures as Record<string, Record<string, string>>)[origin];
   return {

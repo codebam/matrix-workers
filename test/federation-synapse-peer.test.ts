@@ -491,9 +491,8 @@ describe('inbound wire-ID derivation must use the room version (v10 phantom-ID b
     const { event_id: _e, ...wire } = prepared!.wire as Record<string, unknown>;
     // The sender is a peer.test user: sign the PDU with that server's key
     // (the fake key resolver serves this key for every origin in this file).
-    const { hashes: _hashes, ...forSignature } = wire;
     const signed = await signJson(
-      redactEventForSigning(forSignature, '10'),
+      redactEventForSigning(wire, '10'),
       PEER_SERVER,
       signing.keyId,
       signing.privateKeyJwk
