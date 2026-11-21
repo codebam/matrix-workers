@@ -568,8 +568,9 @@ verified. Full suite green after the wave: 45,569/45,569 (351 files).
   required_state, state_after), getEventsSince/getRoomEvents (so
   /messages), /context, /rooms/:id/event. The original `content` column
   is untouched — federation hashes/signatures stay valid over it.
-  Known remainder: stripped-state invites and relation/thread listings
-  still read raw content; redaction events themselves are now federated
+  Client-facing reads now prefer pruned content everywhere covered here:
+  relation/thread listings were already fixed, and stripped-state invites
+  were fixed in `3185021`. Redaction events themselves are federated
   outbound from performRedaction (fixed in `7bd715a`).
 - **Policy servers (MSC4284, spec v1.18) — the big module**:
   - src/services/policy-server.ts: config parsing (m.room.policy with
