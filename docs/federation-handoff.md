@@ -617,3 +617,78 @@ policy servers for our rooms, the network path handles them.
 members) skip wire prep entirely — no hashes/federation signatures on
 their events; only the policy countersignature appears. Signatures
 materialize when there is someone to federate with.
+
+## The 15-item gap ledger, closed (2026-11-21, session 12)
+
+All fifteen items from the session-11 gap ledger, in dependency order.
+Full suite after: 45,596/45,596 (355 files).
+
+- **#1 PS asks outside the client cores**: RoomJoinWorkflow asks the
+  room's policy server before send_join when the room's state is already
+  known to us (re-joins); refusals fail the join instead of three doomed
+  attempts. Fresh first-joins cannot know the remote room's policy state
+  before sending — the resident's send_join rejection is the failure
+  signal there, by protocol design.
+- **#2 PS validation on non-transaction receive paths**: inbound joins
+  (send_join v1+v2) and invites (v1+v2) refuse membership events without
+  a valid PS countersignature (refused rather than soft-failed — a
+  soft-failed join would corrupt membership views; a fresh signature is
+  requested first for key rotation).
+- **#3 ACL read guards**: backfill, state, state_ids, event,
+  get_missing_events and hierarchy now refuse servers denied by the room's
+  ACL; the v2 invite handler gained the ACL check the v1 one already had.
+- **#4 local redaction events federate outbound**: performRedaction now
+  queues the redaction PDU to the (ACL-filtered) destinations through the
+  standard wire pipeline, so remote servers apply our redactions.
+- **#5 backfilled redactions prune**: storeRemoteStateEvent (the state
+  and timeline backfill choke point) applies inbound redactions from
+  backfill responses, mirroring the live transaction path. (Noted in
+  passing: FederationCatchupWorkflow's get_missing_events leg fetches but
+  never stores — a pre-existing no-op stub, harmless.)
+- **#6 remaining raw-content surfaces**: stripped invite state (legacy
+  /sync and sliding sync) and the relations/threads listings now serve
+  the pruned copy.
+- **#7 moderation policy lists (the module)**:
+  src/services/moderation-policy.ts parses m.policy.rule.{user,room,
+  server} m.ban rules; enforcement at the invite/join/PDU gates per the
+  spec's simple-implementation suggestions (banned users'/servers'
+  invites refused, banned servers' PDUs refused ACL-style, banned rooms
+  unjoinable, no outbound invites to banned entities). Subscriptions via
+  POST/GET/DELETE /admin/api/policy-lists: a dedicated
+  @moderation:<server> system user (unknowable random password) joins
+  the policy room — local rooms directly, remote rooms via the join
+  workflow (invite-only lists need an invite for the subscriber first).
+  Migration **028_policy_lists.sql**. Rules cached 5min in CACHE,
+  invalidated on subscription changes.
+- **#8 M_USER_LIMIT_EXCEEDED** added to the error-code table (no emitter
+  until quotas exist).
+- **#9 /sign rate-limited**: new federationOriginRateLimit (per-calling-
+  server buckets via the RateLimit DO; degrades open without the
+  binding), 120/min on /_matrix/policy/v1/sign.
+- **#10** — (was the permissive-PS policy note; unchanged, documented.)
+- **#11 fed v1 send_join/send_leave**: kept deliberately for older
+  peers, now with a comment saying so (spec removed them in v1.18).
+- **#12 admin surfaces lock/suspend**: /admin/api/users and the user
+  detail include locked/suspended; the dashboard status badge renders
+  Locked/Suspended/Deactivated/Active.
+- **#13 free-rider conformance round-trips**: image packs (user + room
+  scope), m.recent_emoji, m.key_backup account data, and the MSC4268
+  to-device transport leg (an m.room_key_bundle stores with its type and
+  content intact) — test/spec-free-riders.test.ts.
+- **#14 pipeline**: MSC4437 (whole-profile replace, FCP) implemented at
+  the unstable prefix with replace semantics + tests; MSC4492 verified
+  ALREADY conformant (tokens are plain stream positions —
+  direction-reuse test added); MSC4582 (m.room_versions capability
+  required) already satisfied. NOT implemented, recorded as the watch
+  list: MSC4480 sticky events, MSC4075 MatrixRTC invites, MSC4388 secure
+  OOB QR, MSC4576 LiveKit data gating, MSC4583/4584 — each needs its
+  proposal studied properly; none are stable.
+- **#15 real-crypto integration tests**:
+  test/federation-real-crypto.test.ts drives requireFederationAuth with
+  a REAL generated Ed25519 key and genuine X-Matrix headers through the
+  real key-resolution chain (KV-served remote keys, no module mocks),
+  then asserts the ACL read guards decide (403 denied / 200 allowed /
+  401 tampered).
+
+Watch list for v1.20: the six unimplemented pipeline MSCs above, plus
+the catchup-workflow get_missing_events stub.

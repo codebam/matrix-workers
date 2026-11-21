@@ -106,8 +106,9 @@ npx wrangler secret put EMAIL_FROM
 | [Invite Permission](https://spec.matrix.org/v1.19/client-server-api/#invite-permission) | [`src/services/database.ts`](src/services/database.ts) | MSC4155 globs + MSC4380 block-all toggle |
 | [Account Moderation](https://spec.matrix.org/v1.19/client-server-api/#account-moderation) | [`src/api/admin.ts`](src/api/admin.ts), [`src/middleware/auth.ts`](src/middleware/auth.ts) | MSC4323 lock/suspend + enforcement |
 | [Server ACLs](https://spec.matrix.org/v1.19/client-server-api/#server-access-control-lists-acls-for-rooms) | [`src/services/server-acl.ts`](src/services/server-acl.ts) | m.room.server_acl enforcement (inbound + outbound destinations), MSC4436 case-insensitive |
-| [Policy Servers](https://spec.matrix.org/v1.19/client-server-api/#policy-servers) | [`src/services/policy-server.ts`](src/services/policy-server.ts) | MSC4284: ask-and-countersign on send, receive-side soft-fail, `POST /_matrix/policy/v1/sign`, `/.well-known/matrix/policy_server` |
-| [Redactions](https://spec.matrix.org/v1.19/client-server-api/#redactions) | [`src/services/event-redaction.ts`](src/services/event-redaction.ts) | client-facing content pruned per room-version keep rules (`events.redacted_content`), local + federation-initiated |
+| [Policy Servers](https://spec.matrix.org/v1.19/client-server-api/#policy-servers) | [`src/services/policy-server.ts`](src/services/policy-server.ts) | MSC4284: ask-and-countersign on send, receive-side soft-fail, membership-event validation, `POST /_matrix/policy/v1/sign`, `/.well-known/matrix/policy_server` |
+| [Moderation Policy Lists](https://spec.matrix.org/v1.19/client-server-api/#moderation-policy-lists) | [`src/services/moderation-policy.ts`](src/services/moderation-policy.ts) | m.policy.rule.{user,room,server} m.ban enforcement across invite/join/PDU gates; admin-subscribed policy rooms |
+| [Redactions](https://spec.matrix.org/v1.19/client-server-api/#redactions) | [`src/services/event-redaction.ts`](src/services/event-redaction.ts) | client-facing content pruned per room-version keep rules (`events.redacted_content`), local + federation-initiated, federated outbound |
 | [Reporting Content](https://spec.matrix.org/v1.19/client-server-api/#reporting-content) | [`src/api/report.ts`](src/api/report.ts) | MSC4277 anti-fingerprinting |
 | [Mutual Rooms](https://spec.matrix.org/v1.19/client-server-api/#mutual-rooms) | [`src/api/rooms.ts`](src/api/rooms.ts) | MSC2666 stable endpoint |
 
@@ -120,6 +121,7 @@ npx wrangler secret put EMAIL_FROM
 | Cross-signing Reset | [`src/api/keys.ts`](src/api/keys.ts), [`src/api/oauth.ts`](src/api/oauth.ts) | [MSC4312](https://github.com/matrix-org/matrix-spec-proposals/pull/4312) |
 | Account Management | [`src/api/oidc-auth.ts`](src/api/oidc-auth.ts) | [MSC4191](https://github.com/matrix-org/matrix-spec-proposals/pull/4191) |
 | Invite Filtering (glob rules) | [`src/services/database.ts`](src/services/database.ts) | [MSC4155](https://github.com/matrix-org/matrix-spec-proposals/pull/4155) — the stable MSC4380 toggle rides the same config |
+| Whole-profile replace | [`src/api/profile.ts`](src/api/profile.ts) | [MSC4437](https://github.com/matrix-org/matrix-spec-proposals/pull/4437) (in FCP) — `PUT /unstable/org.matrix.msc4437/profile/{userId}` |
 
 **Stable spec features added since v1.17**
 
