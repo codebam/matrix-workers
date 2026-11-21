@@ -15,6 +15,7 @@ import { calculateContentHash, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId } from '../utils/event-signing';
 import { federationGet } from '../services/federation-keys';
 import { getEffectiveUserPowerLevel, expectedAuthTypes } from '../services/event-auth';
+import { evaluateRestrictedJoin } from '../services/restricted-joins';
 import { augmentAuthEvents, legacyWireForRoom, prepareOutboundPdu } from '../services/event-wire';
 import { fanoutEventToAppServices } from '../services/appservice-fanout';
 import { isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId, type ServerAclContent } from '../services/server-acl';
@@ -756,6 +757,33 @@ export async function joinFallbackServers(
   return out;
 }
 
+// Local restricted-room joins need the same allow-list + local-authoriser
+// evaluation as make_join. Returns null when the room is not restricted or
+// the user already holds an invite (the ordinary join rules apply then).
+async function evaluateLocalRestrictedJoin(params: {
+  env: Env;
+  roomId: string;
+  roomVersion: string;
+  userId: string;
+  joinRule: string;
+  hasInvite: boolean;
+}) {
+  if (params.hasInvite ||
+      (params.joinRule !== 'restricted' && params.joinRule !== 'knock_restricted')) {
+    return null;
+  }
+  const roomState = await getRoomState(params.env.DB, params.roomId);
+  return evaluateRestrictedJoin({
+    db: params.env.DB,
+    cache: params.env.CACHE,
+    localServerName: params.env.SERVER_NAME,
+    roomId: params.roomId,
+    userId: params.userId,
+    roomState,
+    roomVersion: params.roomVersion,
+  });
+}
+
 app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
@@ -857,6 +885,24 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   const joinRulesEvent = await getStateEvent(c.env.DB, roomId, 'm.room.join_rules');
   const joinRule = (joinRulesEvent?.content as any)?.join_rule || 'invite';
 
+  const restrictedDecision = await evaluateLocalRestrictedJoin({
+    env: c.env,
+    roomId,
+    roomVersion: room.room_version,
+    userId,
+    joinRule,
+    hasInvite: currentMembership?.membership === 'invite',
+  });
+  if (restrictedDecision?.error) {
+    // A knock_restricted room with no allow-list match still has the normal
+    // knock flow available to the client.
+    return Errors.forbidden(
+      joinRule === 'knock_restricted'
+        ? `${restrictedDecision.error}. Knock to request access instead.`
+        : restrictedDecision.error
+    ).toResponse();
+  }
+
   // Determine if user can join
   let canJoin = false;
   if (joinRule === 'public') {
@@ -866,6 +912,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   } else if (currentMembership?.membership === 'join') {
     // Already joined
     return c.json({ room_id: roomId });
+  } else if (restrictedDecision?.authorizedBy) {
+    canJoin = true;
   }
 
   if (!canJoin) {
@@ -881,6 +929,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
   if (joinRulesEvent) authEvents.push(joinRulesEvent.event_id);
   if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
   if (currentMembership) authEvents.push(currentMembership.eventId);
+  if (restrictedDecision?.authEventId) authEvents.push(restrictedDecision.authEventId);
 
   // Get prev events (latest events in room)
   const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
@@ -896,6 +945,9 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
 
   const memberContent: RoomMemberContent = {
     membership: 'join',
+    ...(restrictedDecision?.authorizedBy
+      ? { join_authorised_via_users_server: restrictedDecision.authorizedBy }
+      : {}),
   };
 
   const event: PDU = {
@@ -1439,6 +1491,12 @@ app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => 
   const roomId = c.req.param('roomId');
   const membershipFilter = c.req.query('membership');
   const notMembershipFilter = c.req.query('not_membership');
+  const atParam = c.req.query('at');
+  let atToken: number | undefined;
+  if (atParam) {
+    const parsed = parseInt(atParam.startsWith('s') ? atParam.slice(1) : atParam, 10);
+    if (!isNaN(parsed)) atToken = parsed;
+  }
 
   // Check membership
   const membership = await getMembership(c.env.DB, roomId, userId);
@@ -1446,15 +1504,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => 
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  // One round trip for all current member events. A per-member getStateEvent
-  // loop broke on big rooms (a 4,000-member room = 4,000 D1 subrequests in
-  // one invocation → 500s), and lazy_load_members clients (Element Web
-  // default) call this endpoint on demand for every room they render.
-  const rows = await c.env.DB.prepare(
-    `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, e.origin_server_ts, e.unsigned
-     FROM room_state rs JOIN events e ON rs.event_id = e.event_id
-     WHERE rs.room_id = ? AND rs.event_type = 'm.room.member'`
-  ).bind(roomId).all<{
+  type MemberRow = {
     event_id: string;
     room_id: string;
     sender: string;
@@ -1463,10 +1513,42 @@ app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => 
     content: string;
     origin_server_ts: number;
     unsigned: string | null;
-  }>();
+  };
+  const memberRows: MemberRow[] = [];
+
+  if (atToken !== undefined) {
+    // Point-in-time membership: m.room.member events are kept in the events
+    // table with their stream_ordering, so the latest event at or before the
+    // token per state_key is the membership as it stood at that point.
+    const history = await c.env.DB.prepare(
+      `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, e.origin_server_ts, e.unsigned
+       FROM events e
+       WHERE e.room_id = ? AND e.event_type = 'm.room.member'
+         AND e.state_key IS NOT NULL AND e.stream_ordering IS NOT NULL
+         AND e.stream_ordering <= ?
+       ORDER BY e.stream_ordering ASC`
+    ).bind(roomId, atToken).all<MemberRow & { stream_ordering: number }>();
+
+    const latestByUser = new Map<string, MemberRow>();
+    for (const row of history.results ?? []) {
+      if (row.state_key) latestByUser.set(row.state_key, row);
+    }
+    memberRows.push(...latestByUser.values());
+  } else {
+    // One round trip for all current member events. A per-member getStateEvent
+    // loop broke on big rooms (a 4,000-member room = 4,000 D1 subrequests in
+    // one invocation → 500s), and lazy_load_members clients (Element Web
+    // default) call this endpoint on demand for every room they render.
+    const rows = await c.env.DB.prepare(
+      `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, e.origin_server_ts, e.unsigned
+       FROM room_state rs JOIN events e ON rs.event_id = e.event_id
+       WHERE rs.room_id = ? AND rs.event_type = 'm.room.member'`
+    ).bind(roomId).all<MemberRow>();
+    memberRows.push(...(rows.results ?? []));
+  }
 
   const memberEvents = [];
-  for (const row of rows.results ?? []) {
+  for (const row of memberRows) {
     let content: unknown;
     try {
       content = JSON.parse(row.content);
@@ -1491,6 +1573,43 @@ app.get('/_matrix/client/v3/rooms/:roomId/members', requireAuth(), async (c) => 
   return c.json({ chunk: memberEvents });
 });
 
+// RoomEventFilter subset used by /messages. Unrecognized keys are ignored.
+interface MessageEventFilter {
+  types?: string[];
+  not_types?: string[];
+  rooms?: string[];
+  not_rooms?: string[];
+  senders?: string[];
+  not_senders?: string[];
+  contains_url?: boolean;
+}
+
+/** null = no such constraint; otherwise whether the value matched a pattern. */
+function matchesEventPatterns(value: string, patterns: unknown): boolean | null {
+  if (!Array.isArray(patterns) || patterns.length === 0) return null;
+  return patterns.some((pattern) =>
+    typeof pattern === 'string' &&
+    (pattern.endsWith('*') ? value.startsWith(pattern.slice(0, -1)) : value === pattern)
+  );
+}
+
+/** Exported for unit tests. */
+export function applyMessageEventFilter(events: any[], filter: MessageEventFilter): any[] {
+  return events.filter((event) => {
+    if (matchesEventPatterns(event.type, filter.types) === false) return false;
+    if (matchesEventPatterns(event.type, filter.not_types) === true) return false;
+    if (matchesEventPatterns(event.room_id, filter.rooms) === false) return false;
+    if (matchesEventPatterns(event.room_id, filter.not_rooms) === true) return false;
+    if (matchesEventPatterns(event.sender, filter.senders) === false) return false;
+    if (matchesEventPatterns(event.sender, filter.not_senders) === true) return false;
+    if (typeof filter.contains_url === 'boolean') {
+      const hasUrl = typeof event.content?.url === 'string' && event.content.url.length > 0;
+      if (filter.contains_url !== hasUrl) return false;
+    }
+    return true;
+  });
+}
+
 // GET /_matrix/client/v3/rooms/:roomId/messages - Get room messages
 app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -1503,6 +1622,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
   }
 
   const from = c.req.query('from');
+  const to = c.req.query('to');
   const dir = (c.req.query('dir') || 'b') as 'f' | 'b';
   const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
 
@@ -1513,7 +1633,63 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
     const parsed = parseInt(tokenStr);
     fromToken = isNaN(parsed) ? undefined : parsed;
   }
-  const { events, end } = await getRoomEvents(c.env.DB, roomId, fromToken, limit, dir);
+  let toToken: number | undefined;
+  if (to) {
+    const tokenStr = to.startsWith('s') ? to.slice(1) : to;
+    const parsed = parseInt(tokenStr);
+    toToken = isNaN(parsed) ? undefined : parsed;
+  }
+
+  const filterParam = c.req.query('filter');
+  let eventFilter: MessageEventFilter | undefined;
+  if (filterParam) {
+    try {
+      const parsed = JSON.parse(filterParam);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('filter must be a JSON object');
+      }
+      eventFilter = parsed;
+    } catch {
+      return Errors.badJson('Invalid filter JSON').toResponse();
+    }
+  }
+
+  // `to` is an exclusive stop position. Bound the read where possible, then
+  // trim by actual stream_ordering below (positions are not guaranteed dense).
+  let queryFrom = fromToken;
+  let queryLimit = limit;
+  if (toToken !== undefined) {
+    if (dir === 'b') {
+      if (fromToken !== undefined) {
+        queryLimit = fromToken > toToken ? Math.min(limit, fromToken - toToken - 1) : 0;
+      } else {
+        queryFrom = Number.MAX_SAFE_INTEGER;
+      }
+    } else if (fromToken !== undefined) {
+      queryLimit = toToken > fromToken ? Math.min(limit, toToken - fromToken - 1) : 0;
+    } else {
+      queryLimit = Math.min(limit, Math.max(0, toToken - 1));
+    }
+  }
+  const { events: fetchedEvents, end } = await getRoomEvents(c.env.DB, roomId, queryFrom, queryLimit, dir);
+  let events = fetchedEvents;
+
+  if (toToken !== undefined && events.length > 0) {
+    const ids = events.map((e) => e.event_id);
+    const positions = await c.env.DB.prepare(
+      `SELECT event_id, stream_ordering FROM events WHERE event_id IN (${ids.map(() => '?').join(',')})`
+    ).bind(...ids).all<{ event_id: string; stream_ordering: number | null }>();
+    const byId = new Map(positions.results.map((row) => [row.event_id, row.stream_ordering]));
+    events = events.filter((event) => {
+      const position = byId.get(event.event_id);
+      // A missing position means the event cannot be placed relative to the
+      // token; keep it rather than silently dropping history.
+      if (position == null) return true;
+      return dir === 'b' ? position > toToken : position < toToken;
+    });
+  }
+
+  if (eventFilter) events = applyMessageEventFilter(events, eventFilter);
 
   // Format events for client
   const clientEvents = events.map(e => ({
@@ -3110,6 +3286,13 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
   const roomId = c.req.param('roomId');
   const eventId = c.req.param('eventId');
   const limit = Math.min(parseInt(c.req.query('limit') || '10'), 100);
+  const beforeParam = c.req.query('before');
+  const afterParam = c.req.query('after');
+  const clampSideLimit = (value: string | undefined): number | undefined => {
+    if (value === undefined) return undefined;
+    const parsed = parseInt(value, 10);
+    return isNaN(parsed) ? undefined : Math.min(Math.max(parsed, 0), 100);
+  };
   const userAgent = c.req.header('User-Agent');
 
   // NSE Detection logging - /context is a key endpoint for push notification content
@@ -3154,18 +3337,21 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     timestamp: targetEvent.origin_server_ts,
   });
 
-  // Get events before and after
+  // Get events before and after. before/after override the even split of
+  // limit when supplied; either side may be requested independently.
   const halfLimit = Math.floor(limit / 2);
+  const beforeLimit = clampSideLimit(beforeParam) ?? halfLimit;
+  const afterLimit = clampSideLimit(afterParam) ?? halfLimit;
 
   const eventsBefore = await c.env.DB.prepare(`
     SELECT * FROM events WHERE room_id = ? AND origin_server_ts < ?
     ORDER BY origin_server_ts DESC LIMIT ?
-  `).bind(roomId, targetEvent.origin_server_ts, halfLimit).all();
+  `).bind(roomId, targetEvent.origin_server_ts, beforeLimit).all();
 
   const eventsAfter = await c.env.DB.prepare(`
     SELECT * FROM events WHERE room_id = ? AND origin_server_ts > ?
     ORDER BY origin_server_ts ASC LIMIT ?
-  `).bind(roomId, targetEvent.origin_server_ts, halfLimit).all();
+  `).bind(roomId, targetEvent.origin_server_ts, afterLimit).all();
 
   // Format events
   const formatEvent = (e: any) => ({
@@ -3364,6 +3550,22 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   const joinRulesEvent = await getStateEvent(db, roomId, 'm.room.join_rules');
   const joinRule = (joinRulesEvent?.content as any)?.join_rule || 'invite';
 
+  const restrictedDecision = await evaluateLocalRestrictedJoin({
+    env: c.env,
+    roomId,
+    roomVersion: room.room_version,
+    userId,
+    joinRule,
+    hasInvite: currentMembership?.membership === 'invite',
+  });
+  if (restrictedDecision?.error) {
+    return Errors.forbidden(
+      joinRule === 'knock_restricted'
+        ? `${restrictedDecision.error}. Knock to request access instead.`
+        : restrictedDecision.error
+    ).toResponse();
+  }
+
   // Determine if user can join
   let canJoin = false;
   if (joinRule === 'public') {
@@ -3372,6 +3574,8 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
     canJoin = true;
   } else if (currentMembership?.membership === 'join') {
     return c.json({ room_id: roomId });
+  } else if (restrictedDecision?.authorizedBy) {
+    canJoin = true;
   }
 
   if (!canJoin) {
@@ -3386,6 +3590,7 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   if (joinRulesEvent) authEvents.push(joinRulesEvent.event_id);
   if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
   if (currentMembership) authEvents.push(currentMembership.eventId);
+  if (restrictedDecision?.authEventId) authEvents.push(restrictedDecision.authEventId);
 
   const { events: latestEvents } = await getRoomEvents(db, roomId, undefined, 1);
   const prevEvents = latestEvents.map(e => e.event_id);
@@ -3398,6 +3603,9 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
 
   const memberContent: RoomMemberContent = {
     membership: 'join',
+    ...(restrictedDecision?.authorizedBy
+      ? { join_authorised_via_users_server: restrictedDecision.authorizedBy }
+      : {}),
   };
 
   const event: PDU = {

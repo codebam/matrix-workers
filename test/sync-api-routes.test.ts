@@ -161,12 +161,14 @@ function createSyncDb(opts: {
   deviceKeyChanges?: DeviceKeyChange[];
   sharedRoomUsers?: string[];
   streamPositions?: Record<string, number>;
+  redactedByRoom?: Record<string, Record<string, string>>;
 } = {}) {
   const otkCounts = opts.otkCounts ?? [];
   const fallbackAlgos = opts.fallbackAlgos ?? [];
   const deviceKeyChanges = opts.deviceKeyChanges ?? [];
   const sharedRoomUsers = new Set(opts.sharedRoomUsers ?? [BOB, CAROL]);
   const streamPositions = opts.streamPositions ?? {};
+  const redactedByRoom = opts.redactedByRoom ?? {};
   const selects: SqlCall[] = [];
 
   const db = {
@@ -201,6 +203,17 @@ function createSyncDb(opts: {
 
             async all<T>() {
               selects.push({ sql, args });
+
+              if (sql.includes('redacted_content IS NOT NULL')) {
+                const [roomId] = args as string[];
+                const byEvent = redactedByRoom[roomId] ?? {};
+                return {
+                  results: Object.entries(byEvent).map(([event_id, redacted_content]) => ({
+                    event_id,
+                    redacted_content,
+                  })) as unknown as T[],
+                };
+              }
 
               if (
                 sql.includes('FROM one_time_keys') &&
@@ -354,7 +367,7 @@ describe('GET /_matrix/client/v3/sync — empty baseline', () => {
 
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s42_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -1142,6 +1155,168 @@ describe('GET /sync — invited rooms', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Knocked rooms (Matrix v1.19 rooms.knock)
+// ---------------------------------------------------------------------------
+
+describe('GET /sync — knocked rooms', () => {
+  const KNOCK_ROOM = '!knock:example.com';
+
+  function knockState() {
+    return [
+      makePdu({
+        type: 'm.room.create',
+        event_id: '$create:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: '',
+        content: { creator: BOB },
+        sender: BOB,
+      }),
+      makePdu({
+        type: 'm.room.join_rules',
+        event_id: '$jr:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: '',
+        content: { join_rule: 'knock', reason: 'let me in' },
+        sender: BOB,
+      }),
+      makePdu({
+        type: 'm.room.name',
+        event_id: '$name:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: '',
+        content: { name: 'Knockable room' },
+        sender: BOB,
+      }),
+      makePdu({
+        type: 'm.room.avatar',
+        event_id: '$avatar:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: '',
+        content: { url: 'mxc://example.com/avatar' },
+        sender: BOB,
+      }),
+      makePdu({
+        type: 'm.room.canonical_alias',
+        event_id: '$alias:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: '',
+        content: { alias: '#knockable:example.com' },
+        sender: BOB,
+      }),
+      makePdu({
+        type: 'm.room.encryption',
+        event_id: '$enc:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+        sender: BOB,
+      }),
+      // Not a stripped state type for knock: must be omitted.
+      makePdu({
+        type: 'm.room.topic',
+        event_id: '$topic:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: '',
+        content: { topic: 'private' },
+        sender: BOB,
+      }),
+      // Another user's membership: must be omitted.
+      makePdu({
+        type: 'm.room.member',
+        event_id: '$bob-member:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: BOB,
+        content: { membership: 'join' },
+        sender: BOB,
+      }),
+      makePdu({
+        type: 'm.room.member',
+        event_id: '$self:example.com',
+        room_id: KNOCK_ROOM,
+        state_key: USER,
+        content: { membership: 'knock', reason: 'please' },
+        sender: USER,
+      }),
+    ];
+  }
+
+  function setKnockedRooms(roomIds: string[]) {
+    getUserRooms.mockImplementation(async (_db, _u, membership?: string) => {
+      if (membership === 'knock') return roomIds;
+      return [];
+    });
+  }
+
+  it('returns rooms.knock with stripped join_rules and the user knock member, pruned', async () => {
+    setKnockedRooms([KNOCK_ROOM]);
+    getRoomState.mockResolvedValue(knockState());
+    const env = createEnv({
+      db: createSyncDb({
+        redactedByRoom: {
+          [KNOCK_ROOM]: {
+            '$jr:example.com': JSON.stringify({ join_rule: 'knock' }),
+            '$self:example.com': JSON.stringify({ membership: 'knock' }),
+          },
+        },
+      }),
+    });
+
+    const { body } = await syncRequest(env);
+
+    expect(getUserRooms).toHaveBeenCalledWith(env.DB, USER, 'knock');
+    const rooms = body.rooms as {
+      knock: Record<string, { knock_state: { events: Array<Record<string, unknown>> } }>;
+    };
+    expect(Object.keys(rooms.knock)).toEqual([KNOCK_ROOM]);
+    expect(rooms.knock[KNOCK_ROOM].knock_state.events).toEqual([
+      { type: 'm.room.create', state_key: '', content: { creator: BOB }, sender: BOB },
+      { type: 'm.room.join_rules', state_key: '', content: { join_rule: 'knock' }, sender: BOB },
+      { type: 'm.room.name', state_key: '', content: { name: 'Knockable room' }, sender: BOB },
+      {
+        type: 'm.room.avatar',
+        state_key: '',
+        content: { url: 'mxc://example.com/avatar' },
+        sender: BOB,
+      },
+      {
+        type: 'm.room.canonical_alias',
+        state_key: '',
+        content: { alias: '#knockable:example.com' },
+        sender: BOB,
+      },
+      {
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+        sender: BOB,
+      },
+      { type: 'm.room.member', state_key: USER, content: { membership: 'knock' }, sender: USER },
+    ]);
+    for (const event of rooms.knock[KNOCK_ROOM].knock_state.events) {
+      expect(Object.keys(event).sort()).toEqual(['content', 'sender', 'state_key', 'type']);
+    }
+  });
+
+  it('omits the room from rooms.knock once the knock is retracted (membership leave)', async () => {
+    getRoomState.mockResolvedValue(knockState());
+    const env = createEnv();
+
+    setKnockedRooms([KNOCK_ROOM]);
+    expect(
+      Object.keys((bodyRooms(await syncRequest(env))).knock)
+    ).toEqual([KNOCK_ROOM]);
+
+    // A retraction writes membership='leave'; getUserRooms no longer reports it.
+    setKnockedRooms([]);
+    expect((bodyRooms(await syncRequest(env))).knock).toEqual({});
+  });
+
+  function bodyRooms(result: { body: Record<string, unknown> }) {
+    return result.body.rooms as { knock: Record<string, unknown> };
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Left rooms
 // ---------------------------------------------------------------------------
 
@@ -1416,7 +1591,7 @@ describe('GET /sync — timeout / SYNC DO long-poll', () => {
     const { status, body } = await syncRequest(env, 'since=s10_td0&timeout=1000');
     expect(status).toBe(200);
     expect(syncDo.fetches).toHaveLength(1);
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.next_batch).toBe('s42_td0');
   });
 

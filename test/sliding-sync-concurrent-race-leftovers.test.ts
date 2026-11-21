@@ -616,8 +616,10 @@ function createSlidingDb(opts: {
         rows = rows.filter((r) =>
           state.some((s) => s.room_id === r.room_id && s.event_type === 'm.room.tombstone')
         );
-      } else if (sql.includes("membership IN ('join', 'invite')")) {
-        rows = rows.filter((r) => r.membership === 'join' || r.membership === 'invite');
+      } else if (sql.includes("membership IN ('join', 'invite', 'knock')")) {
+        rows = rows.filter(
+          (r) => r.membership === 'join' || r.membership === 'invite' || r.membership === 'knock'
+        );
       }
 
       if (sql.includes('ORDER BY COALESCE(room_name')) {
@@ -1310,15 +1312,16 @@ describe('race sliding dual getUserRooms JOIN barrier after #202', () => {
         postSync(MSC3575, env, listBody()),
       ]);
       expect(results.every((r) => r.status === 200)).toBe(true);
-      // Default list filter is join+invite: leave/ban/knock drop the room for the
-      // post-mutate observer; invite residual may still include the room.
+      // Default list filter is join+invite+knock (MSC4186): leave/ban drop
+      // the room for the post-mutate observer; invite/knock residuals keep
+      // it — knocked rooms are listable per spec.
       const withRoom = results.filter((r) => ROOM in roomsOf(r.body));
       const withoutRoom = results.filter((r) => !(ROOM in roomsOf(r.body)));
-      expect(withRoom.length).toBeGreaterThanOrEqual(1);
-      if (residual === 'invite') {
-        expect(withRoom.length + withoutRoom.length).toBe(2);
-      } else {
+      if (residual === 'leave' || residual === 'ban') {
+        expect(withRoom.length).toBe(1);
         expect(withoutRoom.length).toBe(1);
+      } else {
+        expect(withRoom.length).toBe(2);
       }
     });
   }

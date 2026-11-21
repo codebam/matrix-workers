@@ -3637,3 +3637,92 @@ describe('spec v1.18/v1.19 conformance additions', () => {
     }
   });
 });
+
+describe('restricted room local joins', () => {
+  const ALLOWED = '!allowed:example.com';
+  const AUTHORIZER = '@bob:example.com';
+
+  function restrictRoom(rule = 'restricted') {
+    getRoom.mockResolvedValue({ room_id: ROOM, room_version: '10' });
+    const joinRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      content: {
+        join_rule: rule,
+        allow: [{ type: 'm.room_membership', room_id: ALLOWED }],
+      },
+      state_key: '',
+    });
+    const powerLevels = pdu({
+      type: 'm.room.power_levels',
+      event_id: '$pl',
+      content: { users: { [AUTHORIZER]: 100 }, users_default: 0, invite: 50 },
+      state_key: '',
+    });
+    defaultState({
+      'm.room.join_rules': joinRules,
+      'm.room.power_levels': powerLevels,
+    });
+    getRoomState.mockResolvedValue([
+      pdu({ type: 'm.room.create', event_id: '$create', content: { creator: AUTHORIZER, room_version: '10' }, state_key: '' }),
+      joinRules,
+      powerLevels,
+      pdu({ type: 'm.room.member', event_id: '$bob-join', sender: AUTHORIZER, state_key: AUTHORIZER, content: { membership: 'join' } }),
+    ]);
+  }
+
+  it('stores a local join with the authorising user when an allowed-room membership exists', async () => {
+    restrictRoom();
+    getMembership.mockImplementation(async (_db, roomId: string) =>
+      roomId === ALLOWED ? { membership: 'join', eventId: '$allowed-join' } : null
+    );
+    const { status } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/join`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(200);
+    const stored = storeEventIdempotent.mock.calls[0][1] as PDU;
+    expect(stored.content).toMatchObject({
+      membership: 'join',
+      join_authorised_via_users_server: AUTHORIZER,
+    });
+    expect(stored.auth_events).toContain('$bob-join');
+  });
+
+  it('403s a local join when the user is in no allowed room', async () => {
+    restrictRoom();
+    getMembership.mockResolvedValue(null);
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/join`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(403);
+    expect(body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+    expect(storeEventIdempotent).not.toHaveBeenCalled();
+  });
+
+  it('applies the same allow-list evaluation on /join/:roomIdOrAlias', async () => {
+    restrictRoom('knock_restricted');
+    getMembership.mockImplementation(async (_db, roomId: string) =>
+      roomId === ALLOWED ? { membership: 'join', eventId: '$allowed-join' } : null
+    );
+    const { status } = await request(
+      `/_matrix/client/v3/join/${ROOM_ENC}`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(200);
+    const stored = storeEventIdempotent.mock.calls[0][1] as PDU;
+    expect(stored.content.join_authorised_via_users_server).toBe(AUTHORIZER);
+  });
+
+  it('points knock_restricted users at the knock flow when no allowed room matches', async () => {
+    restrictRoom('knock_restricted');
+    getMembership.mockResolvedValue(null);
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/join`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(403);
+    expect((body as { error?: string }).error).toMatch(/Knock/);
+  });
+});

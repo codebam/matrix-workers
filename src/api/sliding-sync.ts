@@ -373,8 +373,9 @@ async function getUserRooms(
     // Check for tombstone state
     query += ` AND EXISTS (SELECT 1 FROM room_state rs JOIN events e ON rs.event_id = e.event_id WHERE rs.room_id = rm.room_id AND rs.event_type = 'm.room.tombstone')`;
   } else {
-    // By default, only return rooms the user has joined or been invited to
-    query += ` AND rm.membership IN ('join', 'invite')`;
+    // By default, return rooms the user has joined, been invited to, or has a
+    // pending knock on (MSC4186 membership 'knock').
+    query += ` AND rm.membership IN ('join', 'invite', 'knock')`;
   }
 
   // Default sort: by recency
@@ -833,6 +834,86 @@ async function getInviteRoomData(
   return result;
 }
 
+// Get stripped knock state for rooms where the user's knock is pending. Per
+// Matrix v1.19, the user sees the same limited stripped state as an invite plus
+// their own m.room.member (membership knock) event.
+async function getKnockRoomData(
+  db: D1Database,
+  roomId: string,
+  userId: string
+): Promise<RoomResult> {
+  const result: RoomResult = {
+    initial: true,
+    membership: 'knock',  // MSC4186: explicit membership status
+  };
+
+  const strippedStateTypes = [
+    'm.room.create',
+    'm.room.join_rules',
+    'm.room.name',
+    'm.room.avatar',
+    'm.room.canonical_alias',
+    'm.room.encryption',
+    'm.room.member',  // Only the knocking user's own membership
+  ];
+
+  const knockState: any[] = [];
+
+  for (const eventType of strippedStateTypes) {
+    let query = `
+      SELECT e.event_type, e.state_key, e.content, e.sender, e.redacted_content
+      FROM room_state rs
+      JOIN events e ON rs.event_id = e.event_id
+      WHERE rs.room_id = ? AND rs.event_type = ?
+    `;
+    const params: any[] = [roomId, eventType];
+
+    if (eventType === 'm.room.member') {
+      query += ` AND rs.state_key = ?`;
+      params.push(userId);
+    }
+
+    const events = await db.prepare(query).bind(...params).all();
+
+    for (const event of events.results as any[]) {
+      try {
+        knockState.push({
+          type: event.event_type,
+          state_key: event.state_key,
+          // Redacted events serve their pruned content, as for invite_state.
+          content: JSON.parse(event.redacted_content ?? event.content),
+          sender: event.sender,
+        });
+      } catch { /* ignore parse errors */ }
+    }
+  }
+
+  result.knock_state = knockState;
+
+  const nameEvent = knockState.find(e => e.type === 'm.room.name');
+  if (nameEvent?.content?.name) {
+    result.name = nameEvent.content.name;
+  }
+
+  const avatarEvent = knockState.find(e => e.type === 'm.room.avatar');
+  if (avatarEvent?.content?.url) {
+    result.avatar = avatarEvent.content.url;
+  }
+
+  const joinedCount = await db.prepare(`
+    SELECT COUNT(*) as count FROM room_memberships WHERE room_id = ? AND membership = 'join'
+  `).bind(roomId).first<{ count: number }>();
+
+  const invitedCount = await db.prepare(`
+    SELECT COUNT(*) as count FROM room_memberships WHERE room_id = ? AND membership = 'invite'
+  `).bind(roomId).first<{ count: number }>();
+
+  result.joined_count = joinedCount?.count || 0;
+  result.invited_count = invitedCount?.count || 0;
+
+  return result;
+}
+
 // MSC3575 Sliding Sync endpoint
 app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), async (c) => {
   const userId = c.get('userId');
@@ -973,6 +1054,16 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
           continue;
         }
 
+        // Knocked rooms get knock_state instead of a timeline, like invites.
+        if (roomInfo.membership === 'knock') {
+          response.rooms[roomInfo.roomId] = await getKnockRoomData(db, roomInfo.roomId, userId);
+          connectionState.roomStates[roomInfo.roomId] = {
+            sentState: true,
+            lastStreamOrdering: roomSincePos,
+          };
+          continue;
+        }
+
         // For joined rooms, get full room data
         const roomData = await getRoomData(db, roomInfo.roomId, userId, {
           requiredState: listConfig.required_state,
@@ -1068,6 +1159,15 @@ app.post('/_matrix/client/unstable/org.matrix.msc3575/sync', requireAuth(), asyn
         const roomData = await getInviteRoomData(db, roomId, userId);
         if (!roomData) continue;
         response.rooms[roomId] = roomData;
+        connectionState.roomStates[roomId] = {
+          sentState: true,
+          lastStreamOrdering: roomSincePos,
+        };
+        continue;
+      }
+
+      if (membershipResult.membership === 'knock') {
+        response.rooms[roomId] = await getKnockRoomData(db, roomId, userId);
         connectionState.roomStates[roomId] = {
           sentState: true,
           lastStreamOrdering: roomSincePos,
@@ -1641,6 +1741,16 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
           continue;
         }
 
+        if (roomInfo.membership === 'knock') {
+          response.rooms[roomInfo.roomId] = await getKnockRoomData(db, roomInfo.roomId, userId);
+          hasChanges = true; // Mark that we have actual changes
+          connectionState.roomStates[roomInfo.roomId] = {
+            sentState: true,
+            lastStreamOrdering: roomSincePos,
+          };
+          continue;
+        }
+
         // For joined rooms, get full room data
         const roomData = await getRoomData(db, roomInfo.roomId, userId, {
           requiredState: listConfig.required_state,
@@ -1738,6 +1848,16 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
         if (!roomData) continue;
         hasChanges = true; // Mark that we have actual changes
         response.rooms[roomId] = roomData;
+        connectionState.roomStates[roomId] = {
+          sentState: true,
+          lastStreamOrdering: roomSincePos,
+        };
+        continue;
+      }
+
+      if (membershipResult.membership === 'knock') {
+        response.rooms[roomId] = await getKnockRoomData(db, roomId, userId);
+        hasChanges = true; // Mark that we have actual changes
         connectionState.roomStates[roomId] = {
           sentState: true,
           lastStreamOrdering: roomSincePos,

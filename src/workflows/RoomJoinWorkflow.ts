@@ -442,7 +442,12 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
 
     const eventId = await generateEventId(this.env.SERVER_NAME);
 
+    // A make_join template can carry authorisation fields (restricted rooms:
+    // join_authorised_via_users_server; also third_party_invite). Merge them
+    // instead of rebuilding from scratch — dropping them makes the resident
+    // reject our join — while local profile fields still take precedence.
     const memberContent: any = {
+      ...(remoteEventTemplate?.event?.content ?? {}),
       membership: 'join',
     };
 

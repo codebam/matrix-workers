@@ -139,6 +139,7 @@ export interface RoomJoinRulesContent {
   allow?: Array<{
     type: string;
     room_id?: RoomId;
+    via?: string[];
   }>;
 }
 

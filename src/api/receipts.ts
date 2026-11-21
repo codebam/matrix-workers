@@ -11,6 +11,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { queueFederationEdu } from '../services/federation-edus';
 
 const app = new Hono<AppEnv>();
 
@@ -99,6 +100,16 @@ app.post('/_matrix/client/v3/rooms/:roomId/receipt/:receiptType/:eventId', requi
           content = excluded.content
       `).bind(userId, roomId, JSON.stringify({ event_id: eventId })).run();
       console.log('[receipts] Also updated m.fully_read in account_data for', userId, 'in room', roomId);
+
+      // Public read receipts only. m.read.private is deliberately never
+      // federated, and m.fully_read is local account data, not an EDU.
+      const receipt = threadId
+        ? { ts: Date.now(), thread_id: threadId }
+        : { ts: Date.now() };
+      await queueFederationEdu(c.env, roomId, 'm.receipt', {
+        room_id: roomId,
+        content: { [eventId]: { 'm.read': { [userId]: receipt } } },
+      });
     }
   }
 
@@ -167,6 +178,17 @@ app.post('/_matrix/client/v3/rooms/:roomId/read_markers', requireAuth(), async (
       `).bind(userId, roomId, JSON.stringify({ event_id: body['m.read'] })).run();
       console.log('[receipts] Auto-updated m.fully_read to match m.read for', userId, 'in room', roomId);
     }
+
+    // read_markers stores m.read as an ephemeral receipt too; federate that
+    // public receipt exactly like POST /receipt (never m.read.private).
+    await queueFederationEdu(c.env, roomId, 'm.receipt', {
+      room_id: roomId,
+      content: {
+        [body['m.read']]: {
+          'm.read': { [userId]: { ts: Date.now() } },
+        },
+      },
+    });
   }
 
   // Process m.read.private (stored in Room DO)

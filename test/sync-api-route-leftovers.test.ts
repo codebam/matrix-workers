@@ -296,7 +296,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s40_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -307,7 +307,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s41_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -318,7 +318,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s42_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -329,7 +329,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s43_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -340,7 +340,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s44_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -351,7 +351,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s45_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -362,7 +362,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s46_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -373,7 +373,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s47_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -384,7 +384,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s48_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -395,7 +395,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s49_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -406,7 +406,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s50_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -417,7 +417,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s51_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -428,7 +428,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s52_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -439,7 +439,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s53_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -450,7 +450,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s54_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -461,7 +461,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s55_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -472,7 +472,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s56_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -483,7 +483,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s57_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -494,7 +494,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s58_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -505,7 +505,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s59_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -516,7 +516,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s60_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -527,7 +527,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s61_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -538,7 +538,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s62_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -549,7 +549,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s63_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -560,7 +560,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s64_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -571,7 +571,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s65_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -582,7 +582,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s66_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -593,7 +593,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s67_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -604,7 +604,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s68_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -615,7 +615,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s69_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -626,7 +626,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s70_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });
@@ -637,7 +637,7 @@ describe('sync leftovers empty baseline soft flood after #157', () => {
     const { status, body } = await syncRequest(env);
     expect(status).toBe(200);
     expect(body.next_batch).toBe('s71_td0');
-    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {} });
+    expect(body.rooms).toEqual({ join: {}, invite: {}, leave: {}, knock: {} });
     expect(body.presence).toEqual({ events: [] });
     expect(body.account_data).toEqual({ events: [] });
     expect(body.to_device).toEqual({ events: [] });

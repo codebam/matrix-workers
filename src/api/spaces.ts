@@ -48,41 +48,52 @@ app.get('/_matrix/client/v1/rooms/:roomId/hierarchy', requireAuth(), async (c) =
     return Errors.notFound('Room not found').toResponse();
   }
 
-  // Get pagination params
-  // Note: 'from' pagination param reserved for future use
-  void c.req.query('from');
+  // Get pagination params. next_batch is a room_id: resume strictly after
+  // that room in the same (state_key) order. Unrecognized tokens keep the
+  // first-page behaviour.
+  const from = c.req.query('from');
+  const resumeAfter = from?.startsWith('!') ? from : undefined;
   const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
   const maxDepth = parseInt(c.req.query('max_depth') || '1');
   const suggestedOnly = c.req.query('suggested_only') === 'true';
 
-  // Get space children from m.space.child state events
+  // Get space children from m.space.child state events. ORDER BY makes the
+  // room_id cursor stable between pages.
   const childEvents = await db.prepare(`
     SELECT rs.state_key, e.content
     FROM room_state rs
     JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ? AND rs.event_type = 'm.space.child'
+    ORDER BY rs.state_key ASC
   `).bind(roomId).all<{ state_key: string; content: string }>();
 
-  const rooms: SpaceChild[] = [];
+  let spaceRoom: SpaceChild | undefined;
 
-  // Add the space itself first
-  const spaceInfo = await getRoomInfo(db, roomId, c.env.SERVER_NAME);
-  if (spaceInfo) {
-    rooms.push({
-      ...spaceInfo,
-      children_state: childEvents.results.map(ce => ({
-        type: 'm.space.child',
-        state_key: ce.state_key,
-        content: JSON.parse(ce.content),
-        sender: '', // Would need to fetch from event
-        origin_server_ts: 0,
-      })),
-    });
+  // Add the space itself only on the first page, so walking next_batch never
+  // emits it twice. When the token is the space itself, start at child 1.
+  if (!resumeAfter) {
+    const spaceInfo = await getRoomInfo(db, roomId, c.env.SERVER_NAME);
+    if (spaceInfo) {
+      spaceRoom = {
+        ...spaceInfo,
+        children_state: childEvents.results.map(ce => ({
+          type: 'm.space.child',
+          state_key: ce.state_key,
+          content: JSON.parse(ce.content),
+          sender: '', // Would need to fetch from event
+          origin_server_ts: 0,
+        })),
+      };
+    }
   }
+  const afterRoomId = resumeAfter === roomId ? undefined : resumeAfter;
+
+  const childRooms: SpaceChild[] = [];
 
   // Process each child
   for (const child of childEvents.results) {
     const childRoomId = child.state_key;
+    if (afterRoomId && childRoomId <= afterRoomId) continue;
 
     try {
       const content = JSON.parse(child.content);
@@ -117,7 +128,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/hierarchy', requireAuth(), async (c) =
           }));
         }
 
-        rooms.push({
+        childRooms.push({
           ...childInfo,
           children_state: childrenState,
         });
@@ -127,9 +138,19 @@ app.get('/_matrix/client/v1/rooms/:roomId/hierarchy', requireAuth(), async (c) =
     }
   }
 
+  // Paginate the filtered child list (skipped/deleted children never become
+  // visible gaps in the cursor), after the space itself on the first page.
+  // A non-numeric limit stays the legacy empty-page behaviour (slice(0, NaN)).
+  const childBudget = Number.isNaN(limit) ? 0 : Math.max(0, limit - (spaceRoom ? 1 : 0));
+  const pageChildren = childRooms.slice(0, childBudget);
+  const rooms = Number.isNaN(limit) ? [] : [...(spaceRoom ? [spaceRoom] : []), ...pageChildren];
+  const hasMore = !Number.isNaN(limit) && childRooms.length > pageChildren.length;
+  // Keep the legacy index for non-positive limits (invalid input still 500s).
+  const nextBatchIndex = limit > 0 ? Math.min(limit, rooms.length) - 1 : limit - 1;
+
   return c.json({
-    rooms: rooms.slice(0, limit),
-    next_batch: rooms.length > limit ? rooms[limit - 1].room_id : undefined,
+    rooms,
+    next_batch: hasMore || rooms.length > limit ? rooms[nextBatchIndex].room_id : undefined,
   });
 });
 

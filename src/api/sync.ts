@@ -1,7 +1,16 @@
 // Matrix sync endpoint
 
 import { Hono } from 'hono';
-import type { AppEnv, SyncResponse, JoinedRoom, InvitedRoom, LeftRoom, Env } from '../types';
+import type {
+  AppEnv,
+  SyncResponse,
+  JoinedRoom,
+  InvitedRoom,
+  LeftRoom,
+  KnockedRoom,
+  StrippedStateEvent,
+  Env,
+} from '../types';
 import { requireAuth } from '../middleware/auth';
 import {
   getUserRooms,
@@ -17,6 +26,17 @@ import {
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { getTypingUsers } from './typing';
+
+// Stripped state a knocking user is allowed to see before they join (Matrix
+// v1.19 /sync rooms.knock). Their own membership event is added separately.
+const KNOCK_STRIPPED_STATE_TYPES = [
+  'm.room.create',
+  'm.room.join_rules',
+  'm.room.name',
+  'm.room.avatar',
+  'm.room.canonical_alias',
+  'm.room.encryption',
+];
 
 // ============================================
 // Sync Filter Types and Helpers
@@ -226,6 +246,22 @@ async function getDeviceListChanges(
   };
 }
 
+// Redacted state events serve their pruned content in stripped state (used by
+// both invite_state and knock_state). The redaction pipeline stores the pruned
+// JSON on events.redacted_content, keyed by event_id.
+async function getPrunedContentMap(
+  db: D1Database,
+  roomId: string
+): Promise<Map<string, Record<string, unknown>>> {
+  const redactedRows = await db.prepare(
+    `SELECT event_id, redacted_content FROM events WHERE room_id = ? AND redacted_content IS NOT NULL`
+  ).bind(roomId).all<{ event_id: string; redacted_content: string }>();
+
+  return new Map(
+    redactedRows.results.map(r => [r.event_id, JSON.parse(r.redacted_content)] as const)
+  );
+}
+
 const app = new Hono<AppEnv>();
 
 // GET /_matrix/client/v3/sync - Sync with server
@@ -365,6 +401,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       join: {},
       invite: {},
       leave: {},
+      knock: {},
     },
     presence: {
       events: [],
@@ -669,12 +706,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
 
     // Redacted state events serve their pruned content in stripped state.
-    const redactedRows = await c.env.DB.prepare(
-      `SELECT event_id, redacted_content FROM events WHERE room_id = ? AND redacted_content IS NOT NULL`
-    ).bind(roomId).all<{ event_id: string; redacted_content: string }>();
-    const prunedContent = new Map(
-      redactedRows.results.map(r => [r.event_id, JSON.parse(r.redacted_content)] as const)
-    );
+    const prunedContent = await getPrunedContentMap(c.env.DB, roomId);
 
     // Strip state for invited rooms
     let strippedState = state.map(event => ({
@@ -694,6 +726,41 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     };
 
     response.rooms!.invite![roomId] = invitedRoom;
+  }
+
+  // Get knocked rooms: rooms where this user's knock is still pending. A
+  // retracted knock is a 'leave' membership, so it drops out here (and may
+  // surface in rooms.leave instead).
+  const knockedRoomIds = await getUserRooms(c.env.DB, userId, 'knock');
+  for (const roomId of knockedRoomIds) {
+    if (!shouldIncludeRoom(roomId, filter?.room)) {
+      continue;
+    }
+
+    const state = await getRoomState(c.env.DB, roomId);
+    const prunedContent = await getPrunedContentMap(c.env.DB, roomId);
+
+    let strippedState: StrippedStateEvent[] = state
+      .filter(event =>
+        KNOCK_STRIPPED_STATE_TYPES.includes(event.type) ||
+        (event.type === 'm.room.member' && event.state_key === userId)
+      )
+      .map(event => ({
+        type: event.type,
+        state_key: event.state_key!,
+        content: prunedContent.get(event.event_id) ?? event.content,
+        sender: event.sender,
+      }));
+
+    strippedState = applyEventFilter(strippedState, filter?.room?.state);
+
+    const knockedRoom: KnockedRoom = {
+      knock_state: {
+        events: strippedState,
+      },
+    };
+
+    response.rooms!.knock![roomId] = knockedRoom;
   }
 
   // Get left rooms (rooms the user left since last sync). Deliberately not
@@ -745,10 +812,12 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       || (room.timeline?.state_after?.events.length ?? 0) > 0;
   });
   const hasInvites = Object.keys(response.rooms!.invite!).length > 0;
+  const hasKnocks = Object.keys(response.rooms!.knock!).length > 0;
   const hasLeaves = Object.keys(response.rooms!.leave!).length > 0;
   const hasToDevice = response.to_device!.events.length > 0;
   const hasAccountData = response.account_data!.events.length > 0;
-  const hasChanges = hasRoomChanges || hasInvites || hasLeaves || hasToDevice || hasAccountData;
+  const hasChanges =
+    hasRoomChanges || hasInvites || hasKnocks || hasLeaves || hasToDevice || hasAccountData;
 
   // Parse timeout from query params (default 0 for no wait, max 30s)
   const timeout = Math.min(parseInt(c.req.query('timeout') || '0'), 30000);
@@ -780,8 +849,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
   } else if (timeout > 0 && hasSinceToken) {
     console.log('[sync] Skipping DO wait for', userId, '- hasChanges:', hasChanges,
-      'roomChanges:', hasRoomChanges, 'invites:', hasInvites, 'leaves:', hasLeaves,
-      'toDevice:', hasToDevice, 'accountData:', hasAccountData);
+      'roomChanges:', hasRoomChanges, 'invites:', hasInvites, 'knocks:', hasKnocks,
+      'leaves:', hasLeaves, 'toDevice:', hasToDevice, 'accountData:', hasAccountData);
   }
 
   // Build composite next_batch token with separate positions for each stream.

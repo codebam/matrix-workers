@@ -680,3 +680,37 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     expect(federationGet).not.toHaveBeenCalled();
   });
 });
+
+describe('restricted join template fields', () => {
+  it('preserves make_join authorisation content while applying local profile fields', async () => {
+    const env = createSyncEnv();
+    const wf = new RoomJoinWorkflow({} as any, env as any);
+    const template = validRemoteTemplate({
+      content: {
+        membership: 'join',
+        join_authorised_via_users_server: '@authorizer:example.com',
+        third_party_invite: { signed: { token: 't' } },
+        displayname: 'remote-stale',
+      },
+    });
+    const event = await (wf as any).createJoinEvent({
+      roomId: ROOM,
+      userId: USER,
+      displayName: 'Local Name',
+      avatarUrl: 'mxc://example.com/avatar',
+      reason: 'restricted room',
+      remoteEventTemplate: template,
+    });
+    expect(event.content).toMatchObject({
+      membership: 'join',
+      join_authorised_via_users_server: '@authorizer:example.com',
+      third_party_invite: { signed: { token: 't' } },
+      displayname: 'Local Name',
+      avatar_url: 'mxc://example.com/avatar',
+      reason: 'restricted room',
+    });
+    expect(event.auth_events).toEqual(template.event.auth_events);
+    expect(event.prev_events).toEqual(template.event.prev_events);
+    expect(event.depth).toBe(template.event.depth);
+  });
+});

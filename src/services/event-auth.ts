@@ -282,8 +282,9 @@ function checkMemberEvent(
             }
           }
         }
-        // Check if user is a member of an allowed room (validated externally)
-        // For local auth, we allow if the join_authorised field is present
+        // The allow-list and the resident-server identity of the authorising
+        // user are checked by the joining/resident server before it reaches
+        // this auth check (see services/restricted-joins.ts).
       }
 
       return { allowed: false, error: 'Not authorized to join' };

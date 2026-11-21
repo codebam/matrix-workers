@@ -18,6 +18,7 @@ import { checkEventAuth } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
 import { findServerAcl, isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId } from '../services/server-acl';
 import { getRoomVersion } from '../services/room-versions';
+import { evaluateRestrictedJoin, refreshRestrictedRoomState } from '../services/restricted-joins';
 import { applyEventRedaction } from '../services/event-redaction';
 import {
   getActivePolicyRules,
@@ -629,6 +630,88 @@ app.get('/_matrix/key/v2/query/:serverName/:keyId', async (c) => {
   return c.json({ server_keys: keyResponses });
 });
 
+// Inbound ephemeral EDUs go straight to the Room DO — the same storage path
+// local clients use. No outbound queueing here, so remote typing/read state
+// can never bounce back to its sender as an echo.
+async function inboundEduRoomExists(db: D1Database, roomId: string): Promise<boolean> {
+  try {
+    return (await getRoom(db, roomId)) !== null;
+  } catch (err) {
+    console.warn('[federation] EDU room lookup failed:', err);
+    return false;
+  }
+}
+
+async function deliverInboundTypingEdu(env: Env, content: unknown): Promise<void> {
+  const edu = (content ?? {}) as Record<string, unknown>;
+  const { room_id: roomId, user_id: userId, typing } = edu;
+  if (typeof roomId !== 'string' || !roomId ||
+      typeof userId !== 'string' || !userId ||
+      typeof typing !== 'boolean') {
+    console.warn('[federation] Ignoring malformed m.typing EDU');
+    return;
+  }
+  if (!await inboundEduRoomExists(env.DB, roomId)) {
+    console.warn('[federation] Ignoring m.typing EDU for unknown room', roomId);
+    return;
+  }
+
+  const roomDO = env.ROOMS.get(env.ROOMS.idFromName(roomId));
+  await roomDO.fetch(new Request('https://room/typing', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    // The DO applies its own default timeout.
+    body: JSON.stringify({ user_id: userId, typing }),
+  }));
+}
+
+// Spec v1.19 wire shape: room_id plus content keyed by event ID, receipt type,
+// then user ID. Only m.read is a public ephemeral receipt: m.read.private is
+// never accepted from a remote server, and m.fully_read is local account data.
+async function deliverInboundReceiptEdu(env: Env, content: unknown): Promise<void> {
+  const edu = (content ?? {}) as Record<string, unknown>;
+  const roomId = edu.room_id;
+  const byEventId = edu.content;
+  if (typeof roomId !== 'string' || !roomId ||
+      !byEventId || typeof byEventId !== 'object' || Array.isArray(byEventId)) {
+    console.warn('[federation] Ignoring malformed m.receipt EDU');
+    return;
+  }
+  if (!await inboundEduRoomExists(env.DB, roomId)) {
+    console.warn('[federation] Ignoring m.receipt EDU for unknown room', roomId);
+    return;
+  }
+
+  const roomDO = env.ROOMS.get(env.ROOMS.idFromName(roomId));
+  for (const [eventId, byReceiptType] of Object.entries(byEventId as Record<string, unknown>)) {
+    if (!eventId || !byReceiptType || typeof byReceiptType !== 'object' || Array.isArray(byReceiptType)) continue;
+    for (const [receiptType, byUserId] of Object.entries(byReceiptType as Record<string, unknown>)) {
+      if (receiptType !== 'm.read') continue;
+      if (!byUserId || typeof byUserId !== 'object' || Array.isArray(byUserId)) continue;
+      for (const [userId, data] of Object.entries(byUserId as Record<string, unknown>)) {
+        if (!userId) continue;
+        const threadId = (data as { thread_id?: unknown } | null)?.thread_id;
+        const receipt: { user_id: string; event_id: string; receipt_type: string; thread_id?: string } = {
+          user_id: userId,
+          event_id: eventId,
+          receipt_type: receiptType,
+        };
+        if (typeof threadId === 'string') receipt.thread_id = threadId;
+        try {
+          await roomDO.fetch(new Request('https://room/receipt', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(receipt),
+          }));
+        } catch (err) {
+          // One bad receipt must not prevent the rest of the EDU being stored.
+          console.warn('[federation] Failed to store inbound receipt:', err);
+        }
+      }
+    }
+  }
+}
+
 // PUT /_matrix/federation/v1/send/:txnId - Receive events from remote server
 // This endpoint is now protected by requireFederationAuth middleware
 app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
@@ -1190,8 +1273,11 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
       switch (eduType) {
         case 'm.typing':
-          // Handle typing notification
-          // In a full implementation, this would notify connected clients
+          try {
+            await deliverInboundTypingEdu(c.env, content);
+          } catch (typingErr) {
+            console.warn('[federation] Failed to deliver inbound m.typing EDU:', typingErr);
+          }
           break;
 
         case 'm.presence': {
@@ -1285,7 +1371,11 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
 
         case 'm.receipt':
-          // Handle read receipts
+          try {
+            await deliverInboundReceiptEdu(c.env, content);
+          } catch (receiptErr) {
+            console.warn('[federation] Failed to deliver inbound m.receipt EDU:', receiptErr);
+          }
           break;
 
         case 'm.direct_to_device':
@@ -2051,7 +2141,7 @@ async function persistLegacyInboundJoin(
 // countersigning and persisting it. The joining server runs the same rules,
 // but we must not trust it: without this check send_join accepted joins into
 // invite-only rooms (and handed the caller the room's state).
-async function authorizeInboundJoin(
+export async function authorizeInboundJoin(
   env: Env,
   roomId: string,
   roomVersion: string,
@@ -2069,6 +2159,18 @@ async function authorizeInboundJoin(
       return 'Join event sender does not belong to the authenticated server';
     }
   }
+
+  // Room v8 restricted-join rule: only a user on the RESIDENT server may
+  // authorise an inbound join. checkEventAuth verifies membership and invite
+  // power; the server identity is ours to enforce before we countersign.
+  const content = joinEvent['content'] as Record<string, unknown> | undefined;
+  const authorisingUser = content?.['join_authorised_via_users_server'];
+  if (typeof authorisingUser === 'string' && authorisingUser) {
+    if (serverNameFromId(authorisingUser) !== env.SERVER_NAME) {
+      return 'The authorising user is not on this server';
+    }
+  }
+
   const roomState = await getRoomState(env.DB, roomId);
   // No synced state: cannot authorize, keep the previous permissive behavior
   // rather than refusing joins into rooms whose state we have not received.
@@ -2180,6 +2282,32 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
     ).toResponse();
   }
 
+  // Restricted rooms (MSC3083/MSC3787): without an invite the joining user
+  // must be in an allowed room, and we must name a joined local member with
+  // invite power so the remote server can authorise our join event.
+  let restrictedAuthoriser: string | undefined;
+  let restrictedAuthEventId: string | undefined;
+  if (
+    membership !== 'invite' &&
+    membership !== 'join' &&
+    (joinRule === 'restricted' || joinRule === 'knock_restricted')
+  ) {
+    const decision = await evaluateRestrictedJoin({
+      db: c.env.DB,
+      cache: c.env.CACHE,
+      localServerName: c.env.SERVER_NAME,
+      roomId,
+      userId,
+      roomState,
+      roomVersion: room.room_version,
+    });
+    if (decision.error || !decision.authorizedBy) {
+      return Errors.forbidden(decision.error ?? 'You are not allowed to join this room').toResponse();
+    }
+    restrictedAuthoriser = decision.authorizedBy;
+    restrictedAuthEventId = decision.authEventId;
+  }
+
   // MSC4291 (room version 12): the template must reference the derived wire
   // IDs that federation exchanges, and the create event is implicit so it is
   // never listed in auth_events.
@@ -2190,6 +2318,7 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
   if (createEvent && !isMsc4291RoomVersion(room.room_version)) authEvents.push(wireRef(createEvent.event_id));
   if (powerLevelsEvent) authEvents.push(wireRef(powerLevelsEvent.event_id));
   if (inviteeMembership) authEvents.push(wireRef(inviteeMembership.event_id));
+  if (restrictedAuthEventId) authEvents.push(wireRef(restrictedAuthEventId));
   if (joinRulesEvent) authEvents.push(wireRef(joinRulesEvent.event_id));
 
   // Get latest event for prev_events
@@ -2208,6 +2337,9 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
     state_key: userId,
     content: {
       membership: 'join',
+      ...(restrictedAuthoriser
+        ? { join_authorised_via_users_server: restrictedAuthoriser }
+        : {}),
     },
     origin_server_ts: Date.now(),
     depth,
@@ -2219,6 +2351,70 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
     room_version: room.room_version,
     event: eventTemplate,
   });
+});
+
+// POST /_matrix/federation/v1/refresh_room/:roomId - Refresh current state
+// of a restricted room after joining it via an allow-list room (spec v1.11).
+app.post('/_matrix/federation/v1/refresh_room/:roomId', async (c) => {
+  const roomId = c.req.param('roomId');
+
+  const room = await c.env.DB.prepare(
+    `SELECT room_id, room_version FROM rooms WHERE room_id = ?`
+  ).bind(roomId).first<{ room_id: string; room_version: string }>();
+  if (!room) return Errors.notFound('Room not found').toResponse();
+
+  const behavior = getRoomVersion(room.room_version);
+  if (!behavior?.restrictedJoinsSupported) {
+    return Errors.unsupportedRoomVersion('Restricted room state refresh requires a room version supporting restricted joins').toResponse();
+  }
+
+  // Same ACL posture as the other federation read/state routes: denied
+  // servers learn nothing about the room, including via a refresh. Check
+  // both the room-state ACL and the cached state-event lookup used by the
+  // read endpoints.
+  const aclDeniedMessage = "The calling server is denied by the room's server ACL";
+  const origin = c.get('federationOrigin' as any) as string | undefined;
+  try {
+    const acl = findServerAcl(await getRoomState(c.env.DB, roomId));
+    if (acl && origin && !isServerAllowedByAcl(acl, origin)) {
+      return Errors.forbidden(aclDeniedMessage).toResponse();
+    }
+  } catch {
+    // ACL lookup failures fall open, as on the other read routes.
+  }
+  if (await callerDeniedByRoomAcl(c, roomId)) {
+    return Errors.forbidden(aclDeniedMessage).toResponse();
+  }
+
+  let body: { via?: unknown };
+  try {
+    body = await getFederationBody<{ via?: unknown }>(c);
+  } catch {
+    return Errors.badJson().toResponse();
+  }
+  const via = Array.isArray(body?.via)
+    ? body.via.filter((value): value is string => typeof value === 'string' && !!value)
+    : [];
+  if (via.length === 0) {
+    return Errors.invalidParam('via', 'via must be a non-empty array of server names').toResponse();
+  }
+
+  // The resync is deliberately not awaited: return 200 promptly and refresh
+  // from the via servers on the Worker's execution context.
+  const resync = refreshRestrictedRoomState(c.env, roomId, via, room.room_version)
+    .catch((err) => {
+      console.warn('[federation] refresh_room state resync failed', {
+        roomId, error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  const executionCtx = (c as unknown as { executionCtx?: { waitUntil?: (p: Promise<unknown>) => void } }).executionCtx;
+  if (typeof executionCtx?.waitUntil === 'function') {
+    executionCtx.waitUntil(resync);
+  } else {
+    void resync;
+  }
+
+  return c.json({});
 });
 
 // PUT /_matrix/federation/v1/send_join/:roomId/:eventId - Complete join

@@ -852,8 +852,6 @@ describe('createRoom leftovers — failure / cleanup reliability', () => {
 describe('join leftovers — join_rule matrix / remote workflow soft statuses', () => {
   it.each([
     'knock',
-    'knock_restricted',
-    'restricted',
     'invite',
   ] as const)('forbids join when join_rule=%s without invite (exact error)', async (joinRule) => {
     getRoom.mockResolvedValue({ room_id: ROOM, room_version: '10' });
@@ -872,6 +870,36 @@ describe('join leftovers — join_rule matrix / remote workflow soft statuses', 
     );
     expect(status).toBe(403);
     expect(body).toMatchObject({ errcode: 'M_FORBIDDEN', error: 'Cannot join room' });
+  });
+
+  // Restricted rooms (spec v1.19) without an allow-list match still forbid
+  // the join, but the message names the allow rule; knock_restricted adds
+  // knock guidance since that flow remains available to the client. The
+  // evaluator reads full room state (not the single-event lookup), so the
+  // join rules event must also be served from getRoomState.
+  it.each([
+    ['restricted', 'You are not a member of any room allowed by this room’s join rule'],
+    [
+      'knock_restricted',
+      'You are not a member of any room allowed by this room’s join rule. Knock to request access instead.',
+    ],
+  ] as const)('forbids join when join_rule=%s without invite (exact error)', async (joinRule, error) => {
+    getRoom.mockResolvedValue({ room_id: ROOM, room_version: '10' });
+    getMembership.mockResolvedValue(null);
+    const joinRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      content: { join_rule: joinRule },
+      state_key: '',
+    });
+    defaultState({ 'm.room.join_rules': joinRules });
+    getRoomState.mockResolvedValue([joinRules]);
+    const { status, body } = await request(
+      `/_matrix/client/v3/rooms/${ROOM_ENC}/join`,
+      jsonInit('POST', {})
+    );
+    expect(status).toBe(403);
+    expect(body).toMatchObject({ errcode: 'M_FORBIDDEN', error });
   });
 
   it('allows join when leave membership but join_rule public', async () => {
@@ -945,20 +973,22 @@ describe('join leftovers — join_rule matrix / remote workflow soft statuses', 
     getRoomByAlias.mockResolvedValue(ROOM);
     getRoom.mockResolvedValue({ room_id: ROOM, room_version: '10' });
     getMembership.mockResolvedValue(null);
-    defaultState({
-      'm.room.join_rules': pdu({
-        type: 'm.room.join_rules',
-        event_id: '$jr',
-        content: { join_rule: 'restricted' },
-        state_key: '',
-      }),
+    const joinRules = pdu({
+      type: 'm.room.join_rules',
+      event_id: '$jr',
+      content: { join_rule: 'restricted' },
+      state_key: '',
     });
+    defaultState({ 'm.room.join_rules': joinRules });
+    getRoomState.mockResolvedValue([joinRules]);
     const { status, body } = await request(
       `/_matrix/client/v3/join/${ALIAS_ENC}`,
       jsonInit('POST', {})
     );
     expect(status).toBe(403);
-    expect(body).toMatchObject({ error: 'Cannot join room' });
+    expect(body).toMatchObject({
+      error: 'You are not a member of any room allowed by this room’s join rule',
+    });
   });
 
   it('join by room id with invite membership succeeds under invite rule', async () => {

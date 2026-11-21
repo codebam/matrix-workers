@@ -466,8 +466,10 @@ function createSlidingDb(opts: {
         rows = rows.filter((r) =>
           state.some((s) => s.room_id === r.room_id && s.event_type === 'm.room.tombstone')
         );
-      } else if (sql.includes("membership IN ('join', 'invite')")) {
-        rows = rows.filter((r) => r.membership === 'join' || r.membership === 'invite');
+      } else if (sql.includes("membership IN ('join', 'invite', 'knock')")) {
+        rows = rows.filter(
+          (r) => r.membership === 'join' || r.membership === 'invite' || r.membership === 'knock'
+        );
       }
 
       if (sql.includes('ORDER BY COALESCE(room_name')) {

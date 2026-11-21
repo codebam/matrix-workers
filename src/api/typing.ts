@@ -8,6 +8,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
+import { queueFederationEdu } from '../services/federation-edus';
 
 const app = new Hono<AppEnv>();
 
@@ -89,6 +90,14 @@ app.put('/_matrix/client/v3/rooms/:roomId/typing/:userId', requireAuth(), async 
   }));
 
   console.log('[typing] User', requestingUserId, typing ? 'started' : 'stopped', 'typing in room', roomId);
+
+  // Tell remote servers about both start and stop. No timeout on the wire;
+  // a false notification is what clears a previously sent typing state.
+  await queueFederationEdu(c.env, roomId, 'm.typing', {
+    room_id: roomId,
+    user_id: requestingUserId,
+    typing,
+  });
 
   return c.json({});
 });

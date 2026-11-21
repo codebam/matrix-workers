@@ -105,6 +105,7 @@ const ROOM = '!room:example.com';
 const ROOM2 = '!other:example.com';
 const ROOM3 = '!third:example.com';
 const INVITE_ROOM = '!invite:example.com';
+const KNOCK_ROOM = '!knock:example.com';
 const NOW = 1_700_000_000_000;
 
 const MSC3575 = '/_matrix/client/unstable/org.matrix.msc3575/sync';
@@ -138,6 +139,7 @@ type EventRow = {
   content: string;
   sender: string;
   origin_server_ts: number;
+  redacted_content?: string | null;
   unsigned?: string | null;
   depth?: number;
   stream_ordering: number;
@@ -469,8 +471,10 @@ function createSlidingDb(opts: {
         rows = rows.filter((r) =>
           state.some((s) => s.room_id === r.room_id && s.event_type === 'm.room.tombstone')
         );
-      } else if (sql.includes("membership IN ('join', 'invite')")) {
-        rows = rows.filter((r) => r.membership === 'join' || r.membership === 'invite');
+      } else if (sql.includes("membership IN ('join', 'invite', 'knock')")) {
+        rows = rows.filter(
+          (r) => r.membership === 'join' || r.membership === 'invite' || r.membership === 'knock'
+        );
       }
 
       if (sql.includes('ORDER BY COALESCE(room_name')) {
@@ -603,6 +607,7 @@ function createSlidingDb(opts: {
             event_type: s.event_type,
             state_key: s.state_key,
             content: ev?.content ?? '{}',
+            redacted_content: ev?.redacted_content ?? null,
             sender: ev?.sender ?? USER,
           };
         });
@@ -888,6 +893,78 @@ function fixtureInviteRoom(): {
       state_key: USER,
       event_id: '$inv-member',
     },
+  ];
+  return { memberships, rooms, events, state };
+}
+
+function fixtureKnockRoom(overrides: { membership?: string } = {}): {
+  memberships: MembershipRow[];
+  rooms: RoomMeta[];
+  events: EventRow[];
+  state: StateRow[];
+} {
+  const rooms: RoomMeta[] = [
+    { room_id: KNOCK_ROOM, created_at: NOW - 4000, name: 'Knockable room' },
+  ];
+  const memberships: MembershipRow[] = [
+    { room_id: KNOCK_ROOM, user_id: USER, membership: overrides.membership ?? 'knock' },
+    { room_id: KNOCK_ROOM, user_id: BOB, membership: 'join', display_name: 'Bob' },
+  ];
+  const events: EventRow[] = [
+    makeEvent({
+      event_id: '$knock-create',
+      room_id: KNOCK_ROOM,
+      event_type: 'm.room.create',
+      state_key: '',
+      content: JSON.stringify({ creator: BOB }),
+      sender: BOB,
+      stream_ordering: 1,
+    }),
+    makeEvent({
+      event_id: '$knock-jr',
+      room_id: KNOCK_ROOM,
+      event_type: 'm.room.join_rules',
+      state_key: '',
+      content: JSON.stringify({ join_rule: 'knock', reason: 'let me in' }),
+      redacted_content: JSON.stringify({ join_rule: 'knock' }),
+      sender: BOB,
+      stream_ordering: 2,
+    }),
+    makeEvent({
+      event_id: '$knock-name',
+      room_id: KNOCK_ROOM,
+      event_type: 'm.room.name',
+      state_key: '',
+      content: JSON.stringify({ name: 'Knockable room' }),
+      sender: BOB,
+      stream_ordering: 3,
+    }),
+    makeEvent({
+      event_id: '$knock-topic',
+      room_id: KNOCK_ROOM,
+      event_type: 'm.room.topic',
+      state_key: '',
+      content: JSON.stringify({ topic: 'private' }),
+      sender: BOB,
+      stream_ordering: 4,
+    }),
+    makeEvent({
+      event_id: '$knock-self',
+      room_id: KNOCK_ROOM,
+      event_type: 'm.room.member',
+      state_key: USER,
+      content: JSON.stringify({ membership: 'knock', reason: 'please' }),
+      redacted_content: JSON.stringify({ membership: 'knock' }),
+      sender: USER,
+      stream_ordering: 5,
+    }),
+  ];
+  const state: StateRow[] = [
+    { room_id: KNOCK_ROOM, event_type: 'm.room.create', state_key: '', event_id: '$knock-create' },
+    { room_id: KNOCK_ROOM, event_type: 'm.room.join_rules', state_key: '', event_id: '$knock-jr' },
+    { room_id: KNOCK_ROOM, event_type: 'm.room.name', state_key: '', event_id: '$knock-name' },
+    { room_id: KNOCK_ROOM, event_type: 'm.room.topic', state_key: '', event_id: '$knock-topic' },
+    { room_id: KNOCK_ROOM, event_type: 'm.room.member', state_key: USER, event_id: '$knock-self' },
   ];
   return { memberships, rooms, events, state };
 }
@@ -1533,6 +1610,85 @@ describe('MSC4186 / v4 — range preference and always-include subscriptions', (
 
 // ---------------------------------------------------------------------------
 // Room subscriptions + unsubscribe
+// ---------------------------------------------------------------------------
+// Knocked rooms (MSC3575 / MSC4186 knock_state)
+// ---------------------------------------------------------------------------
+
+describe('sliding sync — knocked rooms', () => {
+  const expectedKnockState = [
+    { type: 'm.room.create', state_key: '', content: { creator: BOB }, sender: BOB },
+    { type: 'm.room.join_rules', state_key: '', content: { join_rule: 'knock' }, sender: BOB },
+    { type: 'm.room.name', state_key: '', content: { name: 'Knockable room' }, sender: BOB },
+    { type: 'm.room.member', state_key: USER, content: { membership: 'knock' }, sender: USER },
+  ];
+
+  it('lists knocked rooms with stripped, pruned knock_state', async () => {
+    const knock = fixtureKnockRoom();
+    const env = createEnv({
+      db: createSlidingDb({
+        maxStreamPos: 5,
+        memberships: knock.memberships,
+        rooms: knock.rooms,
+        events: knock.events,
+        state: knock.state,
+      }),
+    });
+
+    const { body } = await postSync(MSC3575, env, {
+      lists: { main: { ranges: [[0, 9]], timeline_limit: 1 } },
+    });
+
+    expect((body.lists as any).main.ops[0].room_ids).toEqual([KNOCK_ROOM]);
+    const room = (body.rooms as Record<string, any>)[KNOCK_ROOM];
+    expect(room.membership).toBe('knock');
+    expect(room.initial).toBe(true);
+    expect(room.name).toBe('Knockable room');
+    expect(room.knock_state).toEqual(expectedKnockState);
+    expect(room.invite_state).toBeUndefined();
+  });
+
+  it('serves knock_state for a knocked room subscription on MSC4186', async () => {
+    const knock = fixtureKnockRoom();
+    const env = createEnv({
+      db: createSlidingDb({
+        maxStreamPos: 5,
+        memberships: knock.memberships,
+        rooms: knock.rooms,
+        events: knock.events,
+        state: knock.state,
+      }),
+    });
+
+    const { body } = await postSync(MSC4186, env, {
+      room_subscriptions: { [KNOCK_ROOM]: { timeline_limit: 1 } },
+    });
+
+    const room = (body.rooms as Record<string, any>)[KNOCK_ROOM];
+    expect(room.membership).toBe('knock');
+    expect(room.knock_state).toEqual(expectedKnockState);
+  });
+
+  it('omits the room after the knock is retracted (membership leave)', async () => {
+    const retracted = fixtureKnockRoom({ membership: 'leave' });
+    const env = createEnv({
+      db: createSlidingDb({
+        maxStreamPos: 5,
+        memberships: retracted.memberships,
+        rooms: retracted.rooms,
+        events: retracted.events,
+        state: retracted.state,
+      }),
+    });
+
+    const { body } = await postSync(MSC3575, env, {
+      lists: { main: { ranges: [[0, 9]], timeline_limit: 1 } },
+    });
+
+    expect((body.lists as any).main.count).toBe(0);
+    expect((body.rooms as Record<string, any>)[KNOCK_ROOM]).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------
 
 describe('room_subscriptions and unsubscribe_rooms', () => {
