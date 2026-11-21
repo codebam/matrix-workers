@@ -485,11 +485,13 @@ export async function getPresenceEventsForSync(
       for (const member of members.results) userIds.add(member.user_id);
     }
 
-    // Chunk the IN clause: large rooms can exceed SQLite's bind-variable limit.
+    // Chunk the IN clause below D1's 100 bind-variable limit (500 placeholders
+    // threw "too many SQL variables" and broke initial /sync after a cache
+    // clear on rooms with many members).
     const ids = [...userIds];
     const rows: PresenceSyncRow[] = [];
-    for (let i = 0; i < ids.length; i += 500) {
-      const chunk = ids.slice(i, i + 500);
+    for (let i = 0; i < ids.length; i += 90) {
+      const chunk = ids.slice(i, i + 90);
       const placeholders = chunk.map(() => '?').join(',');
       const result = await db.prepare(`
         SELECT user_id, presence, status_msg, last_active_ts, currently_active
