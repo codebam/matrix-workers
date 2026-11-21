@@ -890,3 +890,52 @@ Verified live with the user's token: 20-event window, prev_batch=13685,
 pagination returning strictly older messages. The Nix/NixOS room has 114
 timeline events back to 2026-11-19 (our join); older pre-join history would
 need a separate federation backfill. No messages were sent into that room.
+
+## Session 14: LiveKit → Cloudflare Calls shim — connect + publish only (2026-11-21, `51882d9`)
+
+Handoff on the experimental LiveKit→Cloudflare Calls shim (dev only). Two
+livekit-client 2.25 probe clients now hold a stable `connected` state with zero
+reconnects, and local publishing works end-to-end. **Calls do not work yet**:
+subscriptions are the open blocker; this section is the handoff point.
+
+- **Keepalive root cause (fixed):** the shim advertised pingInterval=30s but
+  pingTimeout=15s; the SDK arms its pong deadline from the last server message,
+  so a quiet gap always timed out before the first ping. Interval is now 10s.
+- **Publishing (verified live):** Calls returns 406 `Missing mid in track`
+  unless each local track carries the m-section mid from the offer SDP
+  (`findSendMid` in the shim). A canvas video track published through Calls,
+  and the publication propagated to the other client via `update` /
+  `trackPublished`. The SDK also refuses to publish without an explicit
+  `ParticipantInfo.permission` grant in the JoinResponse; the shim now mirrors
+  the verified JWT grants.
+- **Second publisher offer:** the SDK always sends a trackless follow-up offer
+  immediately after the first answer (in-band data channels fire
+  negotiationneeded while the initial offer is pending). Calls accepts only one
+  `datachannels/establish` per session, so follow-up offers are answered from a
+  cached first answer instead of failing the session.
+- **Subscriptions — BLOCKED (two structural limits proven live):**
+  1. Chromium's v1 offer-with-join path pins the SDK to single-PC
+     `publisher-only` mode: every server-generated offer is silently dropped
+     because there is no subscriber transport.
+  2. Forcing the v0 / subscriber-primary topology (404 on `/rtc/v1` → SDK
+     fallback → `subscriberPrimary=true`) made server offers apply, but Calls
+     offers cannot be answered anywhere — `/renegotiate` returns 500
+     `internal_error`, and `datachannels/establish` with
+     `sessionDescription:{type:'answer'}` returns 400 `decoding_error`.
+  The v0 experiment was reverted; dev is stable on v1.
+- **Viable remaining design (NEXT STEP, NOT DONE):** client-driven
+  subscriptions in publisher-only mode. The SDK's own publisher offer
+  pre-populates 3 audio + 3 video recvonly placeholder m-sections. Pull a
+  remote Calls track into the client's session via `tracks/new` with
+  `{location:'remote', sessionId, trackName: <LiveKit TR sid>, mid: <unused placeholder mid>}`
+  and NO sessionDescription, then signal the binding via `TrackInfo.mid` in an
+  `update` frame; the SDK maps RTP to the publication via msid (it recognises
+  `TR...` sids). This was assigned to a follow-up worktree subagent; check the
+  current HEAD before assuming it shipped.
+
+### Deploy state
+- prod (`codebam.ca`): **version `5f44fbc7`** — health and
+  `/_matrix/client/versions` verified; prod keeps its self-hosted LiveKit URL,
+  the shim is NOT enabled there.
+- dev (`dev.codebam.ca`): experimental shim deployed.
+- Full suite green at the time of writing: 378 files / 45,887 tests.
