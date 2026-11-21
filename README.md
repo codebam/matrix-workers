@@ -111,6 +111,7 @@ npx wrangler secret put EMAIL_FROM
 | [Redactions](https://spec.matrix.org/v1.19/client-server-api/#redactions) | [`src/services/event-redaction.ts`](src/services/event-redaction.ts) | client-facing content pruned per room-version keep rules (`events.redacted_content`), local + federation-initiated, federated outbound |
 | [Reporting Content](https://spec.matrix.org/v1.19/client-server-api/#reporting-content) | [`src/api/report.ts`](src/api/report.ts) | MSC4277 anti-fingerprinting |
 | [Mutual Rooms](https://spec.matrix.org/v1.19/client-server-api/#mutual-rooms) | [`src/api/rooms.ts`](src/api/rooms.ts) | MSC2666 stable endpoint |
+| [Restricted Rooms](https://github.com/matrix-org/matrix-spec-proposals/pull/3083) | [`src/services/restricted-joins.ts`](src/services/restricted-joins.ts) | [MSC3083](https://github.com/matrix-org/matrix-spec-proposals/pull/3083), [MSC3787](https://github.com/matrix-org/matrix-spec-proposals/pull/3787): fail-closed allow-list joins, room v8+/v10+ |
 
 **Unstable Features (MSCs)**
 
@@ -135,6 +136,10 @@ npx wrangler secret put EMAIL_FROM
 | Mutual rooms (stable route) | [`src/api/rooms.ts`](src/api/rooms.ts) | [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) (v1.19) |
 | `unsigned.replaces_state` on state events | [`src/api/rooms.ts`](src/api/rooms.ts) | spec v1.19 |
 | Server ACL enforcement (case-insensitive) | [`src/services/server-acl.ts`](src/services/server-acl.ts) | spec module + [MSC4436](https://github.com/matrix-org/matrix-spec-proposals/pull/4436) (v1.19) |
+| Restricted rooms (fail-closed allow-list joins, room v8+/v10+) | [`src/services/restricted-joins.ts`](src/services/restricted-joins.ts), [`src/api/federation.ts`](src/api/federation.ts), [`src/workflows/RoomJoinWorkflow.ts`](src/workflows/RoomJoinWorkflow.ts) | [MSC3083](https://github.com/matrix-org/matrix-spec-proposals/pull/3083), [MSC3787](https://github.com/matrix-org/matrix-spec-proposals/pull/3787) |
+| Bidirectional typing/receipt EDUs (`m.typing` / `m.receipt` fan-out + inbound delivery) | [`src/services/federation-edus.ts`](src/services/federation-edus.ts), [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 |
+| Knock visibility in `/sync` and sliding sync (`knock_state`, long-poll change detection) | [`src/api/sync.ts`](src/api/sync.ts), [`src/api/sliding-sync.ts`](src/api/sliding-sync.ts) | spec v1.19 (`rooms.knock`), [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) (sliding sync) |
+| Pagination conformance (`/messages` `to` + `filter`, `/context` `before`/`after`, `/members` `at`, hierarchy from cursor) | [`src/api/rooms.ts`](src/api/rooms.ts), [`src/api/spaces.ts`](src/api/spaces.ts) | spec v1.19 |
 
 ## Features
 

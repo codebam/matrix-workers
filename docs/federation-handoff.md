@@ -692,3 +692,85 @@ Full suite after: 45,596/45,596 (355 files).
 
 Watch list for v1.20: the six unimplemented pipeline MSCs above, plus
 the catchup-workflow get_missing_events stub.
+
+## Session 13: the protocol-conformance wave (2026-11-21, `24f9e8e`)
+
+The gap analysis found four holes, each with a one-line cause: restricted
+rooms broken in both directions (make_join emitted neither
+`join_authorised_via_users_server` nor its auth event, and the inbound /
+local-client join paths skipped allow-list + resident-server checks);
+the EDU loop one-directional (inbound `m.typing`/`m.receipt` cases empty,
+no outbound fan-out for either type); knocks invisible to clients (`/sync`
+served no knock section and sliding sync neither listed knocked rooms nor
+computed `knock_state`); pagination params missing (`/messages` lacked
+`to` + `filter`, `/context` `before`/`after`, `/members` `at`, hierarchy
+could not start from a cursor).
+
+Five parallel hy4-flash subagents implemented the four groups; the lead
+integrated and fixed 7 stale leftover assertions (residual knock rooms
+stay listed per MSC4186) plus the knock-guidance 403 message punctuation.
+
+- **Restricted rooms** (MSC3083/MSC3787, room v8+/v10+): fail-closed
+  allow-list evaluation in src/services/restricted-joins.ts; make_join
+  embeds `join_authorised_via_users_server` + its auth event
+  (src/api/federation.ts), RoomJoinWorkflow preserves the template's
+  authorisation content, authorizeInboundJoin enforces the resident-server
+  rule, both local client join routes evaluate allow lists, and new
+  POST /_matrix/federation/v1/refresh_room/:roomId is federation-auth +
+  ACL-guarded with async state resync.
+- **Ephemeral EDUs, bidirectional**: outbound m.typing/m.receipt fan-out
+  in src/services/federation-edus.ts to ACL-filtered joined-member
+  servers (m.read only, never m.read.private) via the Federation-DO
+  send-edu path presence uses; the inbound cases now deliver to the
+  Room DO so remote typing/read receipts display locally. No echo loop,
+  best-effort per EDU.
+- **Knock sync**: /sync serves the knock section; sliding sync includes
+  knocked rooms with knock_state (spec stripped-state list + the user's
+  own knock member event, redaction-pruned content); long-poll change
+  detection includes knocks.
+- **Pagination conformance**: /messages gains to + filter (types/not_types
+  wildcards, rooms, senders, contains_url; invalid JSON = M_BAD_JSON);
+  /context gains before/after; /members gains at (point-in-time via
+  stream_ordering, no migration); hierarchy from cursor works on both
+  client and federation routes.
+- **Known minor deviations (left open)**: inbound receipts store local ts
+  rather than forwarding the remote ts; m.signing_key_update remains a
+  no-op stub.
+
+Full suite after: 45,653/45,653 (360 files).
+
+### Deploy state
+- prod: **deployed `24f9e8e`** — Current Version ID
+  `060d544d-a7fe-4895-bbe0-b9b974f93c0e`.
+- dev (`wrangler.dev.jsonc`): **deployed at the same commit** — Current
+  Version ID `963def86-d69a-4a95-b04b-1db5926d8d9b`.
+
+Pair verification (2026-11-21, dev migrations approved and applied):
+the new `refresh_room` route answers 401 M_UNAUTHORIZED on both
+codebam.ca and dev.codebam.ca (the old code 404s it). Dev's D1 had
+drifted four migrations behind prod (025-028: account_moderation,
+redacted_because, redacted_content, policy_lists), which 500'd every
+authenticated dev client path on `no such column: u.locked`; with the
+user's approval they were applied and the pair agent then ran the
+full restricted-room round-trip, ALL GREEN:
+
+- Resident `@fedtest:dev.codebam.ca` created a public allow room
+  (`!R-0y_Ii…:dev.codebam.ca`) and two v10 rooms, `restricted` and
+  `knock_restricted`, whose allow lists name the allow room via dev.
+- **Restricted**: the joiner got the fail-closed 403 ("You are not a
+  member of any room allowed by this room's join rule") BEFORE joining
+  the allow room; after joining it, the restricted join returned 200
+  and the resident's member state reads `membership=join` with
+  `join_authorised_via_users_server=@fedtest:dev.codebam.ca`; the
+  joiner's /sync lists both rooms.
+- **knock_restricted**: same flow, with the knock-guidance 403 message
+  before the allow-room join, then a 200 join carrying the authorising
+  user.
+- Worker tail during the run: zero errors.
+
+Caveats: the two joiner accounts hold randomly generated, unretained
+passwords — inspect the rooms via @fedtest in Element instead. Ops
+notes: the /tmp fed-repro scripts insert PROD tokens directly into D1
+— not safe to run as-is; and trust live probes over this doc's older
+top-level Deploy state section, which records historical version IDs
+only.
