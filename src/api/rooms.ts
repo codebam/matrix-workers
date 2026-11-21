@@ -37,6 +37,7 @@ import {
   tryInsertJoinMembership,
   getMembership,
   getUserRooms,
+  getRoomMembers,
   createRoomAlias,
   getRoomByAlias,
   deleteRoomAlias,
@@ -119,6 +120,8 @@ async function createInitialRoomEvents(
     initial_state?: Array<{ type: string; state_key?: string; content: any }>;
     invite?: string[];
     room_alias_local_part?: string;
+    creation_content?: Record<string, unknown>;
+    power_level_content_override?: Record<string, unknown>;
   },
   prebuiltCreate?: { eventId: string; pduBase: Record<string, unknown>; hashes: Record<string, string> }
 ): Promise<string> {
@@ -299,10 +302,14 @@ async function createInitialRoomEvents(
     planned.push({ pdu: createPdu });
     prevEvents.push(createEventId);
   } else {
-    const createContent: RoomCreateContent = {
+    // creation_content is client-supplied, but the server owns the creator
+    // and room_version fields — merge client keys first so they cannot be
+    // overridden (spec: "servers should ignore" attempts to set version).
+    const createContent = {
+      ...(options.creation_content ?? {}),
       creator: creatorId,
       room_version: roomVersion,
-    };
+    } as RoomCreateContent;
     createEventId = await plan('m.room.create', createContent, '');
   }
 
@@ -335,7 +342,27 @@ async function createInitialRoomEvents(
     users: isMsc4291RoomVersion(roomVersion) ? {} : { [creatorId]: 100 },
     users_default: 0,
   };
-  await plan('m.room.power_levels', powerLevelsContent, '');
+
+  // power_level_content_override is merged after the preset so client keys
+  // win for every field (events, ban, kick, redact, invite, notifications,
+  // ...). The creator's own power is server-owned and stays 100; in v12
+  // rooms MSC4289 keeps it implicit by omitting it from the users map.
+  const mergedPowerLevels: Record<string, unknown> = {
+    ...powerLevelsContent,
+    ...(options.power_level_content_override ?? {}),
+  };
+  const overrideUsers = mergedPowerLevels.users;
+  const users: Record<string, unknown> =
+    overrideUsers && typeof overrideUsers === 'object' && !Array.isArray(overrideUsers)
+      ? { ...(overrideUsers as Record<string, unknown>) }
+      : {};
+  if (isMsc4291RoomVersion(roomVersion)) {
+    delete users[creatorId];
+  } else {
+    users[creatorId] = 100;
+  }
+  mergedPowerLevels.users = users;
+  await plan('m.room.power_levels', mergedPowerLevels, '');
 
   // 4. m.room.join_rules
   let joinRule = 'invite';
@@ -481,10 +508,25 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
     preset,
     is_direct,
     visibility,
+    creation_content,
+    power_level_content_override,
   } = body;
-  // Note: invite_3pid and creation_content are reserved for future use
+  // invite_3pid remains reserved; creation_content and
+  // power_level_content_override are spec parameters merged into the initial
+  // create / power-level events below.
   void body.invite_3pid;
-  void body.creation_content;
+
+  const isPlainObject = (value: unknown): value is Record<string, unknown> =>
+    value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (creation_content !== undefined && !isPlainObject(creation_content)) {
+    return Errors.invalidParam('creation_content', 'creation_content must be an object').toResponse();
+  }
+  if (power_level_content_override !== undefined && !isPlainObject(power_level_content_override)) {
+    return Errors.invalidParam(
+      'power_level_content_override',
+      'power_level_content_override must be an object'
+    ).toResponse();
+  }
 
   // MSC4155: reject the create if any invitee's permission config blocks us.
   if (Array.isArray(invite)) {
@@ -562,7 +604,7 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
   // both derived from the create event's reference hash, so the create must
   // be built before the room row exists.
   const prebuiltCreate = isMsc4291RoomVersion(version)
-    ? await buildMsc4291CreateEvent(version, userId)
+    ? await buildMsc4291CreateEvent(version, userId, undefined, creation_content)
     : null;
 
   // Generate room ID
@@ -586,6 +628,8 @@ app.post('/_matrix/client/v3/createRoom', requireAuth(), async (c) => {
       initial_state,
       invite,
       room_alias_local_part,
+      creation_content,
+      power_level_content_override,
     }, prebuiltCreate ?? undefined);
     console.log('[createRoom] Initial room events created successfully');
 
@@ -2070,13 +2114,17 @@ async function prepareAndStoreLocalEvent(env: Env, roomId: string, event: PDU): 
 export async function buildMsc4291CreateEvent(
   roomVersion: string,
   creatorId: string,
-  predecessor?: { room_id: string; event_id: string }
+  predecessor?: { room_id: string; event_id: string },
+  creationContent?: Record<string, unknown>
 ): Promise<{ roomId: string; eventId: string; pduBase: Record<string, unknown>; hashes: Record<string, string> }> {
   // MSC4289: in v12 rooms the creator is implicit (the create event's
-  // sender); matrix.org's own v12 creates carry no `creator` field.
+  // sender); matrix.org's own v12 creates carry no `creator` field. Client
+  // creation_content keys are merged in, but server-owned fields win.
   const content: Record<string, unknown> = {
+    ...(creationContent ?? {}),
     room_version: roomVersion,
   };
+  delete content.creator;
   if (predecessor) {
     content.predecessor = predecessor;
   }
@@ -2600,6 +2648,134 @@ async function storeThirdPartyInvite(
   return c.json({});
 }
 
+type InviteOutcome = { eventId: string } | { error: MatrixApiError };
+
+// Shared MXID invite path used by POST /invite and by room upgrades. Keeps
+// invite permissions, moderation policy, the policy-server ask (inside
+// prepareAndStoreLocalEvent), membership/notification updates and federation
+// in one place so upgrade invites are ordinary invites, not bare member rows.
+async function performRoomInvite(
+  env: Env,
+  roomId: string,
+  inviterId: string,
+  inviteeId: string,
+  inviterMembership: { membership: string; eventId: string }
+): Promise<InviteOutcome> {
+  // MSC4155: the invitee's invite permission config can block this inviter.
+  if ((await getInvitePermission(env.DB, inviteeId, inviterId)) === 'block') {
+    return { error: Errors.inviteBlocked() };
+  }
+
+  // Moderation policy lists (spec module): no invites to banned users or
+  // onto banned servers ("no outbound invites").
+  {
+    const modRules = await getActivePolicyRules(env.DB, env.CACHE);
+    if (modRules.subscriptions > 0) {
+      const bannedUser = isUserBannedByPolicy(modRules, inviteeId);
+      const bannedServer = isServerBannedByPolicy(modRules, serverNameFromId(inviteeId));
+      if (bannedUser || bannedServer) {
+        return {
+          error: Errors.forbidden(
+            `The invitee is banned by a moderation policy list (${bannedUser?.reason || bannedServer?.reason || 'banned entity'})`
+          ),
+        };
+      }
+    }
+  }
+
+  // Check power levels (captured at check-time; re-validated just before write
+  // for optimistic concurrency — see issue 009 sub-finding 3).
+  const createEventForPower = await getStateEvent(env.DB, roomId, 'm.room.create');
+  const powerLevelsEvent = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
+  const powerLevels = powerLevelsEvent?.content as any || {};
+  const userPower = getEffectiveUserPowerLevel(powerLevels, inviterId, createEventForPower);
+  const invitePower = powerLevels.invite ?? 50;
+
+  if (userPower < invitePower) {
+    return { error: Errors.forbidden('Insufficient power level to invite') };
+  }
+
+  // Check if already invited or joined
+  const inviteeMembership = await getMembership(env.DB, roomId, inviteeId);
+  if (inviteeMembership?.membership === 'join') {
+    return { error: Errors.forbidden('User is already in the room') };
+  }
+  if (inviteeMembership?.membership === 'invite') {
+    // Already invited, idempotent -- but re-federate the existing invite so a
+    // retry reaches the invitee's server even when the original delivery
+    // failed (or predates invite federation).
+    const existingInvite = await getStateEvent(env.DB, roomId, 'm.room.member', inviteeId);
+    if (existingInvite) await federateInvite(env, roomId, existingInvite);
+    return { eventId: existingInvite?.event_id ?? '' };
+  }
+
+  // Create invite event
+  const createEvent = await getStateEvent(env.DB, roomId, 'm.room.create');
+
+  // MSC4291 (room version 12): the create event is implicit in the auth
+  // chain and must not be listed explicitly.
+  const inviteRoom = await getRoom(env.DB, roomId);
+  const inviteRoomVersion = String(inviteRoom?.room_version ?? '10');
+  const inviteCreateIsImplicit = isMsc4291RoomVersion(inviteRoomVersion);
+
+  const authEvents: string[] = [];
+  if (createEvent && !inviteCreateIsImplicit) authEvents.push(createEvent.event_id);
+  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
+  if (inviterMembership) authEvents.push(inviterMembership.eventId);
+
+  const { events: latestEvents = [] } = await getRoomEvents(env.DB, roomId, undefined, 1);
+  const prevEvents = latestEvents.map((e) => e.event_id);
+
+  const memberContent: RoomMemberContent = {
+    membership: 'invite',
+  };
+
+  const event: PDU = {
+    event_id: '',
+    room_id: roomId,
+    sender: inviterId,
+    type: 'm.room.member',
+    state_key: inviteeId,
+    content: memberContent,
+    origin_server_ts: Date.now(),
+    depth: (latestEvents[0]?.depth ?? 0) + 1,
+    auth_events: authEvents,
+    prev_events: prevEvents,
+  };
+
+  // Optimistic concurrency: re-read power levels just before writing.
+  const powerLevelsNow = await getStateEvent(env.DB, roomId, 'm.room.power_levels');
+  if ((powerLevelsEvent?.event_id ?? null) !== (powerLevelsNow?.event_id ?? null)) {
+    return { error: Errors.conflict('Power levels changed during invite; retry') };
+  }
+
+  const eventId = await prepareAndStoreLocalEvent(env, roomId, event);
+  await updateMembership(env.DB, roomId, inviteeId, 'invite', eventId);
+
+  // Notify room members and the invitee about the invite
+  await notifyUsersOfEvent(env, roomId, eventId, 'm.room.member');
+
+  // Federate the invite to the invitee's server: they are not in the room
+  // yet, so it travels via the federation invite endpoint rather than a
+  // /send transaction.
+  await federateInvite(env, roomId, event);
+
+  // Bot auto-accept: the homeserver completes the join for invited bots —
+  // they have no client session to accept with.
+  try {
+    const { getBotByUserId } = await import('../services/bots');
+    const bot = await getBotByUserId(env.DB, inviteeId);
+    if (bot) {
+      await joinBotUserToRoom(env, roomId, inviteeId);
+      console.log('[rooms] bot auto-accepted invite', { roomId, bot: inviteeId });
+    }
+  } catch (err) {
+    console.warn('[rooms] bot auto-accept failed:', err);
+  }
+
+  return { eventId };
+}
+
 app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
@@ -2635,116 +2811,8 @@ app.post('/_matrix/client/v3/rooms/:roomId/invite', requireAuth(), async (c) => 
     inviteeId = resolved;
   }
 
-  // MSC4155: the invitee's invite permission config can block this inviter.
-  if ((await getInvitePermission(c.env.DB, inviteeId, userId)) === 'block') {
-    return Errors.inviteBlocked().toResponse();
-  }
-
-  // Moderation policy lists (spec module): no invites to banned users or
-  // onto banned servers ("no outbound invites").
-  {
-    const modRules = await getActivePolicyRules(c.env.DB, c.env.CACHE);
-    if (modRules.subscriptions > 0) {
-      const bannedUser = isUserBannedByPolicy(modRules, inviteeId);
-      const bannedServer = isServerBannedByPolicy(modRules, serverNameFromId(inviteeId));
-      if (bannedUser || bannedServer) {
-        return Errors.forbidden(
-          `The invitee is banned by a moderation policy list (${bannedUser?.reason || bannedServer?.reason || 'banned entity'})`
-        ).toResponse();
-      }
-    }
-  }
-
-  // Check power levels (captured at check-time; re-validated just before write
-  // for optimistic concurrency — see issue 009 sub-finding 3).
-  const createEventForPower = await getStateEvent(c.env.DB, roomId, 'm.room.create');
-  const powerLevelsEvent = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
-  const powerLevels = powerLevelsEvent?.content as any || {};
-  const userPower = getEffectiveUserPowerLevel(powerLevels, userId, createEventForPower);
-  const invitePower = powerLevels.invite ?? 50;
-
-  if (userPower < invitePower) {
-    return Errors.forbidden('Insufficient power level to invite').toResponse();
-  }
-
-  // Check if already invited or joined
-  const inviteeMembership = await getMembership(c.env.DB, roomId, inviteeId);
-  if (inviteeMembership?.membership === 'join') {
-    return Errors.forbidden('User is already in the room').toResponse();
-  }
-  if (inviteeMembership?.membership === 'invite') {
-    // Already invited, idempotent -- but re-federate the existing invite so a
-    // retry reaches the invitee's server even when the original delivery
-    // failed (or predates invite federation).
-    const existingInvite = await getStateEvent(c.env.DB, roomId, 'm.room.member', inviteeId);
-    if (existingInvite) await federateInvite(c.env, roomId, existingInvite);
-    return c.json({});
-  }
-
-  // Create invite event
-  const createEvent = await getStateEvent(c.env.DB, roomId, 'm.room.create');
-
-  // MSC4291 (room version 12): the create event is implicit in the auth
-  // chain and must not be listed explicitly.
-  const inviteRoom = await getRoom(c.env.DB, roomId);
-  const inviteRoomVersion = String(inviteRoom?.room_version ?? '10');
-  const inviteCreateIsImplicit = isMsc4291RoomVersion(inviteRoomVersion);
-
-  const authEvents: string[] = [];
-  if (createEvent && !inviteCreateIsImplicit) authEvents.push(createEvent.event_id);
-  if (powerLevelsEvent) authEvents.push(powerLevelsEvent.event_id);
-  if (inviterMembership) authEvents.push(inviterMembership.eventId);
-
-  const { events: latestEvents } = await getRoomEvents(c.env.DB, roomId, undefined, 1);
-  const prevEvents = latestEvents.map(e => e.event_id);
-
-  const memberContent: RoomMemberContent = {
-    membership: 'invite',
-  };
-
-  const event: PDU = {
-    event_id: '',
-    room_id: roomId,
-    sender: userId,
-    type: 'm.room.member',
-    state_key: inviteeId,
-    content: memberContent,
-    origin_server_ts: Date.now(),
-    depth: (latestEvents[0]?.depth ?? 0) + 1,
-    auth_events: authEvents,
-    prev_events: prevEvents,
-  };
-
-  // Optimistic concurrency: re-read power levels just before writing.
-  const powerLevelsNow = await getStateEvent(c.env.DB, roomId, 'm.room.power_levels');
-  if ((powerLevelsEvent?.event_id ?? null) !== (powerLevelsNow?.event_id ?? null)) {
-    return Errors.conflict('Power levels changed during invite; retry').toResponse();
-  }
-
-  const eventId = await prepareAndStoreLocalEvent(c.env, roomId, event);
-  await updateMembership(c.env.DB, roomId, inviteeId, 'invite', eventId);
-
-  // Notify room members and the invitee about the invite
-  await notifyUsersOfEvent(c.env, roomId, eventId, 'm.room.member');
-
-  // Federate the invite to the invitee's server: they are not in the room
-  // yet, so it travels via the federation invite endpoint rather than a
-  // /send transaction.
-  await federateInvite(c.env, roomId, event);
-
-  // Bot auto-accept: the homeserver completes the join for invited bots —
-  // they have no client session to accept with.
-  try {
-    const { getBotByUserId } = await import('../services/bots');
-    const bot = await getBotByUserId(c.env.DB, inviteeId);
-    if (bot) {
-      await joinBotUserToRoom(c.env, roomId, inviteeId);
-      console.log('[rooms] bot auto-accepted invite', { roomId, bot: inviteeId });
-    }
-  } catch (err) {
-    console.warn('[rooms] bot auto-accept failed:', err);
-  }
-
+  const result = await performRoomInvite(c.env, roomId, userId, inviteeId, inviterMembership);
+  if ('error' in result) return result.error.toResponse();
   return c.json({});
 });
 
@@ -3973,6 +4041,30 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   const currentState = await getRoomState(db, oldRoomId);
   const now = Date.now();
 
+  const stateContent = (event: PDU): any =>
+    typeof event.content === 'string' ? JSON.parse(event.content) : event.content;
+
+  // Spec room upgrades: every user who was joined or invited in the old room
+  // must be invited to the replacement. Membership rows are authoritative;
+  // state events are a fallback for rooms whose membership table lags.
+  const oldMembers = new Map<string, string>();
+  try {
+    for (const member of (await getRoomMembers(db, oldRoomId)) ?? []) {
+      if (member.membership === 'join' || member.membership === 'invite') {
+        oldMembers.set(member.userId, member.membership);
+      }
+    }
+  } catch (err) {
+    console.warn('[rooms] upgrade member lookup failed:', err);
+  }
+  for (const event of currentState) {
+    if (event.type !== 'm.room.member' || !event.state_key) continue;
+    const membership = stateContent(event)?.membership;
+    if (membership === 'join' || membership === 'invite') {
+      oldMembers.set(event.state_key, membership);
+    }
+  }
+
   // Get the last event ID from old room for predecessor
   const lastEvent = await db.prepare(`
     SELECT event_id FROM events WHERE room_id = ? ORDER BY depth DESC LIMIT 1
@@ -4073,71 +4165,40 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
     }, '');
   }
 
-  // 4. Copy join rules
-  const joinRulesEvent = currentState.find(e => e.type === 'm.room.join_rules');
-  if (joinRulesEvent) {
-    const content = typeof joinRulesEvent.content === 'string'
-      ? JSON.parse(joinRulesEvent.content)
-      : joinRulesEvent.content;
-    await createNewRoomEvent('m.room.join_rules', content, '');
-  } else {
-    await createNewRoomEvent('m.room.join_rules', { join_rule: 'invite' }, '');
+  // 4. Copy ALL other current state generically. The new room gets its own
+  // create and membership events, and the tombstone belongs to the old room;
+  // everything else (server ACL, canonical alias, unknown/custom types, ...)
+  // carries over so the replacement is not silently stripped down.
+  const stateCopyExcluded = new Set(['m.room.create', 'm.room.member', 'm.room.tombstone', 'm.room.power_levels']);
+  for (const event of currentState) {
+    if (stateCopyExcluded.has(event.type)) continue;
+    await createNewRoomEvent(event.type, stateContent(event), event.state_key ?? '');
   }
 
-  // 5. Copy history visibility
-  const historyEvent = currentState.find(e => e.type === 'm.room.history_visibility');
-  if (historyEvent) {
-    const content = typeof historyEvent.content === 'string'
-      ? JSON.parse(historyEvent.content)
-      : historyEvent.content;
-    await createNewRoomEvent('m.room.history_visibility', content, '');
-  } else {
+  // Defaults for the two state types the new room cannot be without.
+  if (!currentState.some((e) => e.type === 'm.room.join_rules')) {
+    await createNewRoomEvent('m.room.join_rules', { join_rule: 'invite' }, '');
+  }
+  if (!currentState.some((e) => e.type === 'm.room.history_visibility')) {
     await createNewRoomEvent('m.room.history_visibility', { history_visibility: 'shared' }, '');
   }
 
-  // 6. Copy room name
-  const nameEvent = currentState.find(e => e.type === 'm.room.name');
-  if (nameEvent) {
-    const content = typeof nameEvent.content === 'string'
-      ? JSON.parse(nameEvent.content)
-      : nameEvent.content;
-    await createNewRoomEvent('m.room.name', content, '');
-  }
-
-  // 7. Copy room topic
-  const topicEvent = currentState.find(e => e.type === 'm.room.topic');
-  if (topicEvent) {
-    const content = typeof topicEvent.content === 'string'
-      ? JSON.parse(topicEvent.content)
-      : topicEvent.content;
-    await createNewRoomEvent('m.room.topic', content, '');
-  }
-
-  // 8. Copy room avatar
-  const avatarEvent = currentState.find(e => e.type === 'm.room.avatar');
-  if (avatarEvent) {
-    const content = typeof avatarEvent.content === 'string'
-      ? JSON.parse(avatarEvent.content)
-      : avatarEvent.content;
-    await createNewRoomEvent('m.room.avatar', content, '');
-  }
-
-  // 9. Copy encryption settings
-  const encryptionEvent = currentState.find(e => e.type === 'm.room.encryption');
-  if (encryptionEvent) {
-    const content = typeof encryptionEvent.content === 'string'
-      ? JSON.parse(encryptionEvent.content)
-      : encryptionEvent.content;
-    await createNewRoomEvent('m.room.encryption', content, '');
-  }
-
-  // 10. Copy guest access
-  const guestAccessEvent = currentState.find(e => e.type === 'm.room.guest_access');
-  if (guestAccessEvent) {
-    const content = typeof guestAccessEvent.content === 'string'
-      ? JSON.parse(guestAccessEvent.content)
-      : guestAccessEvent.content;
-    await createNewRoomEvent('m.room.guest_access', content, '');
+  // 5. Invite every joined/invited member of the old room through the normal
+  // invite pipeline. Local invites get real membership events; remote invites
+  // are federated with the v2 invite flow. Failures are best-effort.
+  for (const memberId of oldMembers.keys()) {
+    if (memberId === userId) continue; // the upgrader already joined above
+    try {
+      const result = await performRoomInvite(c.env, newRoomId, userId, memberId, {
+        membership: 'join',
+        eventId: joinEventId,
+      });
+      if ('error' in result) {
+        console.warn(`[rooms] upgrade invite ${memberId} to ${newRoomId} refused:`, result.error.message);
+      }
+    } catch (err) {
+      console.warn(`[rooms] upgrade invite ${memberId} to ${newRoomId} failed:`, err);
+    }
   }
 
   // Now send tombstone to old room
@@ -4169,20 +4230,22 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
 
   const tombstoneEventId = await prepareAndStoreLocalEvent(c.env, oldRoomId, tombstoneEvent);
 
-  // Update old room's power levels to restrict posting
-  // Elevate events_default to prevent casual messaging
-  const newPowerLevels = powerLevels ? { ...powerLevels } : {
-    users: { [userId]: 100 },
-    users_default: 0,
-    events_default: 100, // Set high to prevent messaging
-    state_default: 100,
-    ban: 100,
-    kick: 100,
-    redact: 100,
+  // Freeze the old room: every user becomes powerless and no user may send
+  // state, invites or ordinary events. Keeping the existing users map with
+  // their original powers would still let high-power users post into the
+  // tombstoned room, so zero it out explicitly.
+  const frozenUsers: Record<string, number> = {};
+  if (powerLevels?.users && typeof powerLevels.users === 'object' && !Array.isArray(powerLevels.users)) {
+    for (const uid of Object.keys(powerLevels.users)) frozenUsers[uid] = 0;
+  }
+  for (const memberId of oldMembers.keys()) frozenUsers[memberId] = 0;
+  const newPowerLevels = {
+    ...(powerLevels ?? { users_default: 0, ban: 100, kick: 100, redact: 100 }),
+    users: frozenUsers,
+    events_default: 100,
     invite: 100,
+    state_default: 100,
   };
-  newPowerLevels.events_default = 100;
-  newPowerLevels.invite = 100;
 
   const restrictEvent: PDU = {
     event_id: '',
@@ -4198,6 +4261,11 @@ app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) =>
   };
 
   await prepareAndStoreLocalEvent(c.env, oldRoomId, restrictEvent);
+
+  // Send the freeze through the normal state-event pipeline so remote servers
+  // with joined members in the old room see the same power levels.
+  const oldRemoteServers = await getJoinedRemoteServers(db, oldRoomId, serverName);
+  await federateLocalStateEventToRemotes(c.env, restrictEvent, oldRoomId, oldRemoteServers);
 
   // Migrate local room aliases to point to new room
   const aliases = await db.prepare(`

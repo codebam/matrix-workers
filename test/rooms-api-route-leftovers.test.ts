@@ -658,7 +658,7 @@ describe('createRoom leftovers — presets / invites / soft fields', () => {
     }
   });
 
-  it('soft-accepts reserved invite_3pid + creation_content without failing', async () => {
+  it('soft-accepts reserved invite_3pid and merges creation_content into m.room.create', async () => {
     const { status, body } = await request(
       '/_matrix/client/v3/createRoom',
       jsonInit('POST', {
@@ -671,8 +671,11 @@ describe('createRoom leftovers — presets / invites / soft fields', () => {
     expect(status).toBe(200);
     expect(body).toEqual({ room_id: '!newroom:example.com' });
     const create = plannedPdus().find((p) => p.type === 'm.room.create');
-    expect(create?.content).toMatchObject({ creator: USER });
-    expect(create?.content).not.toHaveProperty('m.federate');
+    expect(create?.content).toMatchObject({
+      creator: USER,
+      'm.federate': false,
+      type: 'org.example.custom',
+    });
   });
 
   it('writes m.fully_read account_data keyed to create event id', async () => {
