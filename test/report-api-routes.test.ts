@@ -603,14 +603,15 @@ describe('report POST /rooms/:roomId/report/:eventId', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({});
     expect(db.inserts).toHaveLength(1);
-    expect(db.inserts[0].args).toEqual([USER, ROOM, EVENT, 'abuse', -40, NOW]);
+    // MSC4277: the score parameter was removed; -100 is always stored.
+    expect(db.inserts[0].args).toEqual([USER, ROOM, EVENT, 'abuse', -100, NOW]);
     expect(db.reports).toHaveLength(1);
     expect(db.reports[0]).toMatchObject({
       reporter_user_id: USER,
       room_id: ROOM,
       event_id: EVENT,
       reason: 'abuse',
-      score: -40,
+      score: -100,
       resolved: 0,
     });
   });
@@ -625,23 +626,24 @@ describe('report POST /rooms/:roomId/report/:eventId', () => {
     expect(db.inserts).toHaveLength(1);
   });
 
-  it('returns 404 when event missing', async () => {
+  it('accepts a report for an unknown event (MSC4277 anti-fingerprinting)', async () => {
     const db = createReportDb({
       memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
       events: [],
     });
     const res = await request(db, eventReportPath(), jsonInit('POST', { reason: 'x' }));
-    expect(res.status).toBe(404);
-    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND', error: 'Event not found' });
+    expect(res.status).toBe(200);
+    expect(db.inserts).toHaveLength(1);
+    expect(db.reports[0]).toMatchObject({ event_id: EVENT, reason: 'x' });
   });
 
-  it('returns 404 when event exists in different room', async () => {
+  it('accepts a report when the event exists in a different room', async () => {
     const db = createReportDb({
       memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
       events: [{ event_id: EVENT, room_id: '!other:example.com' }],
     });
     const res = await request(db, eventReportPath(), jsonInit('POST', {}));
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
   });
 
   it('updates duplicate report instead of inserting', async () => {
@@ -672,38 +674,18 @@ describe('report POST /rooms/:roomId/report/:eventId', () => {
     expect(db.reports[0]).toMatchObject({
       id: 7,
       reason: 'updated',
-      score: -90,
+      score: -100,
       created_at: NOW,
     });
   });
 
-  it('clamps score above 0 down to 0', async () => {
+  it('ignores the removed score parameter (MSC4277)', async () => {
     const db = createReportDb({
       memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
       events: [{ event_id: EVENT, room_id: ROOM }],
     });
-    const res = await request(db, eventReportPath(), jsonInit('POST', { score: 50 }));
-    expect(res.status).toBe(200);
-    expect(db.inserts[0].args[4]).toBe(0);
-  });
-
-  it('clamps score below -100 up to -100', async () => {
-    const db = createReportDb({
-      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
-      events: [{ event_id: EVENT, room_id: ROOM }],
-    });
-    const res = await request(db, eventReportPath(), jsonInit('POST', { score: -999 }));
-    expect(res.status).toBe(200);
+    await request(db, eventReportPath(), jsonInit('POST', { score: 50 }));
     expect(db.inserts[0].args[4]).toBe(-100);
-  });
-
-  it('preserves in-range score -50', async () => {
-    const db = createReportDb({
-      memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
-      events: [{ event_id: EVENT, room_id: ROOM }],
-    });
-    await request(db, eventReportPath(), jsonInit('POST', { score: -50 }));
-    expect(db.inserts[0].args[4]).toBe(-50);
   });
 
   it('defaults score to -100 when omitted', async () => {
@@ -767,11 +749,12 @@ describe('report POST /rooms/:roomId/report/:eventId', () => {
 // ---------------------------------------------------------------------------
 
 describe('report POST /rooms/:roomId/report', () => {
-  it('returns 404 when room missing', async () => {
+  it('accepts a report for an unknown room (MSC4277 anti-fingerprinting)', async () => {
     const db = createReportDb({ rooms: [] });
     const res = await request(db, roomReportPath(), jsonInit('POST', { reason: 'bad room' }));
-    expect(res.status).toBe(404);
-    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND', error: 'Room not found' });
+    expect(res.status).toBe(200);
+    expect(db.inserts).toHaveLength(1);
+    expect(db.reports[0]).toMatchObject({ room_id: ROOM, reason: 'bad room' });
   });
 
   it('creates new room report with event_id NULL and report_type room', async () => {
@@ -784,13 +767,14 @@ describe('report POST /rooms/:roomId/report', () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({});
     expect(db.inserts).toHaveLength(1);
-    expect(db.inserts[0].args).toEqual([USER, ROOM, 'toxic', -70, NOW]);
+    // MSC4277: score removed from the spec; always -100.
+    expect(db.inserts[0].args).toEqual([USER, ROOM, 'toxic', -100, NOW]);
     expect(db.reports[0]).toMatchObject({
       room_id: ROOM,
       event_id: null,
       report_type: 'room',
       reason: 'toxic',
-      score: -70,
+      score: -100,
     });
   });
 
@@ -822,19 +806,15 @@ describe('report POST /rooms/:roomId/report', () => {
     expect(db.reports[0]).toMatchObject({
       id: 3,
       reason: 'new',
-      score: -80,
+      score: -100,
       created_at: NOW,
     });
   });
 
-  it('clamps room report score to [-100, 0]', async () => {
+  it('ignores the removed score parameter (MSC4277)', async () => {
     const db = createReportDb({ rooms: [ROOM] });
     await request(db, roomReportPath(), jsonInit('POST', { score: 10 }));
-    expect(db.inserts[0].args[3]).toBe(0);
-
-    const db2 = createReportDb({ rooms: [ROOM] });
-    await request(db2, roomReportPath(), jsonInit('POST', { score: -150 }));
-    expect(db2.inserts[0].args[3]).toBe(-100);
+    expect(db.inserts[0].args[3]).toBe(-100);
   });
 
   it('defaults room report score to -100', async () => {
@@ -882,15 +862,16 @@ describe('report POST /rooms/:roomId/report', () => {
 // ---------------------------------------------------------------------------
 
 describe('report POST /users/:id/report', () => {
-  it('returns 404 when reported user missing', async () => {
+  it('accepts a report for an unknown user (MSC4277 anti-fingerprinting)', async () => {
     const db = createReportDb({ users: [{ user_id: USER, admin: 0 }] });
     const res = await request(
       db,
       userReportPath(BOB),
       jsonInit('POST', { reason: 'harassment' })
     );
-    expect(res.status).toBe(404);
-    expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND', error: 'User not found' });
+    expect(res.status).toBe(200);
+    expect(db.inserts).toHaveLength(1);
+    expect(db.reports[0]).toMatchObject({ reported_user_id: BOB, reason: 'harassment' });
   });
 
   it('creates new user report', async () => {

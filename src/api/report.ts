@@ -1,7 +1,13 @@
 // Content Reporting API
-// Implements: https://spec.matrix.org/v1.12/client-server-api/#reporting-content
+// Implements: https://spec.matrix.org/v1.19/client-server-api/#reporting-content
 //
-// Allows users to report inappropriate content to server admins
+// Allows users to report inappropriate content to server admins.
+//
+// MSC4277 (stable since spec v1.18): the client `score` parameter was
+// removed from the spec, and servers may answer 200 regardless of whether
+// the reported subject actually exists — a 404 would let callers probe
+// for room/event IDs. We store the report and log the dangling subject
+// server-side instead.
 
 import { Hono } from 'hono';
 import type { AppEnv } from '../types';
@@ -39,7 +45,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/report/:eventId', requireAuth(), asyn
   const eventId = c.req.param('eventId');
   const db = c.env.DB;
 
-  let body: { reason?: string; score?: number };
+  let body: { reason?: string };
   try {
     body = await c.req.json();
   } catch {
@@ -47,7 +53,6 @@ app.post('/_matrix/client/v3/rooms/:roomId/report/:eventId', requireAuth(), asyn
   }
 
   const reason = body.reason || '';
-  const score = typeof body.score === 'number' ? Math.max(-100, Math.min(0, body.score)) : -100;
 
   // Check if user is a member of the room
   const membership = await db.prepare(`
@@ -58,13 +63,15 @@ app.post('/_matrix/client/v3/rooms/:roomId/report/:eventId', requireAuth(), asyn
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
-  // Check if event exists
+  // Check if event exists. MSC4277: the report is still accepted (200) when
+  // the subject is unknown so callers cannot probe for event IDs; the
+  // dangling reference is logged for the admins instead.
   const event = await db.prepare(`
     SELECT event_id FROM events WHERE event_id = ? AND room_id = ?
   `).bind(eventId, roomId).first();
 
   if (!event) {
-    return Errors.notFound('Event not found').toResponse();
+    console.warn('[report] Report for unknown event', { roomId, eventId, reporter: userId });
   }
 
   // Check for duplicate report
@@ -78,13 +85,14 @@ app.post('/_matrix/client/v3/rooms/:roomId/report/:eventId', requireAuth(), asyn
     await db.prepare(`
       UPDATE content_reports SET reason = ?, score = ?, created_at = ?
       WHERE reporter_user_id = ? AND room_id = ? AND event_id = ?
-    `).bind(reason, score, Date.now(), userId, roomId, eventId).run();
+    `).bind(reason, -100, Date.now(), userId, roomId, eventId).run();
   } else {
-    // Create new report
+    // Create new report (score removed by MSC4277; column kept for the
+    // admin dashboard schema)
     await db.prepare(`
       INSERT INTO content_reports (reporter_user_id, room_id, event_id, reason, score, created_at)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).bind(userId, roomId, eventId, reason, score, Date.now()).run();
+    `).bind(userId, roomId, eventId, reason, -100, Date.now()).run();
   }
 
   return c.json({});
@@ -96,7 +104,7 @@ app.post('/_matrix/client/v3/rooms/:roomId/report', requireAuth(), async (c) => 
   const roomId = c.req.param('roomId');
   const db = c.env.DB;
 
-  let body: { reason?: string; score?: number };
+  let body: { reason?: string };
   try {
     body = await c.req.json();
   } catch {
@@ -104,15 +112,15 @@ app.post('/_matrix/client/v3/rooms/:roomId/report', requireAuth(), async (c) => 
   }
 
   const reason = body.reason || '';
-  const score = typeof body.score === 'number' ? Math.max(-100, Math.min(0, body.score)) : -100;
 
-  // Check if room exists
+  // Check if room exists. MSC4277: unknown subjects still get a 200 so
+  // callers cannot probe for room IDs; the dangling report is logged.
   const room = await db.prepare(`
     SELECT room_id FROM rooms WHERE room_id = ?
   `).bind(roomId).first();
 
   if (!room) {
-    return Errors.notFound('Room not found').toResponse();
+    console.warn('[report] Report for unknown room', { roomId, reporter: userId });
   }
 
   // Check for duplicate report (using NULL event_id for room reports)
@@ -126,13 +134,13 @@ app.post('/_matrix/client/v3/rooms/:roomId/report', requireAuth(), async (c) => 
     await db.prepare(`
       UPDATE content_reports SET reason = ?, score = ?, created_at = ?
       WHERE reporter_user_id = ? AND room_id = ? AND event_id IS NULL AND report_type = 'room'
-    `).bind(reason, score, Date.now(), userId, roomId).run();
+    `).bind(reason, -100, Date.now(), userId, roomId).run();
   } else {
-    // Create new report
+    // Create new report (score removed by MSC4277)
     await db.prepare(`
       INSERT INTO content_reports (reporter_user_id, room_id, event_id, reason, score, created_at, report_type)
       VALUES (?, ?, NULL, ?, ?, ?, 'room')
-    `).bind(userId, roomId, reason, score, Date.now()).run();
+    `).bind(userId, roomId, reason, -100, Date.now()).run();
   }
 
   return c.json({});
@@ -153,13 +161,14 @@ app.post('/_matrix/client/v3/users/:reportedUserId/report', requireAuth(), async
 
   const reason = body.reason || '';
 
-  // Check if reported user exists
+  // Check if reported user exists. MSC4277: unknown subjects still get a
+  // 200 so callers cannot probe for user IDs; the dangling report is logged.
   const user = await db.prepare(`
     SELECT user_id FROM users WHERE user_id = ?
   `).bind(reportedUserId).first();
 
   if (!user) {
-    return Errors.notFound('User not found').toResponse();
+    console.warn('[report] Report for unknown user', { reportedUserId, reporter: reporterId });
   }
 
   // Check for duplicate report

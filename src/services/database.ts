@@ -110,12 +110,14 @@ export async function getPasswordHash(db: D1Database, userId: string): Promise<s
   return result?.password_hash ?? null;
 }
 
-// MSC4155: invite filtering. The recipient's global account data
+// MSC4155/MSC4380: invite filtering. The recipient's global account data
 // `m.invite_permission_config` (unstable type
 // `org.matrix.msc4155.invite_permission_config`) holds glob lists evaluated
 // in the MSC's order; `m.ignored_user_list` takes precedence. 'block' means
 // invite endpoints must 403; 'ignore' means the invite is accepted but
-// withheld from the recipient's sync responses.
+// withheld from the recipient's sync responses. MSC4380 (stable since spec
+// v1.18) adds `default_action: "block"` to the stable event type, rejecting
+// every invite that no allow-list redeems.
 export type InvitePermission = 'allow' | 'ignore' | 'block';
 
 function globMatches(glob: string, value: string): boolean {
@@ -171,6 +173,10 @@ export async function getInvitePermission(
   if (matchesAny(config.allowed_servers, inviterServer)) return 'allow';
   if (matchesAny(config.ignored_servers, inviterServer)) return 'ignore';
   if (matchesAny(config.blocked_servers, inviterServer)) return 'block';
+  // MSC4380: with no glob opinion, `default_action: "block"` rejects all
+  // invites. Missing, invalid or unsupported values mean allow (the user
+  // explicitly opts back in by writing the event without the property).
+  if (config.default_action === 'block') return 'block';
   return 'allow';
 }
 
@@ -281,16 +287,38 @@ export async function createAccessToken(
 export async function getUserByTokenHash(
   db: D1Database,
   tokenHash: string
-): Promise<{ userId: string; deviceId: string | null } | null> {
+): Promise<
+  | {
+      userId: string;
+      deviceId: string | null;
+      // MSC4323 account moderation: present only when the account is
+      // moderated so unmoderated contexts stay shape-identical to before.
+      locked?: boolean;
+      suspended?: boolean;
+    }
+  | null
+> {
+  // Join users in the same query so every authenticated request learns the
+  // moderation state without a second D1 round trip.
   const result = await db.prepare(
-    `SELECT user_id, device_id FROM access_tokens WHERE token_hash = ?`
-  ).bind(tokenHash).first<{ user_id: string; device_id: string | null }>();
+    `SELECT at.user_id AS user_id, at.device_id AS device_id,
+            u.locked AS locked, u.suspended AS suspended
+     FROM access_tokens at JOIN users u ON u.user_id = at.user_id
+     WHERE at.token_hash = ?`
+  ).bind(tokenHash).first<{
+    user_id: string;
+    device_id: string | null;
+    locked?: number;
+    suspended?: number;
+  }>();
 
   if (!result) return null;
 
   return {
     userId: result.user_id,
     deviceId: result.device_id,
+    ...(result.locked === 1 ? { locked: true } : {}),
+    ...(result.suspended === 1 ? { suspended: true } : {}),
   };
 }
 

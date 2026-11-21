@@ -213,11 +213,19 @@ function createCrudDb(seed: {
           return (device ?? null) as T;
         }
 
-        if (sql.includes('FROM access_tokens WHERE token_hash = ?')) {
+        if (sql.includes('FROM access_tokens') && sql.includes('token_hash')) {
           const token = tokens.find((t) => t.token_hash === args[0]);
-          return (token
-            ? { user_id: token.user_id, device_id: token.device_id }
-            : null) as T;
+          if (!token) return null as T;
+          // getUserByTokenHash joins users for MSC4323 moderation state.
+          const user = users.find((u) => u.user_id === token.user_id) as
+            | { locked?: number; suspended?: number }
+            | undefined;
+          return {
+            user_id: token.user_id,
+            device_id: token.device_id,
+            locked: user?.locked ?? 0,
+            suspended: user?.suspended ?? 0,
+          } as T;
         }
 
         if (sql.includes('FROM rooms WHERE room_id = ?')) {
@@ -1085,6 +1093,41 @@ describe('database access token helpers', () => {
       deviceId: null,
     });
     await expect(getUserByTokenHash(db, 'missing')).resolves.toBeNull();
+  });
+
+  it('getUserByTokenHash surfaces MSC4323 moderation state when set', async () => {
+    const db = createCrudDb({
+      tokens: [
+        {
+          token_id: 't3',
+          token_hash: 'mod',
+          user_id: USER,
+          device_id: 'D',
+          created_at: 1,
+        },
+      ],
+      users: [
+        {
+          user_id: USER,
+          localpart: 'alice',
+          password_hash: 'h',
+          display_name: null,
+          avatar_url: null,
+          is_guest: 0,
+          is_deactivated: 0,
+          admin: 0,
+          locked: 1,
+          suspended: 1,
+          created_at: 11,
+        },
+      ],
+    });
+    await expect(getUserByTokenHash(db, 'mod')).resolves.toEqual({
+      userId: USER,
+      deviceId: 'D',
+      locked: true,
+      suspended: true,
+    });
   });
 
   it('deleteAccessToken removes by hash only', async () => {

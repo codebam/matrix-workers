@@ -1940,7 +1940,7 @@ describe('race report event vanish TOCTOU residual after #214', () => {
   }
 
   for (let i = 0; i < 6; i++) {
-    it(`event vanish before event SELECT 404 #${i}`, async () => {
+    it(`event vanish before event SELECT 200 (MSC4277) #${i}`, async () => {
       const evt = `$gone${i}:example.com`;
       const db = createReportDb({
         events: [{ event_id: evt, room_id: ROOM, sender: BOB }],
@@ -1957,9 +1957,11 @@ describe('race report event vanish TOCTOU residual after #214', () => {
         `/_matrix/client/v3/rooms/${ROOM_ENC}/report/${encodeURIComponent(evt)}`,
         jsonInit('POST', { reason: `g-${i}` })
       );
-      expect(res.status).toBe(404);
-      expect(errcode(res.body)).toBe('M_NOT_FOUND');
-      expect(db.reports).toHaveLength(0);
+      // MSC4277: reports for vanished/unknown subjects still get a 200 so
+      // callers cannot probe for event IDs; the report is still stored.
+      expect(res.status).toBe(200);
+      expect(db.reports).toHaveLength(1);
+      expect(db.reports[0]).toMatchObject({ event_id: evt, reason: `g-${i}` });
     });
   }
 });

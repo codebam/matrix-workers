@@ -1606,7 +1606,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-0', 'B-0']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #1', async () => {
     const evt = `$upd1:example.com`;
@@ -1633,7 +1633,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-1', 'B-1']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #2', async () => {
     const evt = `$upd2:example.com`;
@@ -1660,7 +1660,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-2', 'B-2']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #3', async () => {
     const evt = `$upd3:example.com`;
@@ -1687,7 +1687,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-3', 'B-3']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #4', async () => {
     const evt = `$upd4:example.com`;
@@ -1714,7 +1714,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-4', 'B-4']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #5', async () => {
     const evt = `$upd5:example.com`;
@@ -1741,7 +1741,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-5', 'B-5']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #6', async () => {
     const evt = `$upd6:example.com`;
@@ -1768,7 +1768,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-6', 'B-6']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #7', async () => {
     const evt = `$upd7:example.com`;
@@ -1795,7 +1795,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-7', 'B-7']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #8', async () => {
     const evt = `$upd8:example.com`;
@@ -1822,7 +1822,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-8', 'B-8']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #9', async () => {
     const evt = `$upd9:example.com`;
@@ -1849,7 +1849,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-9', 'B-9']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #10', async () => {
     const evt = `$upd10:example.com`;
@@ -1876,7 +1876,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-10', 'B-10']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #11', async () => {
     const evt = `$upd11:example.com`;
@@ -1903,7 +1903,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-11', 'B-11']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #12', async () => {
     const evt = `$upd12:example.com`;
@@ -1930,7 +1930,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-12', 'B-12']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #13', async () => {
     const evt = `$upd13:example.com`;
@@ -1957,7 +1957,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-13', 'B-13']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #14', async () => {
     const evt = `$upd14:example.com`;
@@ -1984,7 +1984,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-14', 'B-14']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('event report UPDATE LWW race #15', async () => {
     const evt = `$upd15:example.com`;
@@ -2011,7 +2011,7 @@ describe('race report event UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.event_id === evt)!;
     expect(['A-15', 'B-15']).toContain(row.reason);
-    expect([-10, -20]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
 });
 
@@ -2039,7 +2039,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-0', 'RB-0']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #1', async () => {
     const room = '!updroom1:example.com';
@@ -2064,7 +2064,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-1', 'RB-1']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #2', async () => {
     const room = '!updroom2:example.com';
@@ -2089,7 +2089,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-2', 'RB-2']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #3', async () => {
     const room = '!updroom3:example.com';
@@ -2114,7 +2114,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-3', 'RB-3']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #4', async () => {
     const room = '!updroom4:example.com';
@@ -2139,7 +2139,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-4', 'RB-4']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #5', async () => {
     const room = '!updroom5:example.com';
@@ -2164,7 +2164,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-5', 'RB-5']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #6', async () => {
     const room = '!updroom6:example.com';
@@ -2189,7 +2189,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-6', 'RB-6']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #7', async () => {
     const room = '!updroom7:example.com';
@@ -2214,7 +2214,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-7', 'RB-7']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #8', async () => {
     const room = '!updroom8:example.com';
@@ -2239,7 +2239,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-8', 'RB-8']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #9', async () => {
     const room = '!updroom9:example.com';
@@ -2264,7 +2264,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-9', 'RB-9']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #10', async () => {
     const room = '!updroom10:example.com';
@@ -2289,7 +2289,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-10', 'RB-10']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #11', async () => {
     const room = '!updroom11:example.com';
@@ -2314,7 +2314,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-11', 'RB-11']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #12', async () => {
     const room = '!updroom12:example.com';
@@ -2339,7 +2339,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-12', 'RB-12']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #13', async () => {
     const room = '!updroom13:example.com';
@@ -2364,7 +2364,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-13', 'RB-13']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #14', async () => {
     const room = '!updroom14:example.com';
@@ -2389,7 +2389,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-14', 'RB-14']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
   it('room report UPDATE LWW race #15', async () => {
     const room = '!updroom15:example.com';
@@ -2414,7 +2414,7 @@ describe('race report room UPDATE last-write-wins after #197', () => {
     expect(db.inserts.length).toBe(0);
     const row = db.reports.find((r) => r.room_id === room && r.report_type === 'room')!;
     expect(['RA-15', 'RB-15']).toContain(row.reason);
-    expect([-5, -15]).toContain(row.score);
+    expect(row.score).toBe(-100);
   });
 });
 
@@ -7162,8 +7162,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-0' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-0' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #1', async () => {
     const missing = '!missing1:example.com';
@@ -7174,8 +7174,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-1' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-1' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #2', async () => {
     const missing = '!missing2:example.com';
@@ -7186,8 +7186,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-2' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-2' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #3', async () => {
     const missing = '!missing3:example.com';
@@ -7198,8 +7198,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-3' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-3' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #4', async () => {
     const missing = '!missing4:example.com';
@@ -7210,8 +7210,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-4' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-4' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #5', async () => {
     const missing = '!missing5:example.com';
@@ -7222,8 +7222,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-5' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-5' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #6', async () => {
     const missing = '!missing6:example.com';
@@ -7234,8 +7234,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-6' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-6' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #7', async () => {
     const missing = '!missing7:example.com';
@@ -7246,8 +7246,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-7' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-7' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #8', async () => {
     const missing = '!missing8:example.com';
@@ -7258,8 +7258,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-8' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-8' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #9', async () => {
     const missing = '!missing9:example.com';
@@ -7270,8 +7270,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-9' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-9' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #10', async () => {
     const missing = '!missing10:example.com';
@@ -7282,8 +7282,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-10' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-10' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #11', async () => {
     const missing = '!missing11:example.com';
@@ -7294,8 +7294,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-11' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-11' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #12', async () => {
     const missing = '!missing12:example.com';
@@ -7306,8 +7306,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-12' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-12' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #13', async () => {
     const missing = '!missing13:example.com';
@@ -7318,8 +7318,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-13' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-13' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #14', async () => {
     const missing = '!missing14:example.com';
@@ -7330,8 +7330,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-14' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-14' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
   it('room not found concurrent soft #15', async () => {
     const missing = '!missing15:example.com';
@@ -7342,8 +7342,8 @@ describe('race report room-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'mB-15' })),
       reportReq(db, path, jsonInit('POST', { reason: 'mC-15' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(3);
   });
 });
 
@@ -7356,8 +7356,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-0' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-0' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #1', async () => {
     const missing = '@ghost1:example.com';
@@ -7367,8 +7367,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-1' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-1' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #2', async () => {
     const missing = '@ghost2:example.com';
@@ -7378,8 +7378,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-2' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-2' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #3', async () => {
     const missing = '@ghost3:example.com';
@@ -7389,8 +7389,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-3' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-3' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #4', async () => {
     const missing = '@ghost4:example.com';
@@ -7400,8 +7400,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-4' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-4' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #5', async () => {
     const missing = '@ghost5:example.com';
@@ -7411,8 +7411,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-5' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-5' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #6', async () => {
     const missing = '@ghost6:example.com';
@@ -7422,8 +7422,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-6' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-6' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #7', async () => {
     const missing = '@ghost7:example.com';
@@ -7433,8 +7433,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-7' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-7' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #8', async () => {
     const missing = '@ghost8:example.com';
@@ -7444,8 +7444,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-8' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-8' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #9', async () => {
     const missing = '@ghost9:example.com';
@@ -7455,8 +7455,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-9' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-9' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #10', async () => {
     const missing = '@ghost10:example.com';
@@ -7466,8 +7466,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-10' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-10' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #11', async () => {
     const missing = '@ghost11:example.com';
@@ -7477,8 +7477,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-11' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-11' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #12', async () => {
     const missing = '@ghost12:example.com';
@@ -7488,8 +7488,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-12' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-12' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #13', async () => {
     const missing = '@ghost13:example.com';
@@ -7499,8 +7499,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-13' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-13' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #14', async () => {
     const missing = '@ghost14:example.com';
@@ -7510,8 +7510,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-14' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-14' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
   it('user not found concurrent soft #15', async () => {
     const missing = '@ghost15:example.com';
@@ -7521,8 +7521,8 @@ describe('race report user-not-found concurrent soft after #197', () => {
       reportReq(db, path, jsonInit('POST', { reason: 'gA-15' })),
       reportReq(db, path, jsonInit('POST', { reason: 'gB-15' })),
     ]);
-    expect(results.every((r) => r.status === 404)).toBe(true);
-    expect(db.reports).toHaveLength(0);
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(db.reports).toHaveLength(2);
   });
 });
 

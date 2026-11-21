@@ -140,3 +140,35 @@ describe('MSC4155 getInvitePermission', () => {
     expect(await getInvitePermission(db, RECIPIENT, INVITER)).toBe('allow');
   });
 });
+
+describe('MSC4380 default_action (stable since spec v1.18)', () => {
+  it('blocks all invites with default_action "block"', async () => {
+    expect(
+      await getInvitePermission(config({ default_action: 'block' }), RECIPIENT, INVITER)
+    ).toBe('block');
+  });
+
+  it('missing default_action means allow', async () => {
+    expect(await getInvitePermission(config({}), RECIPIENT, INVITER)).toBe('allow');
+  });
+
+  it('invalid or unsupported default_action values mean allow', async () => {
+    expect(
+      await getInvitePermission(config({ default_action: 'ignore' }), RECIPIENT, INVITER)
+    ).toBe('allow');
+    expect(
+      await getInvitePermission(config({ default_action: true }), RECIPIENT, INVITER)
+    ).toBe('allow');
+  });
+
+  it('an allowed user glob overrides default_action block', async () => {
+    const db = config({ default_action: 'block', allowed_users: [INVITER] });
+    expect(await getInvitePermission(db, RECIPIENT, INVITER)).toBe('allow');
+    expect(await getInvitePermission(db, RECIPIENT, '@eve:elsewhere.net')).toBe('block');
+  });
+
+  it('an ignored user glob wins over default_action block', async () => {
+    const db = config({ default_action: 'block', ignored_users: [INVITER] });
+    expect(await getInvitePermission(db, RECIPIENT, INVITER)).toBe('ignore');
+  });
+});

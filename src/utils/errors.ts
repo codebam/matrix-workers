@@ -6,13 +6,15 @@ export class MatrixApiError extends Error {
   public readonly errcode: ErrorCode;
   public readonly status: number;
   public readonly retryAfterMs?: number;
+  public readonly softLogout?: boolean;
 
-  constructor(errcode: ErrorCode, message: string, status: number = 400, retryAfterMs?: number) {
+  constructor(errcode: ErrorCode, message: string, status: number = 400, retryAfterMs?: number, softLogout?: boolean) {
     super(message);
     this.name = 'MatrixApiError';
     this.errcode = errcode;
     this.status = status;
     this.retryAfterMs = retryAfterMs;
+    this.softLogout = softLogout;
   }
 
   toJSON(): MatrixError {
@@ -22,6 +24,9 @@ export class MatrixApiError extends Error {
     };
     if (this.retryAfterMs) {
       error.retry_after_ms = this.retryAfterMs;
+    }
+    if (this.softLogout) {
+      error.soft_logout = true;
     }
     return error;
   }
@@ -121,7 +126,19 @@ export const Errors = {
   },
 
   inviteBlocked(message: string = 'The recipient does not accept invites from you'): MatrixApiError {
-    return new MatrixApiError(ErrorCodes.ORG_MATRIX_MSC4155_M_INVITE_BLOCKED, message, 403);
+    // MSC4380 stabilized the errcode as flat M_INVITE_BLOCKED in spec v1.18.
+    return new MatrixApiError(ErrorCodes.M_INVITE_BLOCKED, message, 403);
+  },
+
+  // MSC4323 (spec v1.18): account moderation enforcement errors. Locked
+  // accounts keep their sessions (soft_logout: true) so an unlock restores
+  // access without a fresh login; suspended accounts can still read.
+  userLocked(message: string = 'This account has been locked'): MatrixApiError {
+    return new MatrixApiError(ErrorCodes.M_USER_LOCKED, message, 401, undefined, true);
+  },
+
+  userSuspended(message: string = 'You cannot perform this action while suspended.'): MatrixApiError {
+    return new MatrixApiError(ErrorCodes.M_USER_SUSPENDED, message, 403);
   },
 
   delayTooLarge(message: string = 'The requested delay exceeds the maximum allowed'): MatrixApiError {

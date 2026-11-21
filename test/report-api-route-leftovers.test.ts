@@ -2555,30 +2555,29 @@ describe('report leftovers failure and edge cases after #149', () => {
     expect(res.status).toBe(200);
   });
 
-  it('event report 404 missing event', async () => {
+  it('event report 200 on missing event (MSC4277)', async () => {
     const db = createReportDb({
       memberships: [{ room_id: ROOM, user_id: USER, membership: 'join' }],
       events: [],
     });
     const res = await request(db, eventReportPath(), jsonInit('POST', { reason: 'x' }));
-    expect(res.status).toBe(404);
-    expect(res.body.errcode).toBe('M_NOT_FOUND');
+    expect(res.status).toBe(200);
   });
 
-  it('room report 404 missing room', async () => {
+  it('room report 200 on missing room (MSC4277)', async () => {
     const db = createReportDb({ rooms: [], memberships: [] });
     const res = await request(db, roomReportPath('!missing:example.com'), jsonInit('POST', {}));
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
   });
 
-  it('user report 404 missing user', async () => {
+  it('user report 200 on missing user (MSC4277)', async () => {
     const db = createReportDb({ users: [{ user_id: USER, admin: 0 }] });
     const res = await request(
       db,
       userReportPath('@ghost:example.com'),
       jsonInit('POST', { reason: 'x' })
     );
-    expect(res.status).toBe(404);
+    expect(res.status).toBe(200);
   });
 
   it('admin list forbids non-admin', async () => {
@@ -2639,10 +2638,10 @@ describe('report leftovers failure and edge cases after #149', () => {
     expect(res.status).toBe(403);
   });
 
-  it('score clamps above 0 to 0', async () => {
+  it('ignores removed score param (MSC4277, always -100)', async () => {
     const db = adminJoinedDb();
     await request(db, eventReportPath(), jsonInit('POST', { reason: 'x', score: 50 }));
-    expect(db.reports[0].score).toBe(0);
+    expect(db.reports[0].score).toBe(-100);
   });
 
   it('score clamps below -100 to -100', async () => {

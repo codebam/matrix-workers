@@ -40,6 +40,9 @@ export interface UnsignedData {
   age?: number;
   transaction_id?: string;
   prev_content?: Record<string, unknown>;
+  // Spec v1.19: on client-formatted state events, the event ID of the state
+  // event this one replaces.
+  replaces_state?: string;
   redacted_because?: MatrixEvent;
   'm.relations'?: Record<string, unknown>;
 }
@@ -380,6 +383,8 @@ export interface MatrixError {
   errcode: string;
   error: string;
   retry_after_ms?: number;
+  // M_USER_LOCKED responses set this so clients retain session state.
+  soft_logout?: boolean;
 }
 
 // Common error codes
@@ -420,6 +425,12 @@ export const ErrorCodes = {
   // (power levels / membership) changed between the permission check and the
   // attempted write. Clients should re-fetch state and retry.
   M_CONFLICT: 'M_CONFLICT',
+  // MSC4323 (stable since spec v1.18): the recipient blocks all invites.
+  M_INVITE_BLOCKED: 'M_INVITE_BLOCKED',
+  // Account moderation (spec v1.12/v1.13 error codes; MSC4323 endpoints
+  // arrived in v1.18). M_USER_LOCKED carries soft_logout: true on 401s.
+  M_USER_LOCKED: 'M_USER_LOCKED',
+  M_USER_SUSPENDED: 'M_USER_SUSPENDED',
   // MSC4155 (unstable): the recipient's invite permission config blocks the
   // inviter.
   ORG_MATRIX_MSC4155_M_INVITE_BLOCKED: 'ORG.MATRIX.MSC4155.M_INVITE_BLOCKED',

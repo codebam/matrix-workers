@@ -793,12 +793,13 @@ async function getInviteRoomData(
     }
   }
 
-  // MSC4155: an 'ignore' decision accepts the invite but withholds it from
-  // the recipient's sync. Null tells the caller to skip the room entirely.
+  // MSC4155/MSC4380: an 'ignore' decision accepts the invite but withholds it
+  // from the recipient's sync; 'block' covers invites that predate the
+  // toggle. Null tells the caller to skip the room entirely.
   const ownMember = inviteState.find(
     (e) => e.type === 'm.room.member' && e.state_key === userId
   );
-  if (ownMember && (await getInvitePermission(db, userId, ownMember.sender)) === 'ignore') {
+  if (ownMember && (await getInvitePermission(db, userId, ownMember.sender)) !== 'allow') {
     return null;
   }
 

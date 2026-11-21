@@ -654,15 +654,16 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     const state = await getRoomState(c.env.DB, roomId);
 
-    // MSC4155: an 'ignore' decision accepts the invite but withholds it from
-    // the recipient's sync. The inviter is the sender of the invitee's own
-    // m.room.member event.
+    // MSC4155/MSC4380: an 'ignore' decision accepts the invite but withholds
+    // it from the recipient's sync; a 'block' decision does the same for
+    // invites that predate the toggle (new ones are rejected outright). The
+    // inviter is the sender of the invitee's own m.room.member event.
     const inviteEvent = state.find(
       (e) => e.type === 'm.room.member' && e.state_key === userId
     );
     if (
       inviteEvent &&
-      (await getInvitePermission(c.env.DB, userId, inviteEvent.sender)) === 'ignore'
+      (await getInvitePermission(c.env.DB, userId, inviteEvent.sender)) !== 'allow'
     ) {
       continue;
     }
