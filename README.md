@@ -27,7 +27,7 @@ Everything in this list is live on `codebam.ca` and verified against real peers 
 
 **Native bots** (first-class users the homeserver acts for — no password, so bot accounts can never log in):
 - **Admin console bot** in a management room: `!admin` commands for status/counts, registration-token mint/list/revoke, user list/create/deactivate/reset-password, federation peer status, room kick/ban/unban (executed as the bot, governed by the room's power levels), and server notices — admin-gated, replies as `m.notice`.
-- **Telegram bridge** (`@BotFather` token via admin API only — never via room messages): webhook-driven (no polling), one Telegram chat ↔ one Matrix room, bidirectional — Telegram messages land as `[TG] Name (@user): text`, and room messages (including federated users') relay out with display-name prefixes. Loop-proof by construction (all integrations skip bot senders).
+- **Telegram bridge** (`@BotFather` token via admin API only — never via room messages): webhook-driven (no polling), one Telegram chat ↔ one Matrix room, bidirectional — Telegram messages land as `Name: text` (display name only), and room messages (including federated users') relay out with display-name prefixes. Loop-proof by construction (all integrations skip bot senders).
 
 **Quality bar**: 345 test files / ~45,400 tests green (`npm test`), `tsc --noEmit` clean, CI on every push. In-process mock-Synapse peer tests reproduce resident-server auth rejections (the "HTTP 200 but never displayed" class) before they reach production.
 

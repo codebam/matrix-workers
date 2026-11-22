@@ -165,7 +165,7 @@ applied to both, additive-only).
   ONLY via `POST /admin/api/telegram/bridges {bot_localpart, room_id,
   chat_id, tg_token}` (auto-creates the bot user, joins it, calls setWebhook
   with a secret; rolls back on Telegram rejection). Updates land as
-  `[TG] Name (@user): text`; Matrix→TG relays local AND federated sends with
+  `Name: text` (display name only); Matrix→TG relays local AND federated sends with
   display-name prefixes; loop prevention is structural (all integrations
   skip bot senders; consumed commands are never relayed).
 - Loop-prevention/hook architecture: single hook
@@ -292,7 +292,7 @@ code/pre/links now survive both directions. Pure converter module:
   going out WITHOUT parse_mode (no injection surface).
 - **Telegram → Matrix**: message entities (offset/length in UTF-16 code
   units — exactly how JS indexes strings, so emoji are safe) convert into a
-  freshly escaped `formatted_body` with the `[TG] name:` prefix escaped too.
+  freshly escaped `formatted_body` with the `name:` prefix escaped too.
   Supported: bold, italic, underline, strikethrough, spoiler (→
   `<span data-mx-spoiler>`), code, pre+language, text_link, text_mention,
   mention, url. Nothing from the Telegram side passes through unescaped.

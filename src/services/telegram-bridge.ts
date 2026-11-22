@@ -744,7 +744,7 @@ async function sendLottieSticker(
           if (st.thumbnail.width) info.w = st.thumbnail.width;
           if (st.thumbnail.height) info.h = st.thumbnail.height;
           const content: Record<string, unknown> = {
-            body: `[TG] ${senderName}: ${msg.caption ?? label}`,
+            body: `${senderName}: ${msg.caption ?? label}`,
             url: `mxc://${env.SERVER_NAME}/${mediaId}`,
             info,
           };
@@ -780,7 +780,7 @@ async function sendLottieSticker(
     }
     await sendBridgedMessage(env, bridge, msg, 'm.room.message', {
       msgtype: 'm.file',
-      body: `[TG] ${senderName}: ${msg.caption ?? filename}`,
+      body: `${senderName}: ${msg.caption ?? filename}`,
       url: `mxc://${env.SERVER_NAME}/${mediaId}`,
       filename,
       info: { mimetype: 'application/gzip', size: media.bytes.byteLength },
@@ -816,9 +816,7 @@ export async function processTelegramUpdate(
     // Only relay messages from the bridged chat.
     if (String(msg.chat.id) !== String(bridge.chat_id)) return true;
 
-    const senderName = msg.from?.first_name
-      ? `${msg.from.first_name}${msg.from.username ? ` (@${msg.from.username})` : ''}`
-      : 'telegram user';
+    const senderName = msg.from?.first_name || msg.from?.username || 'telegram user';
 
     // Images and video stickers are downloaded from Telegram, stored in our
     // media repo, and posted as m.image / m.sticker events carrying the mxc
@@ -852,7 +850,7 @@ export async function processTelegramUpdate(
             : downloaded;
           const mediaId = media ? await storeBridgeMedia(env, bridge.bot_user_id, { ...media, filename: img.filename }) : null;
           if (media && mediaId) {
-            const caption = `[TG] ${senderName}: ${msg.caption ?? img.filename}`;
+            const caption = `${senderName}: ${msg.caption ?? img.filename}`;
             const info: Record<string, unknown> = {
               mimetype: media.contentType,
               size: media.bytes.byteLength,
@@ -887,7 +885,7 @@ export async function processTelegramUpdate(
     let body: string;
     let content: Record<string, unknown>;
     if (typeof msg.text === 'string' && msg.text.length > 0) {
-      body = `[TG] ${senderName}: ${msg.text}`;
+      body = `${senderName}: ${msg.text}`;
       content = { msgtype: 'm.text', body };
       // Telegram's formatting menu (and bots) produce entities — offset/
       // length ranges over the text. Convert them into a freshly escaped
@@ -898,7 +896,7 @@ export async function processTelegramUpdate(
       );
       if (html) {
         content.format = 'org.matrix.custom.html';
-        content.formatted_body = `${escapeHtml(`[TG] ${senderName}: `)}${html}`;
+        content.formatted_body = `${escapeHtml(`${senderName}: `)}${html}`;
       }
     } else if (msg.photo || msg.document || msg.sticker || msg.voice || msg.audio || msg.video) {
       const kind = msg.photo ? 'photo'
@@ -908,7 +906,7 @@ export async function processTelegramUpdate(
         : msg.audio ? 'audio'
         : 'video';
       body = `[telegram ${kind}]` + (msg.caption ? ` ${msg.caption}` : '');
-      content = { msgtype: 'm.text', body: `[TG] ${senderName}: ${body}` };
+      content = { msgtype: 'm.text', body: `${senderName}: ${body}` };
     } else {
       return true; // service messages / unsupported — ack silently.
     }

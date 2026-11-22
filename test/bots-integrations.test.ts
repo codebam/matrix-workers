@@ -396,7 +396,7 @@ describe('telegram webhook update processing', () => {
     expect(roomId).toBe(ROOM);
     expect(sender).toBe(TG_BOT);
     expect(type).toBe('m.room.message');
-    expect(content.body).toBe('[TG] Ivan (@ivan): privet');
+    expect(content.body).toBe('Ivan: privet');
   });
 
   it('skips duplicates and other chats', async () => {
@@ -461,13 +461,13 @@ describe('telegram reply rendering', () => {
     expect(sentBy).toBe(TG_BOT);
     expect(type).toBe('m.room.message');
     expect(content['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$orig:example.com' } });
-    expect(content.body).toBe('> <@tgbot:example.com> [TG] Ivan (@ivan): original message\n[TG] Ivan (@ivan): my reply');
+    expect(content.body).toBe('> <@tgbot:example.com> Ivan: original message\nIvan: my reply');
     expect(content.format).toBe('org.matrix.custom.html');
     expect(content.formatted_body).toBe(
       '<mx-reply><blockquote>' +
       '<a href="https://matrix.to/#/!room:example.com/$orig:example.com">In reply to</a> ' +
       '<a href="https://matrix.to/#/@tgbot:example.com">@tgbot:example.com</a><br>' +
-      '[TG] Ivan (@ivan): original message</blockquote></mx-reply>[TG] Ivan (@ivan): my reply'
+      'Ivan: original message</blockquote></mx-reply>Ivan: my reply'
     );
 
     const rows = (env.DB as any).messageMap;
@@ -476,12 +476,12 @@ describe('telegram reply rendering', () => {
       expect.objectContaining({
         chat_id: '4711', telegram_message_id: 50, room_id: ROOM,
         matrix_event_id: '$orig:example.com', sender: TG_BOT,
-        body: '[TG] Ivan (@ivan): original message', formatted_body: null,
+        body: 'Ivan: original message', formatted_body: null,
       }),
       expect.objectContaining({
         chat_id: '4711', telegram_message_id: 51, room_id: ROOM,
         matrix_event_id: '$botmsg:example.com', sender: TG_BOT,
-        body: '[TG] Ivan (@ivan): my reply',
+        body: 'Ivan: my reply',
       }),
     ]));
     // The mapping stores the message's own text, not the reply's fallback.
@@ -505,10 +505,10 @@ describe('telegram reply rendering', () => {
 
     const content = performSendEvent.mock.calls[1][4];
     expect(content['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$rich:example.com' } });
-    expect(content.formatted_body).toContain('[TG] Ivan (@ivan): <b>bold</b> text</blockquote></mx-reply>');
-    expect(content.formatted_body).toContain('</mx-reply>[TG] Ivan (@ivan): agree');
+    expect(content.formatted_body).toContain('Ivan: <b>bold</b> text</blockquote></mx-reply>');
+    expect(content.formatted_body).toContain('</mx-reply>Ivan: agree');
     const rows = (env.DB as any).messageMap;
-    expect(rows[0].formatted_body).toBe('[TG] Ivan (@ivan): <b>bold</b> text');
+    expect(rows[0].formatted_body).toBe('Ivan: <b>bold</b> text');
   });
 
   it('a reply to an unmapped message stays plain and is still delivered', async () => {
@@ -523,7 +523,7 @@ describe('telegram reply rendering', () => {
     expect(handled).toBe(true);
     expect(performSendEvent).toHaveBeenCalledTimes(1);
     expect(performSendEvent.mock.calls[0][4]).toEqual({
-      msgtype: 'm.text', body: '[TG] Ivan (@ivan): plain reply',
+      msgtype: 'm.text', body: 'Ivan: plain reply',
     });
     // The new message itself is still mapped for future replies.
     expect((env.DB as any).messageMap).toHaveLength(1);
@@ -542,7 +542,7 @@ describe('telegram reply rendering', () => {
       });
       expect(handled).toBe(true);
       expect(performSendEvent).toHaveBeenCalledTimes(1);
-      expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan (@ivan): still delivered');
+      expect(performSendEvent.mock.calls[0][4].body).toBe('Ivan: still delivered');
       expect((env.DB as any).messageMap).toHaveLength(0);
     } finally {
       warn.mockRestore();
@@ -578,12 +578,12 @@ describe('telegram reply rendering', () => {
     expect((env.DB as any).messageMap).toEqual(expect.arrayContaining([
       expect.objectContaining({
         telegram_message_id: 100, matrix_event_id: '$photo:example.com',
-        body: '[TG] Ivan (@ivan): look',
+        body: 'Ivan: look',
       }),
     ]));
     const replyContent = performSendEvent.mock.calls[1][4];
     expect(replyContent['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$photo:example.com' } });
-    expect(replyContent.body).toContain('> <@tgbot:example.com> [TG] Ivan (@ivan): look');
+    expect(replyContent.body).toContain('> <@tgbot:example.com> Ivan: look');
     expect(replyContent.formatted_body).toContain(
       'href="https://matrix.to/#/!room:example.com/$photo:example.com"'
     );
@@ -646,7 +646,7 @@ describe('telegram image bridging', () => {
     expect(sender).toBe(TG_BOT);
     expect(type).toBe('m.room.message');
     expect(content.msgtype).toBe('m.image');
-    expect(content.body).toBe('[TG] Ivan (@ivan): look at this');
+    expect(content.body).toBe('Ivan: look at this');
     expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
     expect(content.info).toMatchObject({
       mimetype: 'image/jpeg',
@@ -693,7 +693,7 @@ describe('telegram image bridging', () => {
     const [, , , type, content] = performSendEvent.mock.calls[0];
     expect(type).toBe('m.room.message');
     expect(content.msgtype).toBe('m.image');
-    expect(content.body).toBe('[TG] Ivan (@ivan): lol');
+    expect(content.body).toBe('Ivan: lol');
     expect(content.info.mimetype).toBe('image/png');
     const rows = (env.DB as any).mediaRows;
     expect(rows[0].filename).toBe('meme.png');
@@ -776,7 +776,7 @@ describe('telegram image bridging', () => {
         photo: [{ file_id: 'only', width: 640, height: 480, file_size: 2000 }],
       },
     });
-    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan: photo.jpg');
+    expect(performSendEvent.mock.calls[0][4].body).toBe('Ivan: photo.jpg');
   });
 
   it('files over the bot download cap stay placeholders and never fetch', async () => {
@@ -792,7 +792,7 @@ describe('telegram image bridging', () => {
       },
     });
     expect(performSendEvent).toHaveBeenCalledTimes(1);
-    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan: [telegram photo] too big');
+    expect(performSendEvent.mock.calls[0][4].body).toBe('Ivan: [telegram photo] too big');
     expect(fetchMock).not.toHaveBeenCalled();
     expect((env.DB as any).mediaRows).toHaveLength(0);
   });
@@ -810,7 +810,7 @@ describe('telegram image bridging', () => {
       },
     });
     expect(performSendEvent).toHaveBeenCalledTimes(1);
-    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan: [telegram photo]');
+    expect(performSendEvent.mock.calls[0][4].body).toBe('Ivan: [telegram photo]');
     expect((env.DB as any).mediaRows).toHaveLength(0);
   });
 
@@ -1000,7 +1000,7 @@ describe('telegram animated sticker bridging', () => {
     expect(sentBy).toBe(TG_BOT);
     expect(type).toBe('m.sticker');
     expect(content.msgtype).toBeUndefined();
-    expect(content.body).toBe('[TG] Ivan (@ivan): sticker.webm');
+    expect(content.body).toBe('Ivan: sticker.webm');
     expect(content.emoji).toBe('🐶');
     expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
     expect(content.info).toMatchObject({
@@ -1014,7 +1014,7 @@ describe('telegram animated sticker bridging', () => {
       expect.objectContaining({
         chat_id: '4711', telegram_message_id: 60, room_id: ROOM,
         matrix_event_id: '$webm:example.com', sender: TG_BOT,
-        body: '[TG] Ivan (@ivan): sticker.webm',
+        body: 'Ivan: sticker.webm',
       }),
     ]);
   });
@@ -1032,7 +1032,7 @@ describe('telegram animated sticker bridging', () => {
     const content = performSendEvent.mock.calls[0][4];
     expect(performSendEvent.mock.calls[0][3]).toBe('m.sticker');
     expect(content.info.mimetype).toBe('video/webm');
-    expect(content.body).toBe('[TG] Ivan (@ivan): sticker.webm');
+    expect(content.body).toBe('Ivan: sticker.webm');
   });
 
   it('lottie stickers with a thumbnail send the static webp preview as m.sticker', async () => {
@@ -1058,7 +1058,7 @@ describe('telegram animated sticker bridging', () => {
     const [, , sentBy, type, content] = performSendEvent.mock.calls[0];
     expect(sentBy).toBe(TG_BOT);
     expect(type).toBe('m.sticker');
-    expect(content.body).toBe('[TG] Ivan (@ivan): 🐱');
+    expect(content.body).toBe('Ivan: 🐱');
     expect(content.emoji).toBe('🐱');
     expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
     expect(content.info).toMatchObject({
@@ -1071,7 +1071,7 @@ describe('telegram animated sticker bridging', () => {
     expect(JSON.parse((fetchMock.mock.calls[0] as any)[1].body).file_id).toBe('lthumb');
     expect((env.DB as any).messageMap[0]).toMatchObject({
       telegram_message_id: 62, matrix_event_id: '$lottie:example.com',
-      body: '[TG] Ivan (@ivan): 🐱',
+      body: 'Ivan: 🐱',
     });
   });
 
@@ -1091,7 +1091,7 @@ describe('telegram animated sticker bridging', () => {
     expect(sentBy).toBe(TG_BOT);
     expect(type).toBe('m.room.message');
     expect(content.msgtype).toBe('m.file');
-    expect(content.body).toBe('[TG] Ivan (@ivan): 🎉.tgs');
+    expect(content.body).toBe('Ivan: 🎉.tgs');
     expect(content.filename).toBe('🎉.tgs');
     expect(String(content.url)).toMatch(/^mxc:\/\/example\.com\//);
     expect(content.info).toMatchObject({
@@ -1103,7 +1103,7 @@ describe('telegram animated sticker bridging', () => {
     });
     // The file fallback is mapped too, so replies to it work.
     expect((env.DB as any).messageMap[0]).toMatchObject({
-      telegram_message_id: 63, body: '[TG] Ivan (@ivan): 🎉.tgs',
+      telegram_message_id: 63, body: 'Ivan: 🎉.tgs',
     });
   });
 
@@ -1126,7 +1126,7 @@ describe('telegram animated sticker bridging', () => {
     expect(type).toBe('m.room.message');
     expect(content.msgtype).toBe('m.file');
     expect(content.filename).toBe('sticker.tgs');
-    expect(content.body).toBe('[TG] Ivan (@ivan): sticker.tgs');
+    expect(content.body).toBe('Ivan: sticker.tgs');
     expect(content.info.mimetype).toBe('application/gzip');
     expect(storedBytes(env, content.url)).toEqual(new Uint8Array(TGS_BYTES));
   });
@@ -1142,7 +1142,7 @@ describe('telegram animated sticker bridging', () => {
     });
     expect(performSendEvent).toHaveBeenCalledTimes(1);
     expect(performSendEvent.mock.calls[0][3]).toBe('m.room.message');
-    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan (@ivan): [telegram sticker]');
+    expect(performSendEvent.mock.calls[0][4].body).toBe('Ivan: [telegram sticker]');
     expect(fetchMock).not.toHaveBeenCalled();
     expect((env.DB as any).mediaRows).toHaveLength(0);
   });
@@ -1161,7 +1161,7 @@ describe('telegram animated sticker bridging', () => {
       },
     });
     expect(performSendEvent).toHaveBeenCalledTimes(1);
-    expect(performSendEvent.mock.calls[0][4].body).toBe('[TG] Ivan (@ivan): [telegram sticker]');
+    expect(performSendEvent.mock.calls[0][4].body).toBe('Ivan: [telegram sticker]');
     expect((env.DB as any).mediaRows).toHaveLength(0);
     // Even the placeholder is routed through the mapping hook.
     expect((env.DB as any).messageMap[0]).toMatchObject({ telegram_message_id: 66 });
@@ -1190,13 +1190,13 @@ describe('telegram animated sticker bridging', () => {
     const content = performSendEvent.mock.calls[1][4];
     expect(content['m.relates_to']).toEqual({ 'm.in_reply_to': { event_id: '$sticker:example.com' } });
     expect(content.body).toBe(
-      '> <@tgbot:example.com> [TG] Ivan (@ivan): sticker.webm\n[TG] Ivan (@ivan): love it'
+      '> <@tgbot:example.com> Ivan: sticker.webm\nIvan: love it'
     );
     expect(content.formatted_body).toContain(
       'href="https://matrix.to/#/!room:example.com/$sticker:example.com"'
     );
     expect((env.DB as any).messageMap[1]).toMatchObject({
-      telegram_message_id: 68, body: '[TG] Ivan (@ivan): love it',
+      telegram_message_id: 68, body: 'Ivan: love it',
     });
   });
 });
@@ -1267,10 +1267,10 @@ describe('telegram formatting relay', () => {
     });
     expect(performSendEvent).toHaveBeenCalledTimes(1);
     const content = performSendEvent.mock.calls[0][4];
-    expect(content.body).toBe('[TG] Ivan (@ivan): Bold link ok');
+    expect(content.body).toBe('Ivan: Bold link ok');
     expect(content.format).toBe('org.matrix.custom.html');
     expect(content.formatted_body).toBe(
-      '[TG] Ivan (@ivan): <b>Bold <a href="https://google.com">link</a></b> ok'
+      'Ivan: <b>Bold <a href="https://google.com">link</a></b> ok'
     );
   });
 
@@ -1286,7 +1286,7 @@ describe('telegram formatting relay', () => {
       },
     });
     const content = performSendEvent.mock.calls[0][4];
-    expect(content.body).toBe('[TG] Ivan: __not parsed__');
+    expect(content.body).toBe('Ivan: __not parsed__');
     expect(content.format).toBeUndefined();
     expect(content.formatted_body).toBeUndefined();
   });
@@ -1304,7 +1304,7 @@ describe('telegram formatting relay', () => {
       },
     });
     const content = performSendEvent.mock.calls[0][4];
-    expect(content.formatted_body).toBe('[TG] Ivan: 🚀 <b>go</b>');
+    expect(content.formatted_body).toBe('Ivan: 🚀 <b>go</b>');
   });
 });
 
