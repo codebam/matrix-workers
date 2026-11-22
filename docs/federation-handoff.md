@@ -1003,10 +1003,26 @@ Deploy: commit `5dc3bb7` pushed to origin/main; prod
 `dev.zirco.msc4583.v1: unstable`, website root and
 `/_matrix/client/versions` both HTTP 200.
 
-Still not conformant (tracked, not changed here): MSC4075 invites still travel
-over the unstable to-device API rather than as sticky room events, although the
-MSC4354 sticky store now exists; the two temporary federation quirks from
-session 13 (local receipt ts for inbound receipts) were verified already fixed
-in current code, as was the `get_missing_events` catchup no-op and
-`m.signing_key_update` stub noted in earlier sessions — those sections of this
-handoff are stale.
+### Session 16: MSC4075 sticky-event transport (2026-11-21)
+
+Closed the remaining v1.20 gap: `src/api/rtc.ts` now writes MSC4075 invites as
+MSC4354 sticky room events through `putStickyEvent` (room-scoped, sender-keyed,
+one row per sender/room/slot). Sticky lifecycle events follow:
+accept writes an MSC4143 member event, decline writes an MSC4310 decline with
+an `m.reference` to the invite's sticky event ID, and revoke overwrites the
+invite row with empty content (`{sticky_key: slot}`). Deterministic sticky IDs
+(`rtcInviteStickyEventId`) make a repeated invite to the same slot replace the
+old one; local members' sync DOs are woken after each write. The existing
+to-device delivery is kept as a legacy fallback, and invites without a
+`room_id` remain to-device-only (a sticky event needs a room).
+
+The session 15 note that invites still travelled only over to-device is now
+resolved. Residual limitation: sticky invite content is written as received —
+clients are responsible for encrypting invite content in encrypted rooms.
+
+Verification: typecheck clean; `npm test` 443 files / 46,384 tests green;
+lint 0 errors; `npm run worker:check` dry-run succeeded. No migrations.
+
+The older handoff notes about the `get_missing_events` catchup no-op,
+`m.signing_key_update` and inbound receipt timestamps being "left open" remain
+stale: all three were verified fixed in code before this session.

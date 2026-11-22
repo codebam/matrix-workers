@@ -13,6 +13,8 @@ import {
   updateRtcToDeviceMessageState,
   RTC_INVITE_STATE_FIELD,
 } from './to-device';
+import { putStickyEvent } from './account-data';
+import { notifyUsersOfEvent } from '../services/database';
 
 const app = new Hono<AppEnv>();
 
@@ -47,14 +49,61 @@ app.get('/_matrix/client/unstable/org.matrix.msc4143/rtc/transports', (c) => {
 });
 
 // ============================================================================
-// MSC4075 MatrixRTC invites (unstable to-device transport)
+// MSC4075 MatrixRTC invites
 // ============================================================================
 //
 // MSC4075 defines m.rtc.invite as a sticky room event with no new HTTP API.
-// This server does not have sticky-event sending yet, so invites are delivered
-// with the unstable event type org.matrix.msc4075.rtc.notification over the
-// existing to-device store. The payload fields and expiry rules are taken from
-// MSC4075; invite_id is a local handle for the query/ack routes below.
+// The server's helper API writes the sticky event (MSC4354 store) and also
+// delivers the same payload over to-device for clients that only implement
+// the older local transport. Invite lifecycle events are sticky too:
+// declines use MSC4310's stable key with an m.reference relation, acceptance
+// is an MSC4143 member event, and withdrawal overwrites the invite's sticky
+// row with empty content. invite_id remains a local handle for the query/ack
+// routes below.
+const MSC4143_MEMBER_EVENT_TYPE = 'org.matrix.msc4143.rtc.member';
+
+function rtcStickyEventId(prefix: string, sender: string, roomId: string, key: string): string {
+  const raw = `${sender}|${roomId}|${key}`.replace(/[^A-Za-z0-9_-]/g, '_');
+  return `$${prefix}_${raw}`;
+}
+
+export function rtcInviteStickyEventId(sender: string, roomId: string, slotId: string): string {
+  return rtcStickyEventId('msc4075_invite', sender, roomId, slotId);
+}
+
+async function writeRtcStickyEvent(
+  env: Env,
+  args: {
+    sender: string;
+    roomId: string;
+    eventType: string;
+    eventId: string;
+    durationMs: number;
+    content: Record<string, unknown>;
+    originServerTs?: number;
+  }
+): Promise<void> {
+  await putStickyEvent(env.DB, {
+    userId: args.sender,
+    roomId: args.roomId,
+    eventType: args.eventType,
+    txnId: args.eventId,
+    durationMs: Math.max(1, args.durationMs),
+    content: args.content,
+    eventId: args.eventId,
+    originServerTs: args.originServerTs,
+  });
+
+  try {
+    await notifyUsersOfEvent(env, args.roomId, args.eventId, args.eventType);
+  } catch (error) {
+    console.error('[rtc] sticky sync wake failed:', error);
+  }
+}
+
+function remainingStickyDuration(invite: RtcInviteContent, now: number): number {
+  return Math.max(1, getRtcInviteExpiresAt(invite, now) - now);
+}
 
 export interface RtcInviteContent {
   slot_id: string;
@@ -152,6 +201,7 @@ app.post(`${MSC4075_API}/rtc/invite/send`, requireAuth(), async (c) => {
   const now = Date.now();
   const candidate = {
     ...body,
+    ...(body.room_id ? { room_id: body.room_id } : {}),
     slot_id: body.slot_id,
     sender_ts: body.sender_ts ?? now,
     lifetime: body.lifetime,
@@ -195,6 +245,18 @@ app.post(`${MSC4075_API}/rtc/invite/send`, requireAuth(), async (c) => {
   const localRecipients = [...recipients].filter((id) => id.endsWith(localSuffix));
   if (localRecipients.length === 0) {
     return c.json({ errcode: 'M_NOT_FOUND', error: 'No local invite recipients' }, 404);
+  }
+
+  if (body.room_id) {
+    await writeRtcStickyEvent(c.env, {
+      sender,
+      roomId: body.room_id,
+      eventType: MSC4075_INVITE_EVENT_TYPE,
+      eventId: rtcInviteStickyEventId(sender, body.room_id, invite.slot_id),
+      durationMs: remainingStickyDuration(invite, now),
+      content: invite as unknown as Record<string, unknown>,
+      originServerTs: invite.sender_ts,
+    });
   }
 
   const sent = await deliverRtcToDeviceMessage(
@@ -284,6 +346,42 @@ app.post(`${MSC4075_API}/rtc/invites/:inviteId/ack`, requireAuth(), async (c) =>
       `msc4310-decline-${inviteId}`
     );
   }
+
+  const roomId = typeof invite.content.room_id === 'string' ? invite.content.room_id : undefined;
+  const validatedInvite = roomId ? validateRtcInvite(invite.content) : null;
+  if (roomId && validatedInvite?.ok && action !== 'ignored') {
+    const durationMs = remainingStickyDuration(validatedInvite.invite, Date.now());
+    if (action === 'accept') {
+      // Joining the slot inactivates the invite for this sender/slot (MSC4075).
+      await writeRtcStickyEvent(c.env, {
+        sender: userId,
+        roomId,
+        eventType: MSC4143_MEMBER_EVENT_TYPE,
+        eventId: rtcStickyEventId('msc4143_member', userId, roomId, validatedInvite.invite.slot_id),
+        durationMs,
+        content: {
+          slot_id: validatedInvite.invite.slot_id,
+          sticky_key: validatedInvite.invite.slot_id,
+          membership: 'join',
+        },
+      });
+    } else {
+      const inviteStickyId = rtcInviteStickyEventId(
+        invite.senderUserId, roomId, validatedInvite.invite.slot_id
+      );
+      await writeRtcStickyEvent(c.env, {
+        sender: userId,
+        roomId,
+        eventType: MSC4310_DECLINE_EVENT_TYPE,
+        eventId: rtcStickyEventId('msc4310_decline', userId, roomId, inviteId),
+        durationMs,
+        content: {
+          'm.relates_to': { rel_type: 'm.reference', event_id: inviteStickyId },
+          sticky_key: inviteStickyId,
+        },
+      });
+    }
+  }
   return c.json({ success: true, action, updated });
 });
 
@@ -300,13 +398,32 @@ app.post(`${MSC4075_API}/rtc/invites/:inviteId/revoke`, requireAuth(), async (c)
     return c.json({ errcode: 'M_NOT_FOUND', error: 'Invite not found' }, 404);
   }
   const messages = await getRtcToDeviceMessagesBySender(db, userId, MSC4075_INVITE_EVENT_TYPE);
+  const original = messages.find((m) => m.content.invite_id === inviteId);
+  const roomId = original && typeof original.content.room_id === 'string'
+    ? original.content.room_id
+    : undefined;
+  if (original && roomId) {
+    const validatedInvite = validateRtcInvite(original.content);
+    if (validatedInvite.ok) {
+      // An empty invite with the same sticky_key overwrites the sticky row,
+      // inactivating the invite for every recipient (MSC4075 withdrawal).
+      await writeRtcStickyEvent(c.env, {
+        sender: userId,
+        roomId,
+        eventType: MSC4075_INVITE_EVENT_TYPE,
+        eventId: rtcInviteStickyEventId(userId, roomId, validatedInvite.invite.slot_id),
+        durationMs: remainingStickyDuration(validatedInvite.invite, Date.now()),
+        content: { sticky_key: validatedInvite.invite.slot_id },
+      });
+    }
+  }
   const recipients = new Set(
     messages
       .filter((m) => m.content.invite_id === inviteId)
       .map((m) => m.recipientUserId)
       .filter((id): id is string => typeof id === 'string')
   );
-  // Sticky-event withdrawal is an empty invite with the same sticky_key.
+  // Legacy to-device withdrawal for clients that do not read sticky events.
   for (const recipient of recipients) {
     const message = messages.find((m) => m.content.invite_id === inviteId && m.recipientUserId === recipient);
     if (!message) continue;

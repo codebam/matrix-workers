@@ -26,6 +26,7 @@ vi.mock('../src/middleware/auth', () => ({
 import rtcApp, {
   MSC4075_INVITE_EVENT_TYPE,
   MSC4310_DECLINE_EVENT_TYPE,
+  rtcInviteStickyEventId,
   applyMsc4576DataPublishGate,
   evaluateLiveKitPublishRights,
   getRtcInviteExpiresAt,
@@ -65,6 +66,8 @@ function createDb(opts: {
   const messages: Message[] = [];
   const powerLevels = opts.powerLevels ?? null;
   const updates: unknown[][] = [];
+  const stickyRows: Array<{ user_id: string; room_id: string; event_type: string; content: string }> = [];
+  const accountDataChanges: unknown[][] = [];
 
   const db = {
     streamPositions,
@@ -72,6 +75,8 @@ function createDb(opts: {
     memberships,
     messages,
     updates,
+    stickyRows,
+    accountDataChanges,
     prepare(sql: string) {
       return {
         bind(...args: unknown[]) {
@@ -86,6 +91,9 @@ function createDb(opts: {
                 const name = args[0] as string;
                 streamPositions[name] = (streamPositions[name] ?? 0) + 1;
                 return { position: streamPositions[name] } as T;
+              }
+              if (sql.includes('SELECT position FROM stream_positions')) {
+                return { position: streamPositions[args[0] as string] ?? 1 } as T;
               }
               if (sql.includes('FROM room_memberships')) {
                 const [roomId, userId] = args as string[];
@@ -140,6 +148,25 @@ function createDb(opts: {
               return { results: [] as T[] };
             },
             async run() {
+              if (sql.includes('UPDATE stream_positions')) {
+                const name = args[0] as string;
+                streamPositions[name] = (streamPositions[name] ?? 0) + 1;
+                return { meta: { changes: 1 } };
+              }
+              if (sql.includes('INSERT INTO account_data_changes')) {
+                accountDataChanges.push(args);
+                return { meta: { changes: 1 } };
+              }
+              if (sql.includes('INSERT INTO account_data')) {
+                const [userId, roomId, eventType, content] = args as string[];
+                const existing = stickyRows.findIndex((r) =>
+                  r.user_id === userId && r.room_id === roomId && r.event_type === eventType
+                );
+                const row = { user_id: userId, room_id: roomId, event_type: eventType, content };
+                if (existing >= 0) stickyRows[existing] = row;
+                else stickyRows.push(row);
+                return { meta: { changes: 1 } };
+              }
               if (sql.includes('INSERT INTO to_device_messages')) {
                 const [recipient, device, sender, eventType, content, messageId, position] = args as [
                   string, string, string, string, string, string, number,
@@ -437,6 +464,112 @@ describe('MSC4075 invite routes', () => {
     expect(withdrawals.length).toBeGreaterThan(0);
     expect(JSON.parse(withdrawals[withdrawals.length - 1].content).sticky_key).toBe(SLOT);
     expect((await request(env, `${LIST}/nope/revoke`, jsonInit('POST'))).status).toBe(404);
+  });
+});
+
+describe('MSC4075 sticky room events', () => {
+  function stickyRow(db: ReturnType<typeof createDb>, eventId: string) {
+    return db.stickyRows.find((row) => row.event_type.endsWith(eventId));
+  }
+
+  it('writes a room-scoped sticky invite with the full lifetime duration', async () => {
+    const db = createDb();
+    const res = await request(createEnv(db), SEND, jsonInit('POST', {
+      room_id: ROOM,
+      slot_id: SLOT,
+      lifetime: 90_000,
+      sender_ts: NOW,
+      invite_id: 'invite-sticky',
+      'm.mentions': { user_ids: [BOB] },
+    }));
+    expect(res.status).toBe(200);
+    expect(db.stickyRows).toHaveLength(1);
+    const row = db.stickyRows[0];
+    expect(row.user_id).toBe(USER);
+    expect(row.room_id).toBe(ROOM);
+    expect(row.event_type).toBe(
+      `org.matrix.msc4354.sticky.${rtcInviteStickyEventId(USER, ROOM, SLOT)}`
+    );
+    const record = JSON.parse(row.content);
+    expect(record).toMatchObject({
+      event_id: rtcInviteStickyEventId(USER, ROOM, SLOT),
+      type: MSC4075_INVITE_EVENT_TYPE,
+      sender: USER,
+      room_id: ROOM,
+      origin_server_ts: NOW,
+      duration_ms: 90_000,
+    });
+    expect(record.content).toMatchObject({
+      slot_id: SLOT, sticky_key: SLOT, invite_id: 'invite-sticky', room_id: ROOM,
+    });
+    expect(db.accountDataChanges).toHaveLength(1);
+  });
+
+  it('overwrites the sticky row for a repeated invite to the same slot', async () => {
+    const db = createDb();
+    const env = createEnv(db);
+    for (const inviteId of ['invite-a', 'invite-b']) {
+      const res = await request(env, SEND, jsonInit('POST', {
+        room_id: ROOM, slot_id: SLOT, lifetime: 60_000, sender_ts: NOW,
+        invite_id: inviteId, 'm.mentions': { user_ids: [BOB] },
+      }));
+      expect(res.status).toBe(200);
+    }
+    expect(db.stickyRows).toHaveLength(1);
+    expect(JSON.parse(db.stickyRows[0].content).content.invite_id).toBe('invite-b');
+  });
+
+  it('writes a sticky decline referencing the invite event', async () => {
+    const db = createDb();
+    const env = createEnv(db);
+    await request(env, SEND, jsonInit('POST', {
+      room_id: ROOM, slot_id: SLOT, lifetime: 90_000, sender_ts: NOW,
+      invite_id: 'invite-decline', 'm.mentions': { user_ids: [BOB] },
+    }));
+    db.messages[0].recipient_user_id = USER;
+    const res = await request(env, `${LIST}/invite-decline/ack`, jsonInit('POST', { action: 'decline' }));
+    expect(res.status).toBe(200);
+
+    const inviteStickyId = rtcInviteStickyEventId(USER, ROOM, SLOT);
+    const declineRow = db.stickyRows.find((row) => JSON.parse(row.content).type === MSC4310_DECLINE_EVENT_TYPE);
+    expect(declineRow).toBeDefined();
+    expect(JSON.parse(declineRow!.content).content).toEqual({
+      'm.relates_to': { rel_type: 'm.reference', event_id: inviteStickyId },
+      sticky_key: inviteStickyId,
+    });
+    expect(stickyRow(db, inviteStickyId)).toBeDefined();
+  });
+
+  it('writes a sticky member event when the invite is accepted', async () => {
+    const db = createDb();
+    const env = createEnv(db);
+    await request(env, SEND, jsonInit('POST', {
+      room_id: ROOM, slot_id: SLOT, lifetime: 90_000, sender_ts: NOW,
+      invite_id: 'invite-accept', 'm.mentions': { user_ids: [BOB] },
+    }));
+    db.messages[0].recipient_user_id = USER;
+    const res = await request(env, `${LIST}/invite-accept/ack`, jsonInit('POST', { action: 'accept' }));
+    expect(res.status).toBe(200);
+    const memberRow = db.stickyRows.find((row) => JSON.parse(row.content).type === 'org.matrix.msc4143.rtc.member');
+    expect(memberRow).toBeDefined();
+    expect(JSON.parse(memberRow!.content).content).toMatchObject({
+      slot_id: SLOT, sticky_key: SLOT, membership: 'join',
+    });
+  });
+
+  it('withdraws a sticky invite by overwriting it with empty content', async () => {
+    const db = createDb();
+    const env = createEnv(db);
+    await request(env, SEND, jsonInit('POST', {
+      room_id: ROOM, slot_id: SLOT, lifetime: 90_000, sender_ts: NOW,
+      invite_id: 'invite-revoke', 'm.mentions': { user_ids: [BOB] },
+    }));
+    const res = await request(env, `${LIST}/invite-revoke/revoke`, jsonInit('POST'));
+    expect(res.status).toBe(200);
+    expect(db.stickyRows).toHaveLength(1);
+    const record = JSON.parse(db.stickyRows[0].content);
+    expect(record.event_id).toBe(rtcInviteStickyEventId(USER, ROOM, SLOT));
+    expect(record.content).toEqual({ sticky_key: SLOT });
   });
 });
 
