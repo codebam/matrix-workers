@@ -809,9 +809,14 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       },
     };
 
-    // Get events since last sync
-    const events = await getEventsSince(c.env.DB, roomId, sincePosition);
     const isInitial = !hasSinceToken || fullState;
+    // Initial sync (including a cache clear) must select the NEWEST page of
+    // events. The default ascending query returned the OLDEST 100 rows, so
+    // the 20-event timeline window showed ancient history and the client
+    // appeared to be missing every recent message.
+    const events = isInitial
+      ? await getEventsSince(c.env.DB, roomId, sincePosition, 100, 'desc')
+      : await getEventsSince(c.env.DB, roomId, sincePosition);
 
     // Separate state and timeline events
     let stateEvents: any[] = [];

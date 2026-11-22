@@ -2166,7 +2166,7 @@ describe('GET /sync — multi-room scale edges', () => {
     const { body } = await syncRequest(env, `filter=${filter}`);
     expect(Object.keys((body.rooms as { join: object }).join)).toEqual([target]);
     expect(getEventsSince).toHaveBeenCalledTimes(1);
-    expect(getEventsSince).toHaveBeenCalledWith(env.DB, target, 0);
+    expect(getEventsSince).toHaveBeenCalledWith(env.DB, target, 0, 100, 'desc');
   });
 });
 

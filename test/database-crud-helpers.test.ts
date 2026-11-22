@@ -385,13 +385,16 @@ function createCrudDb(seed: {
               .slice(0, limit);
           } else if (
             sql.includes('stream_ordering > ?') &&
-            sql.includes('ORDER BY stream_ordering ASC')
+            sql.includes('ORDER BY stream_ordering')
           ) {
             const sinceOrFrom = args[1] as number;
             const limit = args[2] as number;
+            const descending = sql.includes('ORDER BY stream_ordering DESC');
             rows = rows
               .filter((e) => e.stream_ordering > sinceOrFrom)
-              .sort((a, b) => a.stream_ordering - b.stream_ordering)
+              .sort((a, b) => descending
+                ? b.stream_ordering - a.stream_ordering
+                : a.stream_ordering - b.stream_ordering)
               .slice(0, limit);
           } else if (sql.includes('ORDER BY stream_ordering DESC')) {
             const limit = args[1] as number;
@@ -1972,6 +1975,23 @@ describe('database stream / batch event helpers', () => {
     expect(defaultLimit).toHaveLength(5);
 
     await expect(getEventsSince(db, ROOM, 100)).resolves.toEqual([]);
+  });
+
+  it('getEventsSince with desc order selects the newest page in ascending order', async () => {
+    const db = createCrudDb({
+      events: [1, 2, 3, 4, 5].map((n) =>
+        eventRowFromPdu(
+          pdu({
+            event_id: `$${n}`,
+            type: 'm.room.message',
+            content: { body: String(n) },
+          }),
+          n
+        )
+      ),
+    });
+    const page = await getEventsSince(db, ROOM, 0, 2, 'desc');
+    expect(page.map((e) => e.event_id)).toEqual(['$4', '$5']);
   });
 
   it('getEventsByIds returns [] for empty input without preparing', async () => {

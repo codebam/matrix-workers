@@ -254,6 +254,29 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe('initial sync timeline window after a cache clear', () => {
+  it('shows the newest events, not the oldest 100-row window', async () => {
+    getUserRooms.mockImplementation(async (_db, _u, m?: string) => (m === 'join' ? [ROOM] : []));
+    const events = Array.from({ length: 25 }, (_, i) =>
+      makePdu({
+        type: 'm.room.message',
+        event_id: `$m${i}`,
+        content: { msgtype: 'm.text', body: `msg-${i}` },
+      })
+    );
+    getEventsSince.mockResolvedValue(events);
+
+    const { status, body } = await syncRequest(createEnv());
+    expect(status).toBe(200);
+    expect(joinOf(body).timeline.events.map((e) => e.event_id)).toEqual(
+      events.slice(-20).map((e) => e.event_id)
+    );
+    expect(getEventsSince).toHaveBeenCalledWith(
+      expect.anything(), ROOM, expect.any(Number), 100, 'desc'
+    );
+  });
+});
+
 describe('sparse-state leftovers — incremental without full_state', () => {
   it('keeps state empty when timeline has only non-state messages', async () => {
     getUserRooms.mockImplementation(async (_db, _u, m?: string) => (m === 'join' ? [ROOM] : []));

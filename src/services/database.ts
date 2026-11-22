@@ -839,14 +839,15 @@ export async function getEventsSince(
   db: D1Database,
   roomId: string,
   since: number,
-  limit: number = 100
+  limit: number = 100,
+  order: 'asc' | 'desc' = 'asc'
 ): Promise<PDU[]> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
      origin_server_ts, unsigned, depth, auth_events, prev_events, redacted_content
      FROM events
      WHERE room_id = ? AND stream_ordering > ?
-     ORDER BY stream_ordering ASC
+     ORDER BY stream_ordering ${order === 'desc' ? 'DESC' : 'ASC'}
      LIMIT ?`
   ).bind(roomId, since, limit).all<{
     event_id: string;
@@ -863,7 +864,7 @@ export async function getEventsSince(
     redacted_content?: string | null;
   }>();
 
-  return result.results.map(r => ({
+  const events = result.results.map(r => ({
     event_id: r.event_id,
     room_id: r.room_id,
     sender: r.sender,
@@ -878,6 +879,9 @@ export async function getEventsSince(
     auth_events: JSON.parse(r.auth_events),
     prev_events: JSON.parse(r.prev_events),
   }));
+  // DESC is used to select the newest page; callers still consume events in
+  // ascending stream order, so restore that order before returning.
+  return order === 'desc' ? events.reverse() : events;
 }
 
 // Batch retrieve events by IDs.
