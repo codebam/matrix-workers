@@ -72,8 +72,10 @@ const memberEvent = {
 
 function createEnv(heldIds: Set<string> = new Set()) {
   const membershipWrites: Array<unknown[]> = [];
+  const queries: string[] = [];
   const db = {
     prepare(sql: string) {
+      queries.push(sql);
       return {
         bind(...args: unknown[]) {
           return {
@@ -105,7 +107,7 @@ function createEnv(heldIds: Set<string> = new Set()) {
     SERVER_NAME: SERVER,
     SERVER_VERSION: 'test',
   };
-  return { env: env as unknown as Env, membershipWrites };
+  return { env: env as unknown as Env, membershipWrites, queries };
 }
 
 beforeEach(() => {
@@ -152,5 +154,20 @@ describe('admin /state backfill preserves resident event IDs', () => {
     expect(res.status).toBe(200);
     expect((storeEventIdempotentMock.mock.calls[0][1] as any).event_id).toBe(legacyCreateId);
     expect(membershipWrites[0][3]).toBe(legacyMemberId);
+  });
+
+  it('anchors /state at the newest room event, not the newest event from one server', async () => {
+    const { env, queries } = createEnv();
+    const res = await admin.request(
+      `http://localhost/admin/api/rooms/${encodeURIComponent(ROOM)}/backfill?server=${RESIDENT}`,
+      { method: 'POST' },
+      env
+    );
+
+    expect(res.status).toBe(200);
+    const anchorQuery = queries.find((sql) => sql.includes('ORDER BY stream_ordering DESC'));
+    expect(anchorQuery).toBeDefined();
+    expect(anchorQuery).toContain('stream_ordering > 0');
+    expect(anchorQuery).not.toContain('sender LIKE');
   });
 });

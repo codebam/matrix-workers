@@ -891,18 +891,24 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           ev.signatures ? JSON.stringify(ev.signatures) : null,
           streamOrdering
         ));
-        if (typeof ev.state_key === 'string') {
-          statements.push(this.env.DB.prepare(
-            `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id) VALUES (?, ?, ?, ?)`
-          ).bind(roomId, String(ev.type), ev.state_key, String(ev.event_id)));
-        }
-        const membership = (ev.content as { membership?: unknown } | undefined)?.membership;
-        if (ev.type === 'm.room.member' && typeof ev.state_key === 'string'
-          && ['join', 'invite', 'leave', 'ban', 'knock'].includes(String(membership))) {
-          statements.push(this.env.DB.prepare(
-            `INSERT INTO room_memberships (room_id, user_id, membership, event_id) VALUES (?, ?, ?, ?)
-             ON CONFLICT(room_id, user_id) DO UPDATE SET membership = excluded.membership, event_id = excluded.event_id`
-          ).bind(roomId, ev.state_key, String(membership), String(ev.event_id)));
+        // Only a CURRENT-STATE snapshot may replace room_state/room_memberships.
+        // Real timeline backfill legitimately contains historical membership
+        // events (old joins/leaves); promoting those to current state makes
+        // checkEventAuth reject the sender's live messages as "not joined".
+        if (stateOnly) {
+          if (typeof ev.state_key === 'string') {
+            statements.push(this.env.DB.prepare(
+              `INSERT OR REPLACE INTO room_state (room_id, event_type, state_key, event_id) VALUES (?, ?, ?, ?)`
+            ).bind(roomId, String(ev.type), ev.state_key, String(ev.event_id)));
+          }
+          const membership = (ev.content as { membership?: unknown } | undefined)?.membership;
+          if (ev.type === 'm.room.member' && typeof ev.state_key === 'string'
+            && ['join', 'invite', 'leave', 'ban', 'knock'].includes(String(membership))) {
+            statements.push(this.env.DB.prepare(
+              `INSERT INTO room_memberships (room_id, user_id, membership, event_id) VALUES (?, ?, ?, ?)
+               ON CONFLICT(room_id, user_id) DO UPDATE SET membership = excluded.membership, event_id = excluded.event_id`
+            ).bind(roomId, ev.state_key, String(membership), String(ev.event_id)));
+          }
         }
       });
       await this.env.DB.batch(statements);

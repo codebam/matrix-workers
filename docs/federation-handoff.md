@@ -5,6 +5,26 @@ user-verified (see "GNU/Linux live status"); sessions 2-4 closed four stacked
 root causes. Session 5 (2026-11-20) shipped the next feature set: native bots
 (see docs below).
 
+## 2026-11-22: stale room_state silently dropped live federation traffic
+
+In `!6oudZq5zJjAyrxL2uY:0upti.me` ("Nix / NixOS"), messages from
+`@magic_rb:matrix.redalder.org`, `@vectorialmelonrobot:matrix.org`,
+`@k900:0upti.me`, `@lkib:tchncs.de` and many others were stored by peers but
+rejected on receipt here with `Sender is not joined to the room`. Prod's
+`room_state` held only 1599 rows versus the peer's 4882, with ancient
+membership pointers (e.g. a depth-2 `@k900:0upti.me` join from room creation
+and a stale `@magic_rb` leave); `processed_pdus` records the rejection spike
+across many origins. Signed peer `/backfill` and `/state_ids` probes provided
+the authoritative IDs. Live repair: re-synced `room_state`/`room_memberships`
+from the peer's current state, restored 589 missing timeline events from
+backfill, and pruned the six restored redactions' targets. Code fix: the admin
+`/rooms/:id/backfill` route now anchors `/state` at the newest room event
+instead of the newest event authored by one server (an old founding event used
+to serve an old membership snapshot), and RoomJoinWorkflow's bulk store no
+longer promotes historical backfill state into `room_state`. Regression tests
+in `test/federation-admin-backfill-remote-ids.test.ts` and
+`test/room-join-workflow-concurrent-race-leftovers.test.ts`.
+
 ## What this session found and fixed (all pushed to origin/main)
 
 ### 1. prod→dev federation was dead: same-zone fetch 522 (fixed, live)

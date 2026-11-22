@@ -3210,11 +3210,21 @@ app.post('/admin/api/rooms/:roomId/backfill', requireAuth(), requireAdmin, async
   let members = 0;
   const diag: Record<string, unknown> = {};
   // Synapse's federation /state requires ?event_id= an event the TARGET server
-  // knows; use one authored by that server. There is no /members federation
-  // endpoint — current members come from /state.
-  const latest = await db.prepare(
-    `SELECT event_id FROM events WHERE room_id = ? AND sender LIKE ? ORDER BY stream_ordering DESC LIMIT 1`
-  ).bind(roomId, `%:${server}`).first<{ event_id: string }>();
+  // knows; any resident event works. Prefer the newest timeline event in the
+  // room regardless of author: anchoring at the newest event authored by
+  // `server` can select a years-old event (e.g. a founding member's join),
+  // and /state then returns THAT point's membership snapshot, silently
+  // replacing current members with stale joins/leaves. That stale state makes
+  // /send reject live messages with "Sender is not joined to the room".
+  // There is no /members federation endpoint — current members come from /state.
+  let latest = await db.prepare(
+    `SELECT event_id FROM events WHERE room_id = ? AND stream_ordering > 0 ORDER BY stream_ordering DESC LIMIT 1`
+  ).bind(roomId).first<{ event_id: string }>();
+  if (!latest) {
+    latest = await db.prepare(
+      `SELECT event_id FROM events WHERE room_id = ? ORDER BY ABS(stream_ordering) DESC LIMIT 1`
+    ).bind(roomId).first<{ event_id: string }>();
+  }
   const stateUrl = `/_matrix/federation/v1/state/${encodeURIComponent(roomId)}${latest ? `?event_id=${encodeURIComponent(latest.event_id)}` : ''}`;
   const stateResp = await federationGet(server, stateUrl, c.env.SERVER_NAME, db, c.env.CACHE);
   diag.state_status = stateResp.status;

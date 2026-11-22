@@ -907,3 +907,60 @@ describe('room-join: post-join timeline backfill (members but no history bug)', 
     expect(result.success).toBe(true);
   });
 });
+
+describe('room-join: bulk state-store guard', () => {
+  function batchEnv() {
+    const executed: string[] = [];
+    const db = {
+      prepare(sql: string) {
+        return {
+          bind() {
+            return {
+              async first<T>() {
+                return { position: 100 } as T;
+              },
+              async run() {
+                executed.push(sql);
+                return { meta: { changes: 1 } };
+              },
+            };
+          },
+        };
+      },
+      async batch(stmts: Array<{ run: () => Promise<unknown> }>) {
+        for (const stmt of stmts) await stmt.run();
+      },
+    };
+    return { env: { ...createSyncEnv(), DB: db } as never, executed };
+  }
+
+  const historicalMember = {
+    room_id: ROOM,
+    sender: '@bob:remote.example.com',
+    state_key: '@bob:remote.example.com',
+    type: 'm.room.member',
+    content: { membership: 'join' },
+    origin_server_ts: NOW,
+    depth: 8,
+    auth_events: [],
+    prev_events: [],
+  };
+
+  it('does not promote historical backfill events to current room state', async () => {
+    const { env, executed } = batchEnv();
+    await (new RoomJoinWorkflow({} as never, env) as any).storeRemoteStateEventsBulk(
+      [historicalMember], ROOM, '10', false
+    );
+    expect(executed.join('\n')).not.toContain('INTO room_state');
+    expect(executed.join('\n')).not.toContain('INTO room_memberships');
+  });
+
+  it('still writes current-state snapshots to room_state and room_memberships', async () => {
+    const { env, executed } = batchEnv();
+    await (new RoomJoinWorkflow({} as never, env) as any).storeRemoteStateEventsBulk(
+      [historicalMember], ROOM, '10', true
+    );
+    expect(executed.join('\n')).toContain('INTO room_state');
+    expect(executed.join('\n')).toContain('INTO room_memberships');
+  });
+});
