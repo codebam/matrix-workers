@@ -131,69 +131,87 @@ export function isIPLiteral(hostname: string): boolean {
 async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult | null> {
   const wellKnownUrl = `https://${serverName}/.well-known/matrix/server`;
 
-  // Validate URL to prevent SSRF
-  const validation = validateUrl(wellKnownUrl);
-  if (!validation.valid) {
-    console.warn(`Invalid well-known URL for ${serverName}: ${validation.error}`);
-    return null;
-  }
+  for (const bypassCache of [false, true]) {
+    const url = bypassCache ? `${wellKnownUrl}?cachebust=${Date.now()}` : wellKnownUrl;
 
-  try {
-    const response = await fetch(wellKnownUrl, {
-      headers: { Accept: 'application/json' },
-      // 5-minute edge cache (audit 007.6): a long TTL on an attacker-controlled
-      // .well-known amplifies redirects at the delegated target.
-      cf: { cacheTtl: 300, cacheEverything: true },
-    });
-
-    if (!response.ok) {
+    // Validate URL to prevent SSRF
+    const validation = validateUrl(url);
+    if (!validation.valid) {
+      console.warn(`Invalid well-known URL for ${serverName}: ${validation.error}`);
       return null;
     }
 
-    const wellKnown = (await response.json()) as { 'm.server'?: string };
-    const delegatedServer = wellKnown['m.server'];
+    try {
+      const response = await fetch(url, {
+        headers: { Accept: 'application/json' },
+        // 5-minute edge cache (audit 007.6): a long TTL on an attacker-controlled
+        // .well-known amplifies redirects at the delegated target. A malformed
+        // cached body is retried once with a cache-busted URL below.
+        ...(bypassCache
+          ? { cache: 'no-store' as const, cf: { cacheTtl: 0 } }
+          : { cf: { cacheTtl: 300, cacheEverything: true } }),
+      });
 
-    if (!delegatedServer || typeof delegatedServer !== 'string') {
-      return null;
-    }
+      if (!response.ok) {
+        return null;
+      }
 
-    // Validate the delegated server isn't malicious
-    const delegatedUrl = `https://${delegatedServer}/`;
-    const delegatedValidation = validateUrl(delegatedUrl);
-    if (!delegatedValidation.valid) {
-      console.warn(`Invalid delegated server ${delegatedServer}: ${delegatedValidation.error}`);
-      return null;
-    }
+      let wellKnown: { 'm.server'?: string };
+      try {
+        wellKnown = (await response.json()) as { 'm.server'?: string };
+      } catch (error) {
+        // A cached HTML error page is not a discovery result. Retry uncached
+        // before falling through to SRV/direct, which may be the wrong host
+        // for a delegated server and makes its inbound /send fail auth.
+        if (!bypassCache) continue;
+        console.debug(`Well-known lookup failed for ${serverName}:`, error);
+        return null;
+      }
+      const delegatedServer = wellKnown['m.server'];
 
-    // Parse the delegated server for host:port
-    const delegatedPortMatch = delegatedServer.match(/^(.+):(\d+)$/);
-    if (delegatedPortMatch) {
-      const [, host, portStr] = delegatedPortMatch;
+      if (!delegatedServer || typeof delegatedServer !== 'string') {
+        return null;
+      }
+
+      // Validate the delegated server isn't malicious
+      const delegatedUrl = `https://${delegatedServer}/`;
+      const delegatedValidation = validateUrl(delegatedUrl);
+      if (!delegatedValidation.valid) {
+        console.warn(`Invalid delegated server ${delegatedServer}: ${delegatedValidation.error}`);
+        return null;
+      }
+
+      // Parse the delegated server for host:port
+      const delegatedPortMatch = delegatedServer.match(/^(.+):(\d+)$/);
+      if (delegatedPortMatch) {
+        const [, host, portStr] = delegatedPortMatch;
+        return {
+          host: host,
+          port: parseInt(portStr, 10),
+          tlsHostname: host,
+        };
+      }
+
+      // No port specified, continue discovery on the delegated name
+      // Check SRV records for the delegated server
+      const srvResult = await trySRVRecords(delegatedServer);
+      if (srvResult) {
+        return srvResult;
+      }
+
+      // Default to port 8448
       return {
-        host: host,
-        port: parseInt(portStr, 10),
-        tlsHostname: host,
+        host: delegatedServer,
+        port: 8448,
+        tlsHostname: delegatedServer,
       };
+    } catch (error) {
+      // Well-known not available or invalid
+      console.debug(`Well-known lookup failed for ${serverName}:`, error);
+      return null;
     }
-
-    // No port specified, continue discovery on the delegated name
-    // Check SRV records for the delegated server
-    const srvResult = await trySRVRecords(delegatedServer);
-    if (srvResult) {
-      return srvResult;
-    }
-
-    // Default to port 8448
-    return {
-      host: delegatedServer,
-      port: 8448,
-      tlsHostname: delegatedServer,
-    };
-  } catch (error) {
-    // Well-known not available or invalid
-    console.debug(`Well-known lookup failed for ${serverName}:`, error);
-    return null;
   }
+  return null;
 }
 
 /**

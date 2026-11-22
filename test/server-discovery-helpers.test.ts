@@ -329,6 +329,29 @@ describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
     ]);
   });
 
+  it('retries a malformed cached well-known body with a cache-busted URL', async () => {
+    const urls: string[] = [];
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
+      urls.push(url);
+      if (String(url).includes('/.well-known/matrix/server')) {
+        if (String(url).includes('cachebust=')) {
+          return new Response(JSON.stringify({ 'm.server': 'delegated.example.com:8443' }), { status: 200 });
+        }
+        return new Response('<!doctype html><html>stale cache</html>', { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    });
+
+    const result = await discoverServer('origin.example.com');
+    expect(result).toEqual({
+      host: 'delegated.example.com',
+      port: 8443,
+      tlsHostname: 'delegated.example.com',
+    });
+    expect(urls[0]).not.toContain('cachebust=');
+    expect(urls[1]).toContain('cachebust=');
+  });
+
   it('rejects malicious well-known delegates and falls through to default 8448', async () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation(async (url: string) => {
       if (String(url).includes('/.well-known/matrix/server')) {
