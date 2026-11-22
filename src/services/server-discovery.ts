@@ -156,15 +156,16 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
         return null;
       }
 
+      const body = await response.text();
       let wellKnown: { 'm.server'?: string };
       try {
-        wellKnown = (await response.json()) as { 'm.server'?: string };
+        wellKnown = JSON.parse(body) as { 'm.server'?: string };
       } catch (error) {
         // A cached HTML error page is not a discovery result. Retry uncached
         // before falling through to SRV/direct, which may be the wrong host
         // for a delegated server and makes its inbound /send fail auth.
         if (!bypassCache) continue;
-        console.debug(`Well-known lookup failed for ${serverName}:`, error);
+        console.debug(`Well-known lookup failed for ${serverName}:`, error, body.slice(0, 200));
         return null;
       }
       const delegatedServer = wellKnown['m.server'];
