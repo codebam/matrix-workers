@@ -10,6 +10,19 @@ import { requireAuth } from '../middleware/auth';
 
 const app = new Hono<AppEnv>();
 
+// The events table has no dedicated relation columns; relations live in the
+// event content. Derive them so the queries below work against the real prod
+// schema (the alias names are kept so callers/tests read the same shape).
+const EVENTS_WITH_RELATIONS = `(
+  SELECT e0.*,
+    COALESCE(
+      json_extract(e0.content, '$.m.relates_to.event_id'),
+      json_extract(e0.content, '$.m.relates_to."m.in_reply_to".event_id')
+    ) AS relates_to_event_id,
+    json_extract(e0.content, '$.m.relates_to.rel_type') AS relation_type
+  FROM events e0
+)`;
+
 // ============================================
 // Types
 // ============================================
@@ -53,7 +66,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId', requireAuth(), as
   // Query relations
   let query = `
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
-    FROM events e
+    FROM ${EVENTS_WITH_RELATIONS} e
     WHERE e.room_id = ? AND e.relates_to_event_id = ?
   `;
   const params: any[] = [roomId, eventId];
@@ -124,7 +137,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType', requireA
   // Query relations by type
   const results = await db.prepare(`
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
-    FROM events e
+    FROM ${EVENTS_WITH_RELATIONS} e
     WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
     LIMIT ?
@@ -182,7 +195,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/relations/:eventId/:relType/:eventType
   // Query relations by type and event type
   const results = await db.prepare(`
     SELECT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
-    FROM events e
+    FROM ${EVENTS_WITH_RELATIONS} e
     WHERE e.room_id = ? AND e.relates_to_event_id = ? AND e.relation_type = ? AND e.event_type = ?
     ORDER BY e.origin_server_ts ${dir === 'b' ? 'DESC' : 'ASC'}
     LIMIT ?
@@ -237,9 +250,9 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
   // Find thread roots (events that have replies with m.thread relation)
   let query = `
     SELECT DISTINCT e.event_id, e.event_type, e.sender, e.origin_server_ts, e.content, e.redacted_content
-    FROM events e
+    FROM ${EVENTS_WITH_RELATIONS} e
     WHERE e.room_id = ? AND e.event_id IN (
-      SELECT DISTINCT relates_to_event_id FROM events
+      SELECT DISTINCT relates_to_event_id FROM ${EVENTS_WITH_RELATIONS}
       WHERE room_id = ? AND relation_type = 'm.thread'
     )
   `;
@@ -247,7 +260,7 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
 
   if (include === 'participated') {
     query += ` AND (e.sender = ? OR EXISTS (
-      SELECT 1 FROM events r WHERE r.relates_to_event_id = e.event_id AND r.sender = ?
+      SELECT 1 FROM ${EVENTS_WITH_RELATIONS} r WHERE r.relates_to_event_id = e.event_id AND r.sender = ?
     ))`;
     params.push(userId, userId);
   }

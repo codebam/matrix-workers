@@ -2671,7 +2671,7 @@ describe('forget / redact / context / joined_members / room aliases', () => {
       sender: USER,
       event_type: 'm.room.message',
       type: 'm.room.message',
-      content: JSON.stringify({ body: 'mid', msgtype: 'm.text' }),
+      content: { body: 'mid', msgtype: 'm.text' },
       origin_server_ts: NOW,
       state_key: null,
     });

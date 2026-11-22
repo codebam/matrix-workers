@@ -434,6 +434,17 @@ describe('relations GET all relations', () => {
     expect(relQuery?.args[relQuery.args.length - 1]).toBe(51);
   });
 
+  it('derives relations from event JSON, not nonexistent event columns', async () => {
+    const db = createRelationsDb({
+      memberships: [joinMember()],
+      events: [child({ event_id: '$a', origin_server_ts: 1 })],
+    });
+    await request(db, base, { headers: { Authorization: 'Bearer t' } });
+    const relQuery = db.selects.find((s) => s.sql.includes('relates_to_event_id'));
+    expect(relQuery?.sql).toContain('json_extract');
+    expect(relQuery?.sql).toContain('$.m.relates_to.event_id');
+  });
+
   it('clamps absurd limit query to 100 (+1 fetch)', async () => {
     const db = createRelationsDb({
       memberships: [joinMember()],

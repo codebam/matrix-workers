@@ -3442,11 +3442,16 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     ORDER BY origin_server_ts ASC LIMIT ?
   `).bind(roomId, targetEvent.origin_server_ts, afterLimit).all();
 
-  // Format events
+  // Format events. getEvent returns already-parsed content while raw D1 rows
+  // carry JSON text; accepting both avoids "[object Object]" parse 500s.
+  const parseContent = (raw: unknown) => {
+    if (raw == null) return {};
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+  };
   const formatEvent = (e: any) => ({
     type: e.event_type,
     state_key: e.state_key,
-    content: JSON.parse(e.redacted_content || e.content || '{}'),
+    content: parseContent(e.redacted_content || e.content || '{}'),
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,
@@ -3458,7 +3463,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
   const stateEvents = state.map(e => ({
     type: e.type,
     state_key: e.state_key,
-    content: e.content,
+    content: parseContent(e.content),
     sender: e.sender,
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,
