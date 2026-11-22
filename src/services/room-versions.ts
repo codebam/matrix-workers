@@ -1,6 +1,12 @@
 // Room Version Registry
 // Maps each Matrix room version to its specific behaviors per the spec
 
+import {
+  MSC4583_ROOM_VERSION,
+  MSC4583_ROOM_VERSION_BEHAVIOR,
+  msc4583ComputeRedactedContent,
+} from '../api/msc4583';
+
 export type StateResolutionAlgorithm = 'v1' | 'v2';
 export type EventIdFormat = 'v1' | 'v3' | 'v4';
 export type RedactionAlgorithm = 'v1' | 'v11';
@@ -187,6 +193,7 @@ const ROOM_VERSIONS: Record<string, RoomVersionBehavior> = {
     knockRestrictedSupported: true,
     stable: true,
   },
+  [MSC4583_ROOM_VERSION]: MSC4583_ROOM_VERSION_BEHAVIOR,
 };
 
 /** Get room version behavior. Returns null for unsupported versions. */
@@ -270,6 +277,9 @@ export function computeRedactedContent(
 ): Record<string, unknown> {
   const behavior = getRoomVersion(roomVersion || '10');
   if (!behavior || !content || typeof content !== 'object') return {};
+  if (roomVersion === MSC4583_ROOM_VERSION) {
+    return msc4583ComputeRedactedContent(eventType, content);
+  }
   const keys = redactionContentKeys(eventType, behavior);
   const out: Record<string, unknown> = {};
   for (const key of keys) {

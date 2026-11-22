@@ -4,6 +4,7 @@
 import type { PDU, RoomPowerLevelsContent, RoomJoinRulesContent, RoomMemberContent } from '../types';
 import { getRoomVersion, type RoomVersionBehavior } from './room-versions';
 import { isMsc4291RoomVersion } from '../utils/event-signing';
+import { MSC4583_ROOM_VERSION, msc4583RequiredPowerLevel } from '../api/msc4583';
 
 export interface AuthResult {
   allowed: boolean;
@@ -431,7 +432,9 @@ function checkStateEventPower(
 ): AuthResult {
   const powerLevels = getPowerLevels(state);
   const senderPower = getEffectiveUserPowerLevel(powerLevels, event.sender, getState(state, 'm.room.create'));
-  const requiredPower = getEventPowerLevel(powerLevels, event.type, true);
+  const requiredPower = versionBehavior.version === MSC4583_ROOM_VERSION
+    ? msc4583RequiredPowerLevel(powerLevels, event.type, true)
+    : getEventPowerLevel(powerLevels, event.type, true);
 
   if (senderPower < requiredPower) {
     return {
@@ -464,6 +467,9 @@ function checkPowerLevelChange(
     const allValues = [
       newPl.ban, newPl.events_default, newPl.invite, newPl.kick,
       newPl.redact, newPl.state_default, newPl.users_default,
+      ...(versionBehavior.version === MSC4583_ROOM_VERSION
+        ? [(newPl as RoomPowerLevelsContent & { state_minimum?: number }).state_minimum]
+        : []),
       ...(newPl.events ? Object.values(newPl.events) : []),
       ...(newPl.users ? Object.values(newPl.users) : []),
       newPl.notifications?.room,
@@ -526,6 +532,9 @@ function checkPowerLevelChange(
     checkLevel(newPl.redact),
     checkLevel(newPl.state_default),
     checkLevel(newPl.users_default),
+    ...(versionBehavior.version === MSC4583_ROOM_VERSION
+      ? [checkLevel((newPl as RoomPowerLevelsContent & { state_minimum?: number }).state_minimum)]
+      : []),
   ];
 
   for (const check of checks) {

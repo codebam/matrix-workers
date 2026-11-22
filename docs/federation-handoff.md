@@ -961,3 +961,44 @@ change to answer server offers, which unmodified Element Web cannot do.
 - dev (`dev.codebam.ca`): experimental shim deployed (stable connect + publish;
   no two-way calls).
 - Full suite green at the end of the investigation: 378 files / 45,894 tests.
+
+## Session 15: v1.20 MSC wave — wiring the deferred parts (2026-11-21)
+
+The six MSCs on the v1.20 watch list were **already implemented in `main`** by
+earlier commits (MSC4480 `38386b2`, MSC4388 `09ad111`, MSC4075/MSC4576
+`a9cf540`, MSC4583/4584 `a1edff4`). The MSC4583/4584 commit explicitly
+deferred registration/wiring, so this session closed the remaining integration
+gaps rather than reimplementing them:
+
+- **MSC4584** (soft-ignoring): mounted `src/api/msc4584.ts` in `src/index.ts`
+  BEFORE the generic account-data app, so the unstable
+  `net.f0rest.msc4584.soft_ignore_config` write path validates input instead
+  of being swallowed by the generic route. Mount order is covered by
+  `test/msc4584-route-mount.test.ts` (invalid config → 400 M_INVALID_PARAM).
+- **MSC4583** (minimum state power): registered `dev.zirco.msc4583.v1` in the
+  room-version registry (v12 behaviour, `stable: false`), advertised it as
+  `unstable` in `/capabilities`, added it to createRoom/upgrade and all three
+  join/federation supported-version lists, and wired `state_minimum` into the
+  state-event auth rule (`checkStateEventPower`), power-level integer/escalation
+  checks, and redaction content (preserves `state_minimum`). Pinned registry,
+  capability and join-template tests were refreshed for the 13th version.
+  New contract coverage: `test/msc4583-wiring.test.ts`.
+- **MSC4075** (RTC invites): added the two default override push rules
+  (`.org.matrix.msc4075.rule.rtc.invite_for_me` / `_for_room`) ahead of the
+  mention rules, with ring actions and the per-user mention placeholder.
+  Ordering and actions pinned in `test/push-api-routes.test.ts`.
+- **HITL**: the MSC4583 auth-rule change touches event authorization — human
+  review advised before deploy. No migrations, no secrets, no federation key
+  handling, no wrangler config changes. Nothing was deployed by this session.
+
+Verification: `npm run typecheck` clean; `npm test` 443 files / 46,379 tests
+green; `npm run lint` 0 errors (pre-existing warnings); `npm run worker:check`
+dry-run succeeded.
+
+Still not conformant (tracked, not changed here): MSC4075 invites still travel
+over the unstable to-device API rather than as sticky room events, although the
+MSC4354 sticky store now exists; the two temporary federation quirks from
+session 13 (local receipt ts for inbound receipts) were verified already fixed
+in current code, as was the `get_missing_events` catchup no-op and
+`m.signing_key_update` stub noted in earlier sessions — those sections of this
+handoff are stale.

@@ -10,6 +10,7 @@ import { requireAuth } from '../middleware/auth';
 import { generateRoomId, generateEventId, generateDeterministicEventId, formatRoomAlias, generateOpaqueId, parseUserId } from '../utils/ids';
 import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-cache';
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
+import { MSC4583_ROOM_VERSION } from './msc4583';
 import { applyEventRedaction } from '../services/event-redaction';
 import { calculateContentHash, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId } from '../utils/event-signing';
@@ -4005,7 +4006,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/timestamp_to_event', requireAuth(), as
 // ============================================
 
 // Supported room versions
-const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', MSC4583_ROOM_VERSION];
 
 // POST /_matrix/client/v3/rooms/:roomId/upgrade - Upgrade a room to a new version
 app.post('/_matrix/client/v3/rooms/:roomId/upgrade', requireAuth(), async (c) => {

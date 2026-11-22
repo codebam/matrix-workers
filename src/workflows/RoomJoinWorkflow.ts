@@ -39,12 +39,15 @@ import {
   getRoomPolicyServer,
 } from '../services/policy-server';
 import { validateRemoteJoinTemplate } from './join-template-validation';
+import { MSC4583_ROOM_VERSION } from '../api/msc4583';
 
 // Room versions this homeserver can participate in. make_join must advertise
 // these via ?ver= or resident servers reject modern rooms (e.g. v12) with
 // M_INCOMPATIBLE_ROOM_VERSION. Keep in sync with the federation API's
 // SUPPORTED_ROOM_VERSIONS.
-const SUPPORTED_ROOM_VERSIONS = ['12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1'];
+const SUPPORTED_ROOM_VERSIONS = [
+  '12', '11', '10', '9', '8', '7', '6', '5', '4', '3', '2', '1', MSC4583_ROOM_VERSION,
+];
 
 // Parameters passed when triggering the workflow
 export interface JoinParams {

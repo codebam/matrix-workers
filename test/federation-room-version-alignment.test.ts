@@ -22,7 +22,8 @@ describe('federation room-version module alignment', () => {
   it('treats every make_join-supported version ≥3 as modern for content hashes', () => {
     for (const v of JOIN_SUPPORTED) {
       const n = parseInt(v, 10);
-      expect(isModernRoomVersion(v)).toBe(n >= 3);
+      // Non-numeric custom versions are modern by default (fail-closed).
+      expect(isModernRoomVersion(v)).toBe(Number.isFinite(n) ? n >= 3 : true);
     }
   });
 

@@ -22,12 +22,15 @@ describe('room version registry', () => {
     expect(getRoomVersion('99')).toBeNull();
   });
 
-  it('marks all registered versions stable for clients', () => {
+  it('marks stable versions stable and MSC4583 unstable for clients', () => {
     const supported = getSupportedRoomVersions();
-    expect(Object.keys(supported).sort((a, b) => Number(a) - Number(b))).toEqual(
-      Array.from({ length: 12 }, (_, i) => String(i + 1))
-    );
-    expect(Object.values(supported).every((s) => s === 'stable')).toBe(true);
+    expect(Object.keys(supported).sort((a, b) => Number(a) - Number(b))).toEqual([
+      ...Array.from({ length: 12 }, (_, i) => String(i + 1)),
+      'dev.zirco.msc4583.v1',
+    ]);
+    for (const [version, status] of Object.entries(supported)) {
+      expect(status).toBe(version === 'dev.zirco.msc4583.v1' ? 'unstable' : 'stable');
+    }
   });
 
   it('tracks capability gates across versions', () => {

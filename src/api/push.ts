@@ -108,6 +108,18 @@ const DEFAULT_OVERRIDE_RULES: PushRule[] = [
     actions: [],
   },
   {
+    // MSC4075 (unstable prefix): ringing notification for an RTC invite that
+    // mentions the user. Kept before .m.rule.is_user_mention per the MSC.
+    rule_id: '.org.matrix.msc4075.rule.rtc.invite_for_me',
+    default: true,
+    enabled: true,
+    conditions: [
+      { kind: 'event_property_is', key: 'type', value: 'org.matrix.msc4075.rtc.notification' },
+      { kind: 'event_property_contains', key: 'content.m\\.mentions.user_ids', value: '' }, // user_id placeholder
+    ],
+    actions: ['notify', { set_tweak: 'sound', value: 'ring' }],
+  },
+  {
     rule_id: '.m.rule.is_user_mention',
     default: true,
     enabled: true,
@@ -122,6 +134,19 @@ const DEFAULT_OVERRIDE_RULES: PushRule[] = [
     enabled: true,
     conditions: [{ kind: 'contains_display_name' }],
     actions: ['notify', { set_tweak: 'sound', value: 'default' }, { set_tweak: 'highlight', value: true }],
+  },
+  {
+    // MSC4075 (unstable prefix): ringing notification for an RTC invite that
+    // mentions the room. Kept before .m.rule.is_room_mention per the MSC.
+    rule_id: '.org.matrix.msc4075.rule.rtc.invite_for_room',
+    default: true,
+    enabled: true,
+    conditions: [
+      { kind: 'event_property_is', key: 'type', value: 'org.matrix.msc4075.rtc.notification' },
+      { kind: 'event_property_is', key: 'content.m\\.mentions.room', value: true },
+      { kind: 'sender_notification_permission', key: 'room' },
+    ],
+    actions: ['notify', { set_tweak: 'sound', value: 'ring' }],
   },
   {
     rule_id: '.m.rule.is_room_mention',
@@ -271,7 +296,8 @@ function getDefaultRulesForUser(userId: string): {
         c.key === 'state_key' ? { ...c, pattern: userId } : { ...c }
       );
     }
-    if (r.rule_id === '.m.rule.is_user_mention' && r.conditions) {
+    if ((r.rule_id === '.m.rule.is_user_mention' ||
+         r.rule_id === '.org.matrix.msc4075.rule.rtc.invite_for_me') && r.conditions) {
       r.conditions = r.conditions.map(c =>
         c.key?.includes('user_ids') ? { ...c, value: userId } : { ...c }
       );

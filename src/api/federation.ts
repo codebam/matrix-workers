@@ -18,6 +18,7 @@ import { checkEventAuth } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, getEvent, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
 import { findServerAcl, isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId } from '../services/server-acl';
 import { getRoomVersion } from '../services/room-versions';
+import { MSC4583_ROOM_VERSION } from './msc4583';
 import { evaluateRestrictedJoin, refreshRestrictedRoomState } from '../services/restricted-joins';
 import { applyEventRedaction } from '../services/event-redaction';
 import {
@@ -129,8 +130,11 @@ import { buildWireJoinState, deriveRoomWireEvents, wireForRoom } from '../servic
 import { checkAuthRules, verifyPdu, type VerifyKey } from '../services/federation-verify';
 import { resolveState } from '../services/state-resolution';
 
-// Supported room versions (v1-v12 per Matrix Spec v1.17)
-const SUPPORTED_ROOM_VERSIONS = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12'];
+// Supported room versions (v1-v12 per Matrix Spec v1.17) plus MSC4583's
+// unstable room version.
+const SUPPORTED_ROOM_VERSIONS = [
+  '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', MSC4583_ROOM_VERSION,
+];
 
 // "Modern" room versions for the purpose of content-hash enforcement.
 // Matrix room versions 3 and later require event integrity via hashes.sha256;

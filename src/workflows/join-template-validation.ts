@@ -1,11 +1,13 @@
 // Pure make_join template checks (no Workflow runtime dependency).
 // Kept separate so unit tests can import without `cloudflare:workers`.
 
-// Supported room versions per Matrix Spec v1.17. Rooms outside this set must be
-// rejected — accepting an unknown version means we can't apply the right auth
-// rules or event format checks.
+import { MSC4583_ROOM_VERSION } from '../api/msc4583';
+
+// Supported room versions per Matrix Spec v1.17, plus the unstable MSC4583
+// room version. Rooms outside this set must be rejected — accepting an unknown
+// version means we can't apply the right auth rules or event format checks.
 export const SUPPORTED_ROOM_VERSIONS = new Set([
-  '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12',
+  '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', MSC4583_ROOM_VERSION,
 ]);
 
 const EVENT_ID_REGEX = /^\$[A-Za-z0-9+/=_\-.]+(:[A-Za-z0-9.\-]+)?$/;

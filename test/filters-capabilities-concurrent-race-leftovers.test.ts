@@ -2037,7 +2037,7 @@ describe('race filter failPut∥capabilities isolation after #232', () => {
 // ---------------------------------------------------------------------------
 
 describe('race capabilities room_versions available exhaustive after #232', () => {
-  const expectedVersions = Array.from({ length: 12 }, (_, v) => String(v + 1));
+  const expectedVersions = [...Array.from({ length: 12 }, (_, v) => String(v + 1)), 'dev.zirco.msc4583.v1'];
 
   for (let i = 0; i < 12; i++) {
     it(`available 1–12 stable bind flood-${i}`, async () => {
@@ -2052,7 +2052,7 @@ describe('race capabilities room_versions available exhaustive after #232', () =
           expectedVersions
         );
         for (const v of expectedVersions) {
-          expect(available[v]).toBe('stable');
+          expect(available[v]).toBe(v === 'dev.zirco.msc4583.v1' ? 'unstable' : 'stable');
         }
         expect((r.body as CapabilitiesBody).capabilities['m.room_versions'].default).toBe('10');
       }
@@ -2077,7 +2077,7 @@ describe('race capabilities room_versions available exhaustive after #232', () =
       const avail0 = (results[0].body as CapabilitiesBody).capabilities['m.room_versions'].available;
       const avail2 = (results[2].body as CapabilitiesBody).capabilities['m.room_versions'].available;
       expect(avail0).toEqual(avail2);
-      expect(Object.keys(avail0)).toHaveLength(12);
+      expect(Object.keys(avail0)).toHaveLength(13);
     });
   }
 });

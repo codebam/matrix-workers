@@ -303,9 +303,11 @@ function expectRoomVersionsStable(capsBody: unknown) {
   };
   expect(rv.default).toBe('10');
   const keys = Object.keys(rv.available).sort((a, b) => Number(a) - Number(b));
-  expect(keys).toEqual(['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12']);
+  expect(keys).toEqual([
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', 'dev.zirco.msc4583.v1',
+  ]);
   for (const k of keys) {
-    expect(rv.available[k]).toBe('stable');
+    expect(rv.available[k]).toBe(k === 'dev.zirco.msc4583.v1' ? 'unstable' : 'stable');
   }
 }
 

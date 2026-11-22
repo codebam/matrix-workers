@@ -117,7 +117,7 @@ describe('validateRemoteJoinTemplate', () => {
         validateRemoteJoinTemplate({ ...validTemplate(), room_version: v }, roomId, userId)
       ).not.toThrow();
     }
-    expect(SUPPORTED_ROOM_VERSIONS.size).toBe(12);
+    expect(SUPPORTED_ROOM_VERSIONS.size).toBe(13);
   });
 
   it('rejects missing content, non-array event ID lists, and negative depth', () => {
@@ -383,6 +383,7 @@ describe('validateRemoteJoinTemplate TOKENMAXX leftovers after #81 (remote join)
       '10',
       '11',
       '12',
+      'dev.zirco.msc4583.v1',
     ]);
   });
 

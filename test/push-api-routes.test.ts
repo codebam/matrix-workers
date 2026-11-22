@@ -1853,8 +1853,9 @@ describe('push API TOKENMAXX integration leftovers after #100/#101', () => {
       '.m.rule.suppress_edits',
       '.m.rule.invite_for_me',
       '.m.rule.member_event',
+      '.org.matrix.msc4075.rule.rtc.invite_for_me',
       '.m.rule.is_user_mention',
-      '.m.rule.contains_display_name',
+      '.org.matrix.msc4075.rule.rtc.invite_for_room',
       '.m.rule.is_room_mention',
       '.m.rule.tombstone',
       '.m.rule.room.server_acl',
@@ -1872,6 +1873,43 @@ describe('push API TOKENMAXX integration leftovers after #100/#101', () => {
     ]) {
       expect(underrideIds).toContain(id);
     }
+  });
+
+  it('MSC4075 RTC invite rules ring and precede the mention rules', async () => {
+    const db = createPushDb();
+    const res = await request(db, '/_matrix/client/v3/pushrules/global', authGet());
+    const ids = res.body.override.map((r: { rule_id: string }) => r.rule_id);
+    expect(ids.indexOf('.org.matrix.msc4075.rule.rtc.invite_for_me')).toBe(
+      ids.indexOf('.m.rule.is_user_mention') - 1
+    );
+    expect(ids.indexOf('.org.matrix.msc4075.rule.rtc.invite_for_room')).toBe(
+      ids.indexOf('.m.rule.is_room_mention') - 1
+    );
+
+    const forMe = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.org.matrix.msc4075.rule.rtc.invite_for_me',
+      authGet()
+    );
+    expect(forMe.body).toMatchObject({
+      default: true,
+      enabled: true,
+      actions: ['notify', { set_tweak: 'sound', value: 'ring' }],
+    });
+    expect(forMe.body.conditions).toEqual([
+      { kind: 'event_property_is', key: 'type', value: 'org.matrix.msc4075.rtc.notification' },
+      { kind: 'event_property_contains', key: 'content.m\\.mentions.user_ids', value: USER },
+    ]);
+
+    const forRoom = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.org.matrix.msc4075.rule.rtc.invite_for_room',
+      authGet()
+    );
+    expect(forRoom.body.actions).toEqual(['notify', { set_tweak: 'sound', value: 'ring' }]);
+    expect(forRoom.body.conditions).toContainEqual({
+      kind: 'sender_notification_permission', key: 'room',
+    });
   });
 
   it('default .m.rule.suppress_edits has empty actions and edit-only conditions', async () => {
@@ -2475,8 +2513,9 @@ describe('pushrules GET :scope/:kind/:ruleId — kind vocab + decode leftovers',
       '.m.rule.suppress_edits',
       '.m.rule.invite_for_me',
       '.m.rule.member_event',
+      '.org.matrix.msc4075.rule.rtc.invite_for_me',
       '.m.rule.is_user_mention',
-      '.m.rule.contains_display_name',
+      '.org.matrix.msc4075.rule.rtc.invite_for_room',
       '.m.rule.is_room_mention',
       '.m.rule.tombstone',
       '.m.rule.room.server_acl',
@@ -4667,7 +4706,7 @@ describe('pushrules before/after relative to hardcoded default rules', () => {
     const ids = get.body.override.map((r: { rule_id: string }) => r.rule_id);
     expect(ids.indexOf('before.edits')).toBe(ids.indexOf('.m.rule.suppress_edits') - 1);
     expect(ids.indexOf('after.edits')).toBe(ids.indexOf('.m.rule.suppress_edits') + 1);
-    expect(ids.indexOf('after.edits')).toBe(ids.indexOf('.m.rule.is_user_mention') - 1);
+    expect(ids.indexOf('after.edits')).toBe(ids.indexOf('.org.matrix.msc4075.rule.rtc.invite_for_me') - 1);
   });
 
   it('repeated after= on the same default keeps the newest rule adjacent', async () => {

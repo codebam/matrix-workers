@@ -22,6 +22,7 @@ import admin from './api/admin';
 import keyBackups from './api/key-backups';
 import toDevice from './api/to-device';
 import push from './api/push';
+import softIgnore from './api/msc4584';
 import accountData from './api/account-data';
 import typing from './api/typing';
 import receipts from './api/receipts';
@@ -140,6 +141,8 @@ app.route('/', keyBackups);
 app.route('/', dehydratedDevice);
 app.route('/', toDevice);
 app.route('/', push);
+// MSC4584's validated write path must win over generic account data.
+app.route('/', softIgnore);
 app.route('/', accountData);
 app.route('/', typing);
 app.route('/', receipts);
@@ -199,6 +202,7 @@ app.get('/_matrix/client/v3/capabilities', optionalAuth(), async (c) => {
           '10': 'stable',
           '11': 'stable',
           '12': 'stable',
+          'dev.zirco.msc4583.v1': 'unstable',
         },
       },
       'm.set_displayname': {
