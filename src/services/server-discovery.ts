@@ -148,7 +148,7 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
         // .well-known amplifies redirects at the delegated target. A malformed
         // cached body is retried once with a cache-busted URL below.
         ...(bypassCache
-          ? { cache: 'no-store' as const, cf: { cacheTtl: 0 } }
+          ? { cache: 'no-store' as const }
           : { cf: { cacheTtl: 300, cacheEverything: true } }),
       });
 

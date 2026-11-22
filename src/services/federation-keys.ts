@@ -39,7 +39,7 @@ async function fetchKeyResponseJson(url: string): Promise<ServerKeyResponse> {
     {
       headers: { Accept: 'application/json' },
       ...(bypassCache
-        ? { cache: 'no-store' as const, cf: { cacheTtl: 0 } }
+        ? { cache: 'no-store' as const }
         : { cf: { cacheTtl: 300, cacheEverything: true } }),
     }
   );
