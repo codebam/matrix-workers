@@ -987,13 +987,21 @@ gaps rather than reimplementing them:
   (`.org.matrix.msc4075.rule.rtc.invite_for_me` / `_for_room`) ahead of the
   mention rules, with ring actions and the per-user mention placeholder.
   Ordering and actions pinned in `test/push-api-routes.test.ts`.
-- **HITL**: the MSC4583 auth-rule change touches event authorization — human
-  review advised before deploy. No migrations, no secrets, no federation key
-  handling, no wrangler config changes. Nothing was deployed by this session.
+- **HITL**: the MSC4583 auth-rule change touches event authorization; the
+  operator explicitly approved push + prod deploy after the review flag was
+  raised. No migrations, no secrets, no federation key handling, no wrangler
+  config changes.
 
 Verification: `npm run typecheck` clean; `npm test` 443 files / 46,379 tests
 green; `npm run lint` 0 errors (pre-existing warnings); `npm run worker:check`
 dry-run succeeded.
+
+Deploy: commit `5dc3bb7` pushed to origin/main; prod
+`matrix-worker-codebam` deployed with Current Version ID
+`9667d799-0bd0-4628-bb52-81af466d4741` (previous `5f44fbc7`). Live-verified:
+`/health` ok, `/_matrix/client/v3/capabilities` reports 13 room versions with
+`dev.zirco.msc4583.v1: unstable`, website root and
+`/_matrix/client/versions` both HTTP 200.
 
 Still not conformant (tracked, not changed here): MSC4075 invites still travel
 over the unstable to-device API rather than as sticky room events, although the
