@@ -1023,6 +1023,13 @@ clients are responsible for encrypting invite content in encrypted rooms.
 Verification: typecheck clean; `npm test` 443 files / 46,384 tests green;
 lint 0 errors; `npm run worker:check` dry-run succeeded. No migrations.
 
+Deploy: commit `2b7057a` pushed to origin/main; prod
+`matrix-worker-codebam` deployed with Current Version ID
+`1265b459-90c7-4cb1-a6d8-26be19601edd` (previous `9667d799-0bd0-4628-bb52-81af466d4741`).
+Live-verified: `/health` ok, `/capabilities` still reports 13 room versions
+with `dev.zirco.msc4583.v1: unstable`, website root and `/_matrix/client/versions`
+HTTP 200, MSC4354 sticky endpoint reachable (401 without a token).
+
 The older handoff notes about the `get_missing_events` catchup no-op,
 `m.signing_key_update` and inbound receipt timestamps being "left open" remain
 stale: all three were verified fixed in code before this session.
