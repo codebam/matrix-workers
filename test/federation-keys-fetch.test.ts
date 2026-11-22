@@ -587,6 +587,24 @@ describe('fetchRawServerKeyResponse TOKENMAXX edge paths after #63', () => {
     );
   });
 
+  it('retries a cached HTML key response with a cache-busted request', async () => {
+    const kv = mockKv();
+    seedDiscovery(kv, 'cached-html.example.com');
+    const body = {
+      server_name: 'cached-html.example.com',
+      valid_until_ts: NOW + 1000,
+      verify_keys: { 'ed25519:1': { key: 'k' } },
+    };
+    const fetchMock = fetch as unknown as ReturnType<typeof vi.fn>;
+    fetchMock
+      .mockResolvedValueOnce(new Response('<!doctype html><html>stale cache</html>', { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+
+    await expect(fetchRawServerKeyResponse('cached-html.example.com', kv)).resolves.toEqual(body);
+    expect(fetchMock.mock.calls[0][0]).not.toContain('cachebust=');
+    expect(fetchMock.mock.calls[1][0]).toContain('cachebust=');
+  });
+
   it('returns null on non-OK HTTP status', async () => {
     const kv = mockKv();
     seedDiscovery(kv, 'httpfail.example.com');

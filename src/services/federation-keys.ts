@@ -28,6 +28,37 @@ interface RemoteServerKey {
 // Cache TTL for remote server keys (5 minutes for KV, longer in D1)
 const KEY_CACHE_TTL = 5 * 60;
 
+/**
+ * Edge cache can serve an HTML error page for a key endpoint after an outage.
+ * Retry malformed/non-OK responses once with a cache-busted no-store fetch so
+ * one cached error cannot make a peer look unavailable and reject its /send.
+ */
+async function fetchKeyResponseJson(url: string): Promise<ServerKeyResponse> {
+  const request = (bypassCache: boolean) => federationFetch(
+    bypassCache ? `${url}?cachebust=${Date.now()}` : url,
+    {
+      headers: { Accept: 'application/json' },
+      ...(bypassCache
+        ? { cache: 'no-store' as const, cf: { cacheTtl: 0 } }
+        : { cf: { cacheTtl: 300, cacheEverything: true } }),
+    }
+  );
+
+  let response = await request(false);
+  if (response.ok) {
+    try {
+      return (await response.json()) as ServerKeyResponse;
+    } catch {
+      // fall through to the uncached retry
+    }
+  }
+  response = await request(true);
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  return (await response.json()) as ServerKeyResponse;
+}
+
 // Maximum staleness for federation signing keys past their valid_until timestamp.
 // Per Matrix spec, keys can be used to verify historical signatures past expiry,
 // but we cap how far past expiry we'll accept a key — beyond this threshold, the
@@ -163,22 +194,7 @@ async function fetchKeysFromRemote(
   const discovery = await discoverServer(serverName, cache);
   const serverUrl = buildServerUrl(discovery);
 
-  const response = await federationFetch(`${serverUrl}/_matrix/key/v2/server`, {
-    headers: {
-      Accept: 'application/json',
-    },
-    cf: {
-      // Cache at edge for 5 minutes
-      cacheTtl: 300,
-      cacheEverything: true,
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} from ${serverName}`);
-  }
-
-  const keyResponse: ServerKeyResponse = await response.json();
+  const keyResponse = await fetchKeyResponseJson(`${serverUrl}/_matrix/key/v2/server`);
 
   // Validate the response has the expected server name
   if (keyResponse.server_name !== serverName) {
@@ -265,21 +281,7 @@ export async function fetchRawServerKeyResponse(
     const discovery = await discoverServer(serverName, cache);
     const serverUrl = buildServerUrl(discovery);
 
-    const response = await federationFetch(`${serverUrl}/_matrix/key/v2/server`, {
-      headers: {
-        Accept: 'application/json',
-      },
-      cf: {
-        cacheTtl: 300,
-        cacheEverything: true,
-      },
-    });
-
-    if (!response.ok) {
-      return null;
-    }
-
-    const keyResponse: ServerKeyResponse = await response.json();
+    const keyResponse = await fetchKeyResponseJson(`${serverUrl}/_matrix/key/v2/server`);
 
     // Validate server name matches
     if (keyResponse.server_name !== serverName) {
