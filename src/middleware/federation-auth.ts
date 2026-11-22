@@ -209,6 +209,21 @@ export function requireFederationAuth() {
 
       return next();
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A D1/KV hiccup during key lookup is an infrastructure failure, not a
+      // bad signature. Returning 401 makes peers treat the transaction as a
+      // permanent auth failure and stop retrying, silently losing events.
+      // 503 tells them to retry once storage recovers.
+      if (/D1_ERROR|overloaded|Stream was cancelled|timeout|timed out/i.test(message)) {
+        console.warn(`Federation auth temporarily unavailable for ${authParams.origin}:`, error);
+        return c.json(
+          {
+            errcode: 'M_UNKNOWN',
+            error: 'Temporary federation verification failure',
+          },
+          503
+        );
+      }
       console.error(`Federation auth error for ${authParams.origin}:`, error);
       return c.json(
         {

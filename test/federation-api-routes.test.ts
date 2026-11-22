@@ -190,6 +190,7 @@ type FedDbOptions = {
   }>;
   deviceKeyChanges?: Array<{ user_id: string; stream_position: number }>;
   failInsert?: boolean;
+  failEventInsert?: boolean;
 };
 
 function stateKey(roomId: string, eventType: string, sk: string) {
@@ -236,6 +237,12 @@ function createFedDb(opts: FedDbOptions = {}) {
     prepare(sql: string) {
       async function runWithArgs(args: unknown[]) {
         inserts.push({ sql, args });
+        if (opts.failEventInsert && (
+          sql.includes('INSERT OR IGNORE INTO events') ||
+          sql.includes("UPDATE stream_positions SET position = position + 1")
+        )) {
+          throw new Error('D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 second window.');
+        }
         if (opts.failInsert) throw new Error('simulated insert failure');
 
         if (sql.includes('INSERT OR REPLACE INTO processed_pdus') || sql.includes('INSERT INTO processed_pdus')) {
@@ -1464,6 +1471,37 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
     const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
     expect(Object.keys(pdus)).toEqual([derivedId]);
     expect(pdus[derivedId].error).toBeUndefined();
+  });
+
+  it('returns 503 and leaves the PDU retryable when event storage fails', async () => {
+    verifyRemoteSignature.mockResolvedValue(true);
+    checkEventAuth.mockReturnValue({ allowed: true });
+    const db = seedBasicRoom({
+      rooms: [{ room_id: ROOM, room_version: '2', is_public: 1, created_at: 1000 }],
+      failEventInsert: true,
+    });
+    const { status, body } = await req(
+      'PUT',
+      '/_matrix/federation/v1/send/txn-store-fail',
+      makeEnv(db),
+      {
+        pdus: [
+          {
+            event_id: '$storefail',
+            room_id: ROOM,
+            sender: REMOTE_USER,
+            type: 'm.room.message',
+            content: { body: 'hello' },
+            signatures: { [FED_ORIGIN]: { 'ed25519:1': 'sig' } },
+          },
+        ],
+      }
+    );
+
+    expect(status).toBe(503);
+    expect(body).toMatchObject({ errcode: 'M_UNKNOWN' });
+    expect(db.processedPdus['$storefail']).toBeUndefined();
+    expect(db.federationTxns[`${FED_ORIGIN}|txn-store-fail`]).toBeUndefined();
   });
 
   it('accepts valid legacy PDU without hash when auth allows', async () => {

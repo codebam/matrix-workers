@@ -865,6 +865,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
   const { pdus, edus } = body;
   const pduResults: Record<string, any> = {};
+  let transientStorageFailure = false;
 
   // Moderation policy lists (spec module): m.ban server rules deny the
   // sending server's PDUs with the same posture as ACL denial. Fetched
@@ -1179,15 +1180,9 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
       }
 
-      // Accept the PDU
-      pduResults[eventId] = {};
-
-      // Record that we processed this PDU
-      await c.env.DB.prepare(
-        `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
-         VALUES (?, ?, ?, ?, 1, NULL)`
-      ).bind(eventId, pduOrigin, roomId, Date.now()).run();
-
+      // Accept the PDU only AFTER it is actually stored (see end of this
+      // block). Marking processed_pdus first made a D1 failure during storage
+      // permanent: the peer's retry was skipped as "already processed".
       // If room exists, store the event
       if (room) {
         try {
@@ -1369,9 +1364,28 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
               }
             }
           }
+
+          // Storage completed: only now is it safe to mark the PDU processed.
+          await c.env.DB.prepare(
+            `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+             VALUES (?, ?, ?, ?, 1, NULL)`
+          ).bind(eventId, pduOrigin, roomId, Date.now()).run();
+          pduResults[eventId] = {};
         } catch (e) {
           console.error(`Failed to store event ${eventId}:`, e);
+          pduResults[eventId] = {
+            error: e instanceof Error ? e.message : 'Transient storage failure',
+          };
+          transientStorageFailure = true;
         }
+      } else {
+        // Unknown room: nothing to store, but acknowledge so peers stop
+        // retrying a PDU we can never place locally.
+        await c.env.DB.prepare(
+          `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
+           VALUES (?, ?, ?, ?, 1, NULL)`
+        ).bind(eventId, pduOrigin, roomId, Date.now()).run();
+        pduResults[eventId] = {};
       }
     } catch (e: any) {
       const eventId = pdu?.event_id || 'unknown';
@@ -1548,6 +1562,14 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
     } catch (e) {
       console.error(`Failed to process EDU:`, e);
     }
+  }
+
+  if (transientStorageFailure) {
+    // Do not cache this transaction: peers must retry it after D1 recovers.
+    return c.json(
+      { errcode: 'M_UNKNOWN', error: 'Temporary storage failure; retry this transaction' },
+      503
+    );
   }
 
   const response = { pdus: pduResults };

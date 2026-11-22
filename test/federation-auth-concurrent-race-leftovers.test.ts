@@ -117,8 +117,8 @@ type VerifyCtl = {
   barrier?: VerifyBarrier;
   flip?: VerifyFlip;
   delayMs?: number;
-  byOrigin?: Map<string, boolean | 'throw'>;
-  defaultResult?: boolean | 'throw';
+  byOrigin?: Map<string, boolean | 'throw' | 'd1'>;
+  defaultResult?: boolean | 'throw' | 'd1';
 };
 
 function installVerify(ctl: VerifyCtl = {}) {
@@ -158,6 +158,9 @@ function installVerify(ctl: VerifyCtl = {}) {
     const mapped = ctl.byOrigin?.get(o);
     const result = mapped ?? ctl.defaultResult ?? true;
     if (result === 'throw') throw new Error(`verify-throw:${o}`);
+    if (result === 'd1') {
+      throw new Error('D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 second window.');
+    }
     return result;
   });
 
@@ -246,6 +249,18 @@ describe('race fed-auth require ok∥fail isolation after #217', () => {
       expect(boomCtx.get('federationOrigin')).toBeUndefined();
     });
   }
+});
+
+it('returns 503 for a transient D1 overload during signature verification', async () => {
+  installVerify({ byOrigin: new Map([['d1.example.com', 'd1']]) });
+  const ctx = makeFedCtx({
+    auth: xMatrix({ origin: 'd1.example.com', destination: SERVER }),
+  });
+
+  const res = await requireFederationAuth()(ctx, vi.fn());
+  expect(res).toMatchObject({ status: 503 });
+  expect((res as any).body.errcode).toBe('M_UNKNOWN');
+  expect(ctx.get('federationOrigin')).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------
