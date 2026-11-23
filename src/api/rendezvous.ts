@@ -151,6 +151,188 @@ for (const prefix of PREFIXES) {
 }
 
 // ---------------------------------------------------------------------------
+// MSC4108 insecure rendezvous session — unstable v1 byte transport
+// ---------------------------------------------------------------------------
+//
+// Element Web's "Link new device / Sign in with QR" flow uses the insecure
+// rendezvous session from MSC4108, exposed under its unstable prefix. This is
+// the MSC3886-style ETag/byte-channel contract (NOT the MSC4388 JSON
+// {data} -> {id, sequence_token} contract implemented below), so it needs its
+// own routes and its own KV key namespace.
+//
+// Reference: MSC4108, sections "Insecure rendezvous session", "Maximum payload
+// size" / "Maximum duration of a rendezvous" / "ETags", and "Unstable prefix":
+// https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/4108-oidc-qr-login.md
+//
+// Spec points honoured here:
+//   - POST requires Content-Length and Content-Type: text/plain; the payload
+//     may be an empty string, and is capped at 4KB (4096 bytes).
+//   - Common headers on 2xx/412 responses: ETag, Expires, Last-Modified,
+//     Cache-Control: no-store, Pragma: no-cache (caches must not rewrite the
+//     ETag that drives the compare-and-swap).
+//   - Strong, single-valued ETags only; stale If-Match -> 412. Under the
+//     unstable prefix a brand-new errcode is reported as M_UNKNOWN with the
+//     real code in `org.matrix.msc4108.errcode` (the "Unstable prefix" rule).
+//   - Sessions live ~60 seconds, then the URL is a 404 M_NOT_FOUND.
+//   - Unauthenticated by design: trust is layered on by the secure channel.
+
+const MSC4108_PREFIX = '/_matrix/client/unstable/org.matrix.msc4108/rendezvous';
+const MSC4108_MAX_BYTES = 4096; // MSC4108: "enforce a maximum payload size of 4KB"
+const MSC4108_TTL_SECONDS = 60; // MSC4108: "a timeout such as 60 seconds should be adequate"
+
+// Distinct namespace: legacy MSC3886/3906 byte channels use `rendezvous:` and
+// the MSC4388 JSON API uses `rendezvous:v1:`. MSC4108 sessions must never
+// collide with either (UUID ids also make accidental overlap impossible).
+function msc4108Key(id: string): string {
+  return `rendezvous:msc4108:${id}`;
+}
+
+function msc4108Headers(c: any, session: RendezvousSession): void {
+  sessionHeaders(c, session); // ETag, Expires, Last-Modified (unchanged legacy helper)
+  c.header('Cache-Control', 'no-store');
+  c.header('Pragma', 'no-cache');
+}
+
+async function loadMsc4108Session(c: any, id: string): Promise<RendezvousSession | null> {
+  const key = msc4108Key(id);
+  const session = await c.env.SESSIONS.get(key, 'json') as RendezvousSession | null;
+  if (!session) return null;
+  // KV expirationTtl normally removes the key; check explicitly too so an
+  // expired session is still a 404 if KV deletion is ever delayed.
+  if (session.expires <= Date.now()) {
+    await c.env.SESSIONS.delete(key);
+    return null;
+  }
+  return session;
+}
+
+function isTextPlain(contentType: string | undefined): boolean {
+  if (contentType === undefined) return false;
+  // Allow parameters such as `text/plain; charset=utf-8`.
+  return contentType.split(';', 1)[0].trim().toLowerCase() === 'text/plain';
+}
+
+function isStrongEtag(value: string): boolean {
+  // MSC4108: "we only accept strong, single-valued ETag values".
+  return !value.startsWith('W/') && !value.includes(',');
+}
+
+// Create a session. The returned `url` is what Device G puts in the QR code.
+app.post(MSC4108_PREFIX, async (c) => {
+  if (c.req.header('Content-Length') === undefined) {
+    return Errors.missingParam('Content-Length').toResponse();
+  }
+  const contentType = c.req.header('Content-Type');
+  if (contentType === undefined) {
+    return Errors.missingParam('Content-Type').toResponse();
+  }
+  if (!isTextPlain(contentType)) {
+    return Errors.invalidParam('Content-Type', 'Content-Type must be text/plain').toResponse();
+  }
+
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  if (bytes.length > MSC4108_MAX_BYTES) {
+    return Errors.tooLarge(`Rendezvous payload exceeds ${MSC4108_MAX_BYTES} bytes`).toResponse();
+  }
+
+  const id = crypto.randomUUID();
+  const now = Date.now();
+  const session: RendezvousSession = {
+    payload: toBase64(bytes), // keep the payload as base64 text in KV
+    contentType: 'text/plain',
+    etag: newEtag(), // strong + unique per revision (16 random bytes)
+    created: now,
+    expires: now + MSC4108_TTL_SECONDS * 1000,
+  };
+  await c.env.SESSIONS.put(msc4108Key(id), JSON.stringify(session), {
+    expirationTtl: MSC4108_TTL_SECONDS,
+  });
+
+  const url = `https://${c.env.SERVER_NAME}${MSC4108_PREFIX}/${id}`;
+  msc4108Headers(c, session);
+  return c.json({ url }, 201);
+});
+
+// Receive the payload; an If-None-Match hit returns 304 with common headers.
+app.get(`${MSC4108_PREFIX}/:id`, async (c) => {
+  const session = await loadMsc4108Session(c, c.req.param('id'));
+  if (!session) return Errors.notFound('Unknown rendezvous session').toResponse();
+
+  msc4108Headers(c, session);
+  if (c.req.header('If-None-Match') === session.etag) {
+    return c.body(null, 304);
+  }
+  c.header('Content-Type', 'text/plain');
+  return c.body(fromBase64(session.payload), 200);
+});
+
+// Compare-and-swap write. A stale If-Match is a conflict; under the unstable
+// prefix the new M_CONCURRENT_WRITE errcode travels in org.matrix.msc4108.errcode.
+app.put(`${MSC4108_PREFIX}/:id`, async (c) => {
+  const id = c.req.param('id');
+  const session = await loadMsc4108Session(c, id);
+  if (!session) return Errors.notFound('Unknown rendezvous session').toResponse();
+
+  if (c.req.header('Content-Length') === undefined) {
+    return Errors.missingParam('Content-Length').toResponse();
+  }
+  const contentType = c.req.header('Content-Type');
+  if (contentType === undefined) {
+    return Errors.missingParam('Content-Type').toResponse();
+  }
+  if (!isTextPlain(contentType)) {
+    return Errors.invalidParam('Content-Type', 'Content-Type must be text/plain').toResponse();
+  }
+  const ifMatch = c.req.header('If-Match');
+  if (ifMatch === undefined) {
+    return Errors.missingParam('If-Match').toResponse();
+  }
+  if (!isStrongEtag(ifMatch)) {
+    return Errors.invalidParam('If-Match', 'If-Match must be a single strong ETag').toResponse();
+  }
+  if (ifMatch !== session.etag) {
+    msc4108Headers(c, session);
+    return c.json(
+      {
+        errcode: 'M_UNKNOWN',
+        'org.matrix.msc4108.errcode': 'M_CONCURRENT_WRITE',
+        error: 'The rendezvous payload was modified concurrently',
+      },
+      412
+    );
+  }
+
+  const bytes = new Uint8Array(await c.req.arrayBuffer());
+  if (bytes.length > MSC4108_MAX_BYTES) {
+    return Errors.tooLarge(`Rendezvous payload exceeds ${MSC4108_MAX_BYTES} bytes`).toResponse();
+  }
+
+  const now = Date.now();
+  const updated: RendezvousSession = {
+    payload: toBase64(bytes),
+    contentType: 'text/plain',
+    etag: newEtag(), // new revision -> new ETag even if the bytes are identical
+    created: now,
+    expires: now + MSC4108_TTL_SECONDS * 1000,
+  };
+  await c.env.SESSIONS.put(msc4108Key(id), JSON.stringify(updated), {
+    expirationTtl: MSC4108_TTL_SECONDS,
+  });
+
+  msc4108Headers(c, updated);
+  return c.body(null, 202);
+});
+
+// Cancel a session (MSC4108: 204 No Content).
+app.delete(`${MSC4108_PREFIX}/:id`, async (c) => {
+  const id = c.req.param('id');
+  const session = await loadMsc4108Session(c, id);
+  if (!session) return Errors.notFound('Unknown rendezvous session').toResponse();
+  await c.env.SESSIONS.delete(msc4108Key(id));
+  return c.body(null, 204);
+});
+
+// ---------------------------------------------------------------------------
 // MSC4388 secure QR channel — stable v1 JSON rendezvous transport
 // ---------------------------------------------------------------------------
 //
