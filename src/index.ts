@@ -322,8 +322,8 @@ app.route('/', search);
 // Device management now handled by devices.ts
 
 // Public rooms directory (Matrix v1.17): GET with query params, POST with
-// filter body. Both paginate via opaque offset tokens and sort by joined
-// member count (largest first), per spec.
+// filter body. Both paginate via opaque offset tokens and sort by most-recent
+// activity first (MSC4423), then room_id.
 interface PublicRoomChunk {
   room_id: string;
   name?: string;
@@ -358,11 +358,19 @@ async function listPublicRooms(
   opts: { searchTerm?: string; roomTypes?: (string | null)[] } = {}
 ): Promise<PublicRoomChunk[]> {
   const rooms = await db.prepare(
-    `SELECT r.room_id, r.room_version
+    `SELECT r.room_id, r.room_version,
+            COALESCE((SELECT MAX(e.origin_server_ts) FROM events e WHERE e.room_id = r.room_id), 0) AS last_activity_ts
      FROM rooms r
      WHERE r.is_public = 1
      LIMIT 100`
-  ).all<{ room_id: string; room_version: string }>();
+  ).all<{ room_id: string; room_version: string; last_activity_ts: number | null }>();
+
+  // Internal map of room_id -> newest activity timestamp, used for ordering
+  // (MSC4423: most-recent activity first). Not exposed in response shape.
+  const lastActivityByRoom = new Map<string, number>();
+  for (const room of rooms.results) {
+    lastActivityByRoom.set(room.room_id, room.last_activity_ts ?? 0);
+  }
 
   const publicRooms: PublicRoomChunk[] = [];
 
@@ -461,8 +469,16 @@ async function listPublicRooms(
     );
   }
 
-  // Spec: ordered by joined member count, largest first (stable for ties).
-  filtered.sort((a, b) => b.num_joined_members - a.num_joined_members);
+  // MSC4423: rank public rooms by most-recent activity first (newest event
+  // origin_server_ts), with deterministic secondary key room_id for ties.
+  filtered.sort((a, b) => {
+    const ta = lastActivityByRoom.get(a.room_id) ?? 0;
+    const tb = lastActivityByRoom.get(b.room_id) ?? 0;
+    if (tb !== ta) return tb - ta;
+    if (a.room_id < b.room_id) return -1;
+    if (a.room_id > b.room_id) return 1;
+    return 0;
+  });
   return filtered;
 }
 

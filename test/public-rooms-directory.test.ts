@@ -1,7 +1,7 @@
 /**
  * Public rooms directory (Matrix v1.17): GET query params, POST filter body,
- * pagination tokens, member-count ordering, directory metadata, and remote
- * `server` passthrough over federation.
+ * pagination tokens, recent-activity ordering (MSC4423), directory metadata,
+ * and remote `server` passthrough over federation.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Env } from '../src/types';
@@ -75,15 +75,19 @@ const SERVER = 'example.com';
 const ROOM_A = '!a:example.com';
 const ROOM_B = '!b:example.com';
 const ROOM_S = '!s:example.com';
+const ROOM_TIE_A = '!tie-a:example.com';
+const ROOM_TIE_B = '!tie-b:example.com';
 
 interface StateRow { room_id: string; event_type: string; content: string }
 
 function createDb() {
   const rooms = [
-    { room_id: ROOM_A, room_version: '10', is_public: 1 },
-    { room_id: ROOM_B, room_version: '10', is_public: 1 },
-    { room_id: ROOM_S, room_version: '10', is_public: 1 },
-    { room_id: '!private:example.com', room_version: '10', is_public: 0 },
+    { room_id: ROOM_A, room_version: '10', is_public: 1, last_activity_ts: 300 },
+    { room_id: ROOM_B, room_version: '10', is_public: 1, last_activity_ts: 200 },
+    { room_id: ROOM_S, room_version: '10', is_public: 1, last_activity_ts: 100 },
+    { room_id: ROOM_TIE_A, room_version: '10', is_public: 1, last_activity_ts: 50 },
+    { room_id: ROOM_TIE_B, room_version: '10', is_public: 1, last_activity_ts: 50 },
+    { room_id: '!private:example.com', room_version: '10', is_public: 0, last_activity_ts: 0 },
   ];
   const memberCounts: Record<string, number> = {
     [ROOM_A]: 2,
@@ -101,6 +105,10 @@ function createDb() {
     { room_id: ROOM_B, event_type: 'm.room.avatar', content: JSON.stringify({ url: 'mxc://example.com/beta' }) },
     { room_id: ROOM_S, event_type: 'm.room.name', content: JSON.stringify({ name: 'Space Room' }) },
     { room_id: ROOM_S, event_type: 'm.room.create', content: JSON.stringify({ room_version: '10', type: 'm.space' }) },
+    { room_id: ROOM_TIE_A, event_type: 'm.room.name', content: JSON.stringify({ name: 'Tie A' }) },
+    { room_id: ROOM_TIE_A, event_type: 'm.room.create', content: JSON.stringify({ room_version: '10', type: 'm.foo' }) },
+    { room_id: ROOM_TIE_B, event_type: 'm.room.name', content: JSON.stringify({ name: 'Tie B' }) },
+    { room_id: ROOM_TIE_B, event_type: 'm.room.create', content: JSON.stringify({ room_version: '10', type: 'm.foo' }) },
   ];
 
   const stmt = (sql: string) => {
@@ -174,11 +182,11 @@ beforeEach(() => {
 });
 
 describe('GET /publicRooms ordering and metadata', () => {
-  it('sorts by joined member count (largest first) and exposes directory metadata', async () => {
+  it('sorts by most-recent activity first (MSC4423) with room_id tie-break', async () => {
     const { status, body } = await request('/_matrix/client/v3/publicRooms');
     expect(status).toBe(200);
-    expect(body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_B, ROOM_A, ROOM_S]);
-    expect(body.total_room_count_estimate).toBe(3);
+    expect(body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_A, ROOM_B, ROOM_S, ROOM_TIE_A, ROOM_TIE_B]);
+    expect(body.total_room_count_estimate).toBe(5);
 
     const alpha = body.chunk.find((r: any) => r.room_id === ROOM_A);
     expect(alpha.name).toBe('Alpha');
@@ -198,29 +206,42 @@ describe('GET /publicRooms ordering and metadata', () => {
   });
 });
 
+describe('GET /publicRooms tie-break (MSC4423)', () => {
+  it('orders rooms with equal activity by room_id ascending', async () => {
+    const { status, body } = await request('/_matrix/client/v3/publicRooms');
+    expect(status).toBe(200);
+    const ids = body.chunk.map((r: any) => r.room_id);
+    const tieIndex = ids.indexOf(ROOM_TIE_A);
+    expect(tieIndex).toBeGreaterThan(-1);
+    expect(ids[tieIndex + 1]).toBe(ROOM_TIE_B);
+    // Equal activity timestamps sort by room_id ascending.
+    expect(ROOM_TIE_A < ROOM_TIE_B).toBe(true);
+  });
+});
+
 describe('GET /publicRooms pagination', () => {
   it('limit + since walk the directory with next_batch/prev_batch', async () => {
     const page1 = await request('/_matrix/client/v3/publicRooms?limit=2');
     expect(page1.status).toBe(200);
-    expect(page1.body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_B, ROOM_A]);
-    expect(page1.body.total_room_count_estimate).toBe(3);
+    expect(page1.body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_A, ROOM_B]);
+    expect(page1.body.total_room_count_estimate).toBe(5);
     expect(typeof page1.body.next_batch).toBe('string');
     expect(page1.body.prev_batch).toBeUndefined();
 
     const page2 = await request(`/_matrix/client/v3/publicRooms?limit=2&since=${page1.body.next_batch}`);
     expect(page2.status).toBe(200);
-    expect(page2.body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_S]);
-    expect(page2.body.next_batch).toBeUndefined();
+    expect(page2.body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_S, ROOM_TIE_A]);
+    expect(typeof page2.body.next_batch).toBe('string');
     expect(typeof page2.body.prev_batch).toBe('string');
 
     const back = await request(`/_matrix/client/v3/publicRooms?limit=2&since=${page2.body.prev_batch}`);
-    expect(back.body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_B, ROOM_A]);
+    expect(back.body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_A, ROOM_B]);
   });
 
   it('tolerates a malformed since token by starting at the beginning', async () => {
     const { status, body } = await request('/_matrix/client/v3/publicRooms?since=not-a-token');
     expect(status).toBe(200);
-    expect(body.chunk).toHaveLength(3);
+    expect(body.chunk).toHaveLength(5);
   });
 });
 
@@ -265,7 +286,7 @@ describe('publicRooms remote server passthrough', () => {
   it('server equal to the local name is served locally', async () => {
     const { status, body } = await request(`/_matrix/client/v3/publicRooms?server=${SERVER}`);
     expect(status).toBe(200);
-    expect(body.total_room_count_estimate).toBe(3);
+    expect(body.total_room_count_estimate).toBe(5);
     expect(fedMocks.get).not.toHaveBeenCalled();
   });
 });
@@ -280,7 +301,7 @@ describe('POST /publicRooms filters', () => {
 
   it('room_types [null, "m.space"] selects untyped and space rooms', async () => {
     const { body } = await post({ filter: { room_types: [null, 'm.space'] } });
-    expect(body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_B, ROOM_A, ROOM_S]);
+    expect(body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_A, ROOM_B, ROOM_S]);
   });
 
   it('generic_search_term matches topic and canonical alias', async () => {
@@ -292,7 +313,7 @@ describe('POST /publicRooms filters', () => {
 
   it('limit applies after filtering', async () => {
     const { body } = await post({ limit: 1, filter: { room_types: [null] } });
-    expect(body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_B]);
+    expect(body.chunk.map((r: any) => r.room_id)).toEqual([ROOM_A]);
     expect(body.total_room_count_estimate).toBe(2);
     expect(typeof body.next_batch).toBe('string');
   });
