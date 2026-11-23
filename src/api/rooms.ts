@@ -12,6 +12,7 @@ import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-c
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
 import { MSC4583_ROOM_VERSION } from './msc4583';
 import { applyEventRedaction } from '../services/event-redaction';
+import { attachReplacesState } from '../services/replaces-state';
 import { calculateContentHash, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId } from '../utils/event-signing';
 import { federationGet } from '../services/federation-keys';
@@ -1311,7 +1312,9 @@ app.get('/_matrix/client/v3/rooms/:roomId/state', requireAuth(), async (c) => {
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,
     room_id: e.room_id,
+    unsigned: e.unsigned,
   }));
+  await attachReplacesState(c.env.DB, clientEvents);
 
   return c.json(clientEvents);
 });
@@ -1767,6 +1770,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
     room_id: e.room_id,
     unsigned: e.unsigned,
   }));
+  await attachReplacesState(c.env.DB, clientEvents);
 
   // Build response - omit 'end' if no events returned (reached start/end of timeline)
   // This prevents infinite retry loops when client paginates past available events
@@ -1807,7 +1811,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/event/:eventId', requireAuth(), async 
     `SELECT redacted_content FROM events WHERE event_id = ?`
   ).bind(eventId).first<{ redacted_content: string | null }>();
 
-  return c.json({
+  const clientEvent = {
     type: event.type,
     state_key: event.state_key,
     content: pruned?.redacted_content ? JSON.parse(pruned.redacted_content) : event.content,
@@ -1816,7 +1820,10 @@ app.get('/_matrix/client/v3/rooms/:roomId/event/:eventId', requireAuth(), async 
     event_id: event.event_id,
     room_id: event.room_id,
     unsigned: event.unsigned,
-  });
+  };
+  await attachReplacesState(c.env.DB, [clientEvent]);
+
+  return c.json(clientEvent);
 });
 
 // Servers (other than ours) with at least one joined member in the room --
@@ -3404,6 +3411,22 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     return Errors.forbidden('Not a member of this room').toResponse();
   }
 
+  // Same filter shape as /messages; applied to before/after only, never to
+  // the target event itself (clients need the event they requested).
+  const filterParam = c.req.query('filter');
+  let eventFilter: MessageEventFilter | undefined;
+  if (filterParam) {
+    try {
+      const parsed = JSON.parse(filterParam);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('filter must be a JSON object');
+      }
+      eventFilter = parsed;
+    } catch {
+      return Errors.badJson('Invalid filter JSON').toResponse();
+    }
+  }
+
   // Get the target event
   const targetEvent = await getEvent(c.env.DB, eventId);
   if (!targetEvent || targetEvent.room_id !== roomId) {
@@ -3448,6 +3471,10 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     if (raw == null) return {};
     return typeof raw === 'string' ? JSON.parse(raw) : raw;
   };
+  const parseUnsigned = (raw: unknown) => {
+    if (raw == null) return undefined;
+    return typeof raw === 'string' ? JSON.parse(raw) : raw;
+  };
   const formatEvent = (e: any) => ({
     type: e.event_type,
     state_key: e.state_key,
@@ -3456,7 +3483,15 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,
     room_id: e.room_id,
+    unsigned: parseUnsigned(e.unsigned),
   });
+
+  let beforeEvents = eventsBefore.results.reverse().map(formatEvent);
+  let afterEvents = eventsAfter.results.map(formatEvent);
+  if (eventFilter) {
+    beforeEvents = applyMessageEventFilter(beforeEvents, eventFilter);
+    afterEvents = applyMessageEventFilter(afterEvents, eventFilter);
+  }
 
   // Get current state
   const state = await getRoomState(c.env.DB, roomId);
@@ -3468,12 +3503,24 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
     origin_server_ts: e.origin_server_ts,
     event_id: e.event_id,
     room_id: e.room_id,
+    unsigned: e.unsigned,
   }));
 
+  // One batched predecessor lookup for the whole context window. The target
+  // event keeps its own stored unsigned; only state events lacking a value
+  // are enriched.
+  const targetClientEvent = formatEvent(targetForFormat);
+  await attachReplacesState(c.env.DB, [
+    targetClientEvent,
+    ...beforeEvents,
+    ...afterEvents,
+    ...stateEvents,
+  ]);
+
   return c.json({
-    event: formatEvent(targetForFormat),
-    events_before: eventsBefore.results.reverse().map(formatEvent),
-    events_after: eventsAfter.results.map(formatEvent),
+    event: targetClientEvent,
+    events_before: beforeEvents,
+    events_after: afterEvents,
     state: stateEvents,
     start: eventsBefore.results.length > 0 ? String(eventsBefore.results[0].origin_server_ts) : undefined,
     end: eventsAfter.results.length > 0 ? String(eventsAfter.results[eventsAfter.results.length - 1].origin_server_ts) : undefined,

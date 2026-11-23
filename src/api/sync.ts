@@ -32,6 +32,7 @@ import {
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { getTypingUsers } from './typing';
+import { attachReplacesState } from '../services/replaces-state';
 
 // Stripped state a knocking user is allowed to see before they join (Matrix
 // v1.19 /sync rooms.knock). Their own membership event is added separately.
@@ -900,6 +901,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       }
     }
 
+    // Spec v1.19: fill unsigned.replaces_state on every state event in this
+    // room's served window (timeline + state sections share object refs).
+    await attachReplacesState(c.env.DB, [...stateEvents, ...timelineEvents]);
+
     // Apply filters to state and timeline events
     stateEvents = applyEventFilter(stateEvents, withEventFormat(filter, filter?.room?.state));
     timelineEvents = applyEventFilter(timelineEvents, withEventFormat(filter, filter?.room?.timeline));
@@ -983,18 +988,18 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
           return e.state_key !== undefined && afterSenders.has(e.state_key);
         });
       }
-      joinedRoom.timeline!.state_after = {
-        events: afterState.map((e) => ({
-          type: e.type,
-          state_key: e.state_key,
-          content: e.content,
-          sender: e.sender,
-          origin_server_ts: e.origin_server_ts,
-          event_id: e.event_id,
-          room_id: e.room_id,
-          ...(federationFormat ? federationEventFields(e) : {}),
-        })),
-      };
+      const afterStateEvents = afterState.map((e) => ({
+        type: e.type,
+        state_key: e.state_key,
+        content: e.content,
+        sender: e.sender,
+        origin_server_ts: e.origin_server_ts,
+        event_id: e.event_id,
+        room_id: e.room_id,
+        ...(federationFormat ? federationEventFields(e) : {}),
+      }));
+      await attachReplacesState(c.env.DB, afterStateEvents);
+      joinedRoom.timeline!.state_after = { events: afterStateEvents };
     }
     joinedRoom.state!.events = stateEvents;
 
@@ -1142,20 +1147,21 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       );
 
       if (leaveEvent) {
-        const leftRoom: LeftRoom = {
-          timeline: {
-            events: [
-              {
-                type: leaveEvent.type,
-                state_key: leaveEvent.state_key,
-                content: leaveEvent.content,
-                sender: leaveEvent.sender,
-                origin_server_ts: leaveEvent.origin_server_ts,
-                event_id: leaveEvent.event_id,
-                room_id: leaveEvent.room_id,
-              },
-            ],
+        const leaveEvents = [
+          {
+            type: leaveEvent.type,
+            state_key: leaveEvent.state_key,
+            content: leaveEvent.content,
+            sender: leaveEvent.sender,
+            origin_server_ts: leaveEvent.origin_server_ts,
+            event_id: leaveEvent.event_id,
+            room_id: leaveEvent.room_id,
           },
+        ];
+        await attachReplacesState(c.env.DB, leaveEvents);
+
+        const leftRoom: LeftRoom = {
+          timeline: { events: leaveEvents },
         };
 
         response.rooms!.leave![roomId] = leftRoom;
