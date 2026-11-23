@@ -387,8 +387,8 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
 
   await db.prepare(
     `INSERT INTO events (event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, sticky, received_ts, stream_ordering)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     event.event_id,
     event.room_id,
@@ -403,6 +403,8 @@ export async function storeEvent(db: D1Database, event: PDU): Promise<number> {
     JSON.stringify(event.prev_events),
     event.hashes ? JSON.stringify(event.hashes) : null,
     event.signatures ? JSON.stringify(event.signatures) : null,
+    event.sticky ? JSON.stringify(event.sticky) : null,
+    Date.now(),
     streamOrdering
   ).run();
 
@@ -455,8 +457,8 @@ export async function storeEventIdempotent(
 
   const insertResult = await db.prepare(
     `INSERT OR IGNORE INTO events (event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, sticky, received_ts, stream_ordering)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     event.event_id,
     event.room_id,
@@ -471,6 +473,8 @@ export async function storeEventIdempotent(
     JSON.stringify(event.prev_events),
     event.hashes ? JSON.stringify(event.hashes) : null,
     event.signatures ? JSON.stringify(event.signatures) : null,
+    event.sticky ? JSON.stringify(event.sticky) : null,
+    Date.now(),
     streamOrdering
   ).run();
 
@@ -490,7 +494,7 @@ export async function storeEventIdempotent(
 export async function getEvent(db: D1Database, eventId: string): Promise<PDU | null> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures
+     origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, sticky
      FROM events WHERE event_id = ?`
   ).bind(eventId).first<{
     event_id: string;
@@ -506,6 +510,7 @@ export async function getEvent(db: D1Database, eventId: string): Promise<PDU | n
     prev_events: string;
     hashes: string | null;
     signatures: string | null;
+    sticky: string | null;
   }>();
 
   if (!result) return null;
@@ -524,6 +529,7 @@ export async function getEvent(db: D1Database, eventId: string): Promise<PDU | n
     prev_events: JSON.parse(result.prev_events),
     hashes: result.hashes ? JSON.parse(result.hashes) : undefined,
     signatures: result.signatures ? JSON.parse(result.signatures) : undefined,
+    ...(result.sticky ? { sticky: JSON.parse(result.sticky) } : {}),
   };
 }
 
@@ -572,6 +578,7 @@ export async function getRoomEvents(
     prev_events: string;
     stream_ordering: number;
     redacted_content?: string | null;
+    sticky?: string | null;
   }>();
 
   const events = result.results.map(r => ({
@@ -589,6 +596,7 @@ export async function getRoomEvents(
     depth: r.depth,
     auth_events: JSON.parse(r.auth_events),
     prev_events: JSON.parse(r.prev_events),
+    ...(r.sticky ? { sticky: JSON.parse(r.sticky) } : {}),
   }));
 
   const lastEvent = result.results[result.results.length - 1];
@@ -604,7 +612,7 @@ export async function getRoomState(
 ): Promise<PDU[]> {
   const result = await db.prepare(
     `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events
+     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events, e.sticky
      FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
      WHERE rs.room_id = ?`
@@ -620,6 +628,7 @@ export async function getRoomState(
     depth: number;
     auth_events: string;
     prev_events: string;
+    sticky: string | null;
   }>();
 
   return result.results.map(r => ({
@@ -634,6 +643,7 @@ export async function getRoomState(
     depth: r.depth,
     auth_events: JSON.parse(r.auth_events),
     prev_events: JSON.parse(r.prev_events),
+    ...(r.sticky ? { sticky: JSON.parse(r.sticky) } : {}),
   }));
 }
 
@@ -645,7 +655,7 @@ export async function getStateEvent(
 ): Promise<PDU | null> {
   const result = await db.prepare(
     `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events
+     e.origin_server_ts, e.unsigned, e.depth, e.auth_events, e.prev_events, e.sticky
      FROM room_state rs
      JOIN events e ON rs.event_id = e.event_id
      WHERE rs.room_id = ? AND rs.event_type = ? AND rs.state_key = ?`
@@ -661,6 +671,7 @@ export async function getStateEvent(
     depth: number;
     auth_events: string;
     prev_events: string;
+    sticky: string | null;
   }>();
 
   if (!result) return null;
@@ -677,6 +688,7 @@ export async function getStateEvent(
     depth: result.depth,
     auth_events: JSON.parse(result.auth_events),
     prev_events: JSON.parse(result.prev_events),
+    ...(result.sticky ? { sticky: JSON.parse(result.sticky) } : {}),
   };
 }
 
@@ -844,7 +856,7 @@ export async function getEventsSince(
 ): Promise<PDU[]> {
   const result = await db.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, unsigned, depth, auth_events, prev_events, redacted_content
+     origin_server_ts, unsigned, depth, auth_events, prev_events, redacted_content, sticky
      FROM events
      WHERE room_id = ? AND stream_ordering > ?
      ORDER BY stream_ordering ${order === 'desc' ? 'DESC' : 'ASC'}
@@ -862,6 +874,7 @@ export async function getEventsSince(
     auth_events: string;
     prev_events: string;
     redacted_content?: string | null;
+    sticky?: string | null;
   }>();
 
   const events = result.results.map(r => ({
@@ -878,6 +891,7 @@ export async function getEventsSince(
     depth: r.depth,
     auth_events: JSON.parse(r.auth_events),
     prev_events: JSON.parse(r.prev_events),
+    ...(r.sticky ? { sticky: JSON.parse(r.sticky) } : {}),
   }));
   // DESC is used to select the newest page; callers still consume events in
   // ascending stream order, so restore that order before returning.
@@ -899,7 +913,7 @@ export async function getEventsByIds(db: D1Database, eventIds: string[]): Promis
     const placeholders = page.map(() => '?').join(', ');
     const result = await db.prepare(
       `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures
+       origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, sticky
        FROM events WHERE event_id IN (${placeholders})`
     ).bind(...page).all<{
       event_id: string;
@@ -915,6 +929,7 @@ export async function getEventsByIds(db: D1Database, eventIds: string[]): Promis
       prev_events: string;
       hashes: string | null;
       signatures: string | null;
+      sticky: string | null;
     }>();
 
     for (const r of result.results) {
@@ -932,6 +947,7 @@ export async function getEventsByIds(db: D1Database, eventIds: string[]): Promis
         prev_events: JSON.parse(r.prev_events),
         hashes: r.hashes ? JSON.parse(r.hashes) : undefined,
         signatures: r.signatures ? JSON.parse(r.signatures) : undefined,
+        ...(r.sticky ? { sticky: JSON.parse(r.sticky) } : {}),
       });
     }
   }

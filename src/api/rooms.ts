@@ -12,7 +12,7 @@ import { invalidateRoomCache, bumpRoomCacheGeneration } from '../services/room-c
 import { isRoomVersionSupported, getDefaultRoomVersion } from '../services/room-versions';
 import { MSC4583_ROOM_VERSION } from './msc4583';
 import { applyEventRedaction } from '../services/event-redaction';
-import { attachReplacesState } from '../services/replaces-state';
+import { attachServedEventMetadata } from '../services/served-events';
 import { calculateContentHash, sha256 } from '../utils/crypto';
 import { computeEventReferenceHash, isMsc4291RoomVersion, msc4291CreateEventId, msc4291RoomId } from '../utils/event-signing';
 import { federationGet } from '../services/federation-keys';
@@ -1329,7 +1329,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/state', requireAuth(), async (c) => {
     room_id: e.room_id,
     unsigned: e.unsigned,
   }));
-  await attachReplacesState(c.env.DB, clientEvents);
+  await attachServedEventMetadata(c.env.DB, clientEvents, { viewer: c.get('userId') });
 
   return c.json(clientEvents);
 });
@@ -1376,7 +1376,8 @@ export async function performStateEvent(
   userId: string,
   eventType: string,
   stateKey: string,
-  content: any
+  content: any,
+  stickyDurationMs?: number
 ): Promise<{ eventId: string } | { error: MatrixApiError }> {
   // Check membership
   const membership = await getMembership(env.DB, roomId, userId);
@@ -1445,6 +1446,7 @@ export async function performStateEvent(
     state_key: stateKey,
     content,
     origin_server_ts: Date.now(),
+    ...(stickyDurationMs ? { sticky: { duration_ms: stickyDurationMs } } : {}),
     depth: (latestEvents[0]?.depth ?? 0) + 1,
     auth_events: authEvents,
     prev_events: prevEvents,
@@ -1785,7 +1787,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/messages', requireAuth(), async (c) =>
     room_id: e.room_id,
     unsigned: e.unsigned,
   }));
-  await attachReplacesState(c.env.DB, clientEvents);
+  await attachServedEventMetadata(c.env.DB, clientEvents, { viewer: c.get('userId') });
 
   // Build response - omit 'end' if no events returned (reached start/end of timeline)
   // This prevents infinite retry loops when client paginates past available events
@@ -1836,7 +1838,7 @@ app.get('/_matrix/client/v3/rooms/:roomId/event/:eventId', requireAuth(), async 
     room_id: event.room_id,
     unsigned: event.unsigned,
   };
-  await attachReplacesState(c.env.DB, [clientEvent]);
+  await attachServedEventMetadata(c.env.DB, [clientEvent], { viewer: c.get('userId') });
 
   return c.json(clientEvent);
 });
@@ -2359,13 +2361,28 @@ async function federateInvite(env: Env, roomId: string, inviteEvent: PDU): Promi
 // Core of PUT /rooms/:roomId/send, shared with MSC4140 delayed events so a
 // delayed send travels the same auth, signing and federation path as an
 // immediate one.
+/**
+ * Parse the spec v1.20 `sticky_duration_ms` query parameter. Absent is valid
+ * (not sticky); anything present must be a strictly positive integer.
+ */
+export function parseStickyDurationQuery(
+  raw: string | undefined
+): { ok: true; value?: number } | { ok: false } {
+  if (raw === undefined) return { ok: true };
+  if (!/^[0-9]+$/.test(raw)) return { ok: false };
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) return { ok: false };
+  return { ok: true, value };
+}
+
 export async function performSendEvent(
   env: Env,
   roomId: string,
   userId: string,
   eventType: string,
   content: any,
-  txnId?: string
+  txnId?: string,
+  stickyDurationMs?: number
 ): Promise<{ eventId: string; originServerTs: number } | { error: MatrixApiError }> {
   // Check membership
   const membership = await getMembership(env.DB, roomId, userId);
@@ -2428,6 +2445,10 @@ export async function performSendEvent(
     content,
     origin_server_ts: Date.now(),
     unsigned: { transaction_id: txnId },
+    // Spec v1.20: `sticky` is a top-level member of the event and travels in
+    // the content hash and federation wire form. Redaction does not protect
+    // it, so it disappears once the event is redacted.
+    ...(stickyDurationMs ? { sticky: { duration_ms: stickyDurationMs } } : {}),
     depth: (parent?.depth ?? 0) + 1,
     auth_events: authEventsFinal,
     prev_events: prevEvents,
@@ -2553,7 +2574,19 @@ app.put('/_matrix/client/v3/rooms/:roomId/send/:eventType/:txnId', requireAuth()
     return c.json({ event_id: result.eventId });
   }
 
-  const result = await performSendEvent(c.env, roomId, userId, eventType, content, txnId);
+  // Spec v1.20 (MSC4354): clients may ask for the message event to be sticky
+  // by setting `sticky_duration_ms` on the send URL.
+  const sticky = parseStickyDurationQuery(c.req.query('sticky_duration_ms'));
+  if (!sticky.ok) {
+    return Errors.invalidParam(
+      'sticky_duration_ms',
+      'sticky_duration_ms must be a strictly positive integer'
+    ).toResponse();
+  }
+
+  const result = await performSendEvent(
+    c.env, roomId, userId, eventType, content, txnId, sticky.value
+  );
   if ('error' in result) return result.error.toResponse();
 
   // Send push notifications via durable workflow (fire and forget)
@@ -3525,12 +3558,12 @@ app.get('/_matrix/client/v3/rooms/:roomId/context/:eventId', requireAuth(), asyn
   // event keeps its own stored unsigned; only state events lacking a value
   // are enriched.
   const targetClientEvent = formatEvent(targetForFormat);
-  await attachReplacesState(c.env.DB, [
+  await attachServedEventMetadata(c.env.DB, [
     targetClientEvent,
     ...beforeEvents,
     ...afterEvents,
     ...stateEvents,
-  ]);
+  ], { viewer: c.get('userId') });
 
   return c.json({
     event: targetClientEvent,

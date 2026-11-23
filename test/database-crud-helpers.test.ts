@@ -550,6 +550,8 @@ function createCrudDb(seed: {
             prevEvents,
             hashes,
             signatures,
+            sticky,
+            receivedTs,
             streamOrdering,
           ] = args as [
             string,
@@ -565,6 +567,8 @@ function createCrudDb(seed: {
             string,
             string | null,
             string | null,
+            string | null,
+            number | null,
             number,
           ];
           const exists = events.some((e) => e.event_id === eventId);
@@ -588,6 +592,8 @@ function createCrudDb(seed: {
             prev_events: prevEvents,
             hashes,
             signatures,
+            sticky,
+            received_ts: receivedTs,
             stream_ordering: streamOrdering,
           });
           return { meta: { changes: 1 } };
@@ -2175,6 +2181,8 @@ describe('database CRUD contracts / isolation', () => {
       JSON.stringify(['$prev']),
       JSON.stringify({ sha256: 'h' }),
       JSON.stringify({ 'example.com': { 'ed25519:1': 'sig' } }),
+      null,
+      NOW,
       1,
     ]);
   });

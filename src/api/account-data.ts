@@ -124,10 +124,12 @@ export interface StickyClientEvent {
   origin_server_ts: number;
   content: Record<string, unknown>;
   sticky: { duration_ms: number };
-  msc4354_sticky: { duration_ms: number };
+  // Unstable duplicates are emitted for the legacy account-data-backed store
+  // only; sticky events stored as real PDUs (spec v1.20) omit them.
+  msc4354_sticky?: { duration_ms: number };
   unsigned: {
     sticky_duration_remaining_ms: number;
-    msc4354_sticky_duration_ttl_ms: number;
+    msc4354_sticky_duration_ttl_ms?: number;
   };
 }
 
@@ -296,6 +298,102 @@ export async function getStickyEventsForRooms(
     if (byRoom[roomId].some(existing => existing.event_id === event.event_id)) continue;
     byRoom[roomId].push(event);
   }
+  return byRoom;
+}
+
+
+/**
+ * Spec v1.20 (MSC4354): unexpired sticky events that exist as real room PDUs.
+ *
+ * These live in the timeline like any other message event; this helper exists
+ * so `/sync` can also surface the ones that fall outside the timeline window
+ * (history visibility MUST NOT be applied to unexpired sticky events, so the
+ * query is deliberately unfiltered).
+ */
+export async function getStickyPduEventsForRooms(
+  db: D1Database,
+  roomIds: string[],
+  opts: { now?: number; limitPerRoom?: number } = {}
+): Promise<Record<string, StickyClientEvent[]>> {
+  const byRoom: Record<string, StickyClientEvent[]> = {};
+  if (roomIds.length === 0) return byRoom;
+
+  const now = opts.now ?? Date.now();
+  const perRoom = Math.max(1, Math.min(opts.limitPerRoom ?? DEFAULT_STICKY_LIMIT, DEFAULT_STICKY_LIMIT));
+
+  // Stay below D1's bind-variable limit.
+  for (let i = 0; i < roomIds.length; i += 90) {
+    const chunk = roomIds.slice(i, i + 90);
+    const placeholders = chunk.map(() => '?').join(',');
+    let rows: Array<{
+      event_id: string;
+      room_id: string;
+      sender: string;
+      event_type: string;
+      content: string;
+      origin_server_ts: number;
+      received_ts: number | null;
+      sticky: string;
+    }>;
+    try {
+      const result = await db.prepare(`
+        SELECT event_id, room_id, sender, event_type, content,
+               origin_server_ts, received_ts, sticky, stream_ordering
+        FROM events
+        WHERE room_id IN (${placeholders})
+          AND sticky IS NOT NULL AND sticky != ''
+          AND stream_ordering > 0
+        ORDER BY stream_ordering DESC
+        LIMIT ?
+      `).bind(...chunk, perRoom * chunk.length).all<{
+        event_id: string;
+        room_id: string;
+        sender: string;
+        event_type: string;
+        content: string;
+        origin_server_ts: number;
+        received_ts: number | null;
+        sticky: string;
+      }>();
+      rows = result.results ?? [];
+    } catch (error) {
+      console.warn('[sticky] PDU sticky lookup failed:', error);
+      continue;
+    }
+
+    for (const row of rows) {
+      let sticky: { duration_ms?: unknown };
+      try {
+        sticky = JSON.parse(row.sticky) as { duration_ms?: unknown };
+      } catch {
+        continue;
+      }
+      if (!sticky || typeof sticky.duration_ms !== 'number') continue;
+
+      const durationMs = Math.min(
+        Math.max(sticky.duration_ms, 0),
+        MAX_STICKY_DURATION_MS
+      );
+      if (durationMs <= 0) continue;
+      const start = Math.min(row.received_ts ?? row.origin_server_ts, row.origin_server_ts);
+      const remaining = start + durationMs - now;
+      if (remaining <= 0) continue;
+
+      const list = (byRoom[row.room_id] ??= []);
+      if (list.length >= perRoom) continue;
+      list.push({
+        type: row.event_type,
+        event_id: row.event_id,
+        sender: row.sender,
+        room_id: row.room_id,
+        origin_server_ts: row.origin_server_ts,
+        content: JSON.parse(row.content) as Record<string, unknown>,
+        sticky: { duration_ms: sticky.duration_ms },
+        unsigned: { sticky_duration_remaining_ms: remaining },
+      });
+    }
+  }
+
   return byRoom;
 }
 

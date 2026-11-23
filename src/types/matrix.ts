@@ -52,6 +52,10 @@ export interface PDU extends MatrixEvent {
   auth_events: EventId[];
   prev_events: EventId[];
   depth: number;
+  // MSC4354 / spec v1.20: a message event may be "sticky" for a limited time.
+  // The object is part of the federated event (content hash) and is stripped
+  // by redaction.
+  sticky?: { duration_ms: number };
   hashes?: {
     sha256: string;
   };

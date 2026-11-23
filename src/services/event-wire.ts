@@ -107,7 +107,7 @@ export async function deriveRoomWireEvents(
 
   const all = await env.DB.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+     origin_server_ts, depth, auth_events, prev_events, hashes, signatures, sticky
      FROM events WHERE room_id = ?
      ORDER BY depth ASC, stream_ordering ASC`
   ).bind(roomId).all();
@@ -158,6 +158,9 @@ export async function deriveRoomWireEvents(
       prev_events: JSON.parse(row.prev_events),
       hashes: row.hashes ? JSON.parse(row.hashes) : undefined,
       signatures: row.signatures ? JSON.parse(row.signatures) : undefined,
+      // Spec v1.20 (MSC4354): the top-level `sticky` object is part of the
+      // wire event and its content hash, so it must be re-emitted here.
+      ...(row.sticky ? { sticky: JSON.parse(row.sticky) } : {}),
     };
     // `state_key` exists only on state events; adding it as null would change
     // the canonical JSON and produce a phantom reference hash.

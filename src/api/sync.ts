@@ -28,11 +28,12 @@ import {
   getGlobalAccountData,
   getRoomAccountData,
   getStickyEventsForRooms,
+  getStickyPduEventsForRooms,
   type StickyClientEvent,
 } from './account-data';
 import { getReceiptsForRoom } from './receipts';
 import { getTypingUsers } from './typing';
-import { attachReplacesState } from '../services/replaces-state';
+import { attachServedEventMetadata } from '../services/served-events';
 
 // Stripped state a knocking user is allowed to see before they join (Matrix
 // v1.19 /sync rooms.knock). Their own membership event is added separately.
@@ -772,9 +773,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
   // Get user's joined rooms
   const joinedRoomIds = await getUserRooms(c.env.DB, userId, 'join');
 
-  // MSC4354: sticky events are stored outside the timeline tables, so they
-  // never enter `getEventsSince`; they ride in their own `sticky` room section.
-  // A failure here must never break the rest of sync.
+  // MSC4354 sticky events ride in their own `sticky` room section. Two
+  // sources feed it: real timeline PDUs with a top-level `sticky` object
+  // (spec v1.20) and the legacy account-data-backed store used by the
+  // unstable endpoints. A failure here must never break the rest of sync.
   type StickyJoinedRoom = JoinedRoom & {
     sticky?: { events: StickyClientEvent[] };
     msc4354_sticky?: { events: StickyClientEvent[] };
@@ -786,6 +788,21 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     });
   } catch (error) {
     console.error('[sync] Failed to load sticky events:', error);
+  }
+  try {
+    const stickyPduByRoom = await getStickyPduEventsForRooms(c.env.DB, joinedRoomIds);
+    for (const [roomId, events] of Object.entries(stickyPduByRoom)) {
+      const merged = [...(stickyByRoom[roomId] ?? [])];
+      const seen = new Set(merged.map((event) => event.event_id));
+      for (const event of events) {
+        if (seen.has(event.event_id)) continue;
+        seen.add(event.event_id);
+        merged.push(event);
+      }
+      stickyByRoom[roomId] = merged;
+    }
+  } catch (error) {
+    console.error('[sync] Failed to load sticky PDU events:', error);
   }
 
   for (const roomId of joinedRoomIds) {
@@ -903,7 +920,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     // Spec v1.19: fill unsigned.replaces_state on every state event in this
     // room's served window (timeline + state sections share object refs).
-    await attachReplacesState(c.env.DB, [...stateEvents, ...timelineEvents]);
+    await attachServedEventMetadata(c.env.DB, [...stateEvents, ...timelineEvents], { viewer: userId });
 
     // Apply filters to state and timeline events. The timeline limit is handled
     // separately below so an explicit filter.room.timeline.limit selects the
@@ -1019,7 +1036,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
         room_id: e.room_id,
         ...(federationFormat ? federationEventFields(e) : {}),
       }));
-      await attachReplacesState(c.env.DB, afterStateEvents);
+      await attachServedEventMetadata(c.env.DB, afterStateEvents, { viewer: userId });
       joinedRoom.timeline!.state_after = { events: afterStateEvents };
     }
     joinedRoom.state!.events = stateEvents;
@@ -1179,7 +1196,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
             room_id: leaveEvent.room_id,
           },
         ];
-        await attachReplacesState(c.env.DB, leaveEvents);
+        await attachServedEventMetadata(c.env.DB, leaveEvents, { viewer: userId });
 
         const leftRoom: LeftRoom = {
           timeline: { events: leaveEvents },
