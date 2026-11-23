@@ -8,16 +8,19 @@ import { computeWireEventId, inboundWireEventIdCandidates, isMsc4291RoomVersion,
 import { requireFederationAuth } from '../middleware/federation-auth';
 import { federationOriginRateLimit } from '../middleware/rate-limit';
 import {
+  federationPost,
   fetchRemoteServerKeys,
   getRemoteKeysWithNotarySignature,
   getServerSigningKey,
   type ServerKeyResponse,
 } from '../services/federation-keys';
+import { verifySignedThirdPartyInvite } from '../services/third-party-invite';
 import { validateUrl } from '../utils/url-validator';
 import { checkEventAuth } from '../services/event-auth';
 import { getRoom, getRoomState, createRoom, getEvent, storeEvent, storeEventIdempotent, updateMembership, notifyUserSync, getInvitePermission } from '../services/database';
 import { findServerAcl, isServerAllowedByAcl, isServerAllowedInRoom, serverNameFromId } from '../services/server-acl';
 import { getRoomVersion } from '../services/room-versions';
+import { performStateEvent } from './rooms';
 import { MSC4583_ROOM_VERSION } from './msc4583';
 import { evaluateRestrictedJoin, refreshRestrictedRoomState } from '../services/restricted-joins';
 import { applyEventRedaction } from '../services/event-redaction';
@@ -217,10 +220,20 @@ app.get('/_matrix/federation/v1/version', async (c) => {
   });
 });
 
-// Apply federation authentication to all other federation v1 endpoints
-// Key endpoints (/_matrix/key/*) remain unauthenticated as they are used to establish trust
-// Version endpoint is also unauthenticated as it's used for initial contact
-app.use('/_matrix/federation/v1/*', requireFederationAuth());
+// Apply federation authentication to all other federation v1 endpoints.
+// Key endpoints (/_matrix/key/*) remain unauthenticated as they are used to
+// establish trust; the version endpoint is also unauthenticated as it is used
+// for initial contact.
+//
+// `3pid/onbind` is called by *identity servers*, not homeservers: they cannot
+// sign X-Matrix requests. Each pending invite carries the identity server's
+// own signature over {mxid, sender, token}, which the handler verifies against
+// the room's m.room.third_party_invite state instead.
+const federationAuth = requireFederationAuth();
+app.use('/_matrix/federation/v1/*', async (c, next) => {
+  if (c.req.path === '/_matrix/federation/v1/3pid/onbind') return next();
+  return federationAuth(c, next);
+});
 
 // The v2 endpoints (send_join / send_leave / invite) take the same signed
 // X-Matrix requests. Without this the request bodies were trusted verbatim,
@@ -5343,6 +5356,150 @@ app.put('/_matrix/federation/v1/exchange_third_party_invite/:roomId', async (c) 
       errcode: 'M_UNKNOWN',
       error: 'Failed to store invite event',
     }, 500);
+  }
+
+  return c.json({});
+});
+
+
+// POST /_matrix/federation/v1/3pid/onbind - An identity server notifies this
+// homeserver that one of its users bound a third-party identifier, including
+// any pending room invites the identity server knows about.
+//
+// Spec v1.20 fixes the verb (PUT -> POST). The request is unauthenticated at
+// the federation layer: the caller is an identity server, not a homeserver, so
+// each invite carries the identity server's own signature, which is verified
+// against the public key in the room's m.room.third_party_invite state.
+app.post('/_matrix/federation/v1/3pid/onbind', async (c) => {
+  let body: {
+    medium?: unknown;
+    address?: unknown;
+    mxid?: unknown;
+    invites?: unknown;
+  };
+  try {
+    body = (await c.req.json()) as typeof body;
+  } catch {
+    return c.json({ errcode: 'M_NOT_JSON', error: 'Request body was not JSON' }, 400);
+  }
+
+  if (
+    !body ||
+    typeof body !== 'object' ||
+    typeof body.medium !== 'string' ||
+    typeof body.address !== 'string' ||
+    typeof body.mxid !== 'string' ||
+    !Array.isArray(body.invites)
+  ) {
+    return c.json(
+      { errcode: 'M_INVALID_PARAM', error: 'medium, address, mxid and invites are required' },
+      400
+    );
+  }
+
+  // Only email is defined for the bound identifier today.
+  if (body.medium !== 'email') {
+    return c.json(
+      { errcode: 'M_INVALID_PARAM', error: 'Only the email medium is supported' },
+      400
+    );
+  }
+
+  const boundUserId = body.mxid;
+  if (!boundUserId.startsWith('@') || serverNameFromId(boundUserId) !== c.env.SERVER_NAME) {
+    return c.json(
+      { errcode: 'M_INVALID_PARAM', error: 'mxid is not a local user' },
+      400
+    );
+  }
+
+  // Per-invite failures are logged and skipped: one stale or hostile entry
+  // must not stop the remaining invites from being issued.
+  for (const rawInvite of body.invites) {
+    const invite = rawInvite as {
+      room_id?: unknown;
+      sender?: unknown;
+      mxid?: unknown;
+      signed?: unknown;
+    };
+    if (
+      !invite ||
+      typeof invite.room_id !== 'string' ||
+      !invite.room_id.startsWith('!') ||
+      typeof invite.sender !== 'string' ||
+      !invite.sender.startsWith('@') ||
+      invite.mxid !== boundUserId ||
+      !invite.signed ||
+      typeof invite.signed !== 'object'
+    ) {
+      console.warn('[3pid/onbind] skipping malformed invite:', rawInvite);
+      continue;
+    }
+
+    const signed = invite.signed as {
+      mxid: string;
+      token: string;
+      signatures: Record<string, Record<string, string>>;
+    };
+
+    const verified = await verifySignedThirdPartyInvite(c.env.DB, {
+      roomId: invite.room_id,
+      sender: invite.sender,
+      signed,
+    });
+    if (!verified.ok) {
+      console.warn(`[3pid/onbind] invite in ${invite.room_id} rejected: ${verified.reason}`);
+      continue;
+    }
+
+    const content = {
+      membership: 'invite',
+      third_party_invite: {
+        display_name: verified.displayName,
+        signed: invite.signed,
+      },
+    };
+
+    // Local room: issue the invite directly through the normal state path so
+    // power levels, invite permissions and policy lists all apply.
+    if (serverNameFromId(invite.room_id) === c.env.SERVER_NAME) {
+      const result = await performStateEvent(
+        c.env,
+        invite.room_id,
+        invite.sender,
+        'm.room.member',
+        boundUserId,
+        content
+      );
+      if ('error' in result) {
+        console.warn(`[3pid/onbind] local invite failed: ${result.error.toJSON().errcode}`);
+      }
+      continue;
+    }
+
+    // Remote room: ask the room's server to exchange the 3PID invite.
+    const destination = serverNameFromId(invite.room_id);
+    try {
+      const response = await federationPost(
+        destination,
+        `/_matrix/federation/v1/exchange_third_party_invite/${encodeURIComponent(invite.room_id)}`,
+        {
+          type: 'm.room.member',
+          room_id: invite.room_id,
+          sender: invite.sender,
+          state_key: boundUserId,
+          content,
+        },
+        c.env.SERVER_NAME,
+        c.env.DB,
+        c.env.CACHE
+      );
+      if (!response.ok) {
+        console.warn(`[3pid/onbind] exchange to ${destination} failed: HTTP ${response.status}`);
+      }
+    } catch (error) {
+      console.warn(`[3pid/onbind] exchange to ${destination} threw:`, error);
+    }
   }
 
   return c.json({});
