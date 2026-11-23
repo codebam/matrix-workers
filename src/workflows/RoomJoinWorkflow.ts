@@ -13,6 +13,7 @@ import { calculateContentHash, signJson } from '../utils/crypto';
 import {
   computeWireEventId,
   redactEventForSigning,
+  redactionOptionsForEvent,
   toWireEventObject,
 } from '../utils/event-signing';
 import {
@@ -91,6 +92,7 @@ interface SerializableEvent {
   depth: number;
   auth_events: string[];
   prev_events: string[];
+  origin?: string;
 }
 
 export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
@@ -686,15 +688,30 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
       // a version-blind derivation produces an ID the resident does not
       // recognize.
       const roomVersion = remoteEventTemplate?.room_version;
+      // /send_join requires the top-level `origin` (Tuwunel rejects the PDU
+      // with M_BAD_JSON "Event does not have an origin server name."), and
+      // room versions 1-10 protect it from redaction, so it is covered by the
+      // content hash, reference-hash event ID and signature. It must be set
+      // before derivation, not appended to the wire body.
+      const wireEvent = { ...baseEvent, origin: this.env.SERVER_NAME };
       const hashed = {
-        ...baseEvent,
+        ...wireEvent,
         hashes: {
-          sha256: await calculateContentHash(baseEvent as unknown as Record<string, unknown>),
+          sha256: await calculateContentHash(wireEvent as unknown as Record<string, unknown>),
         },
       };
-      const eventId = await computeWireEventId(hashed as unknown as Record<string, unknown>, roomVersion);
+      // Pre-v11 rooms keep `origin` in the redacted form, so a spec-compliant
+      // resident derives the event ID and verifies our signature with it
+      // retained. This server's default v3-10 derivation is the modern
+      // origin-less shape, so an origin-bearing event asks for the spec form.
+      const redactionOptions = redactionOptionsForEvent(
+        wireEvent as unknown as Record<string, unknown>, roomVersion
+      );
+      const eventId = await computeWireEventId(
+        hashed as unknown as Record<string, unknown>, roomVersion, redactionOptions
+      );
       const signed = await signJson(
-        redactEventForSigning(hashed as unknown as Record<string, unknown>, roomVersion),
+        redactEventForSigning(hashed as unknown as Record<string, unknown>, roomVersion, redactionOptions),
         this.env.SERVER_NAME,
         signingKey.keyId,
         signingKey.privateKeyJwk
@@ -785,7 +802,10 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     try {
       const normalized: Record<string, unknown> = { ...ev };
       if (typeof ev.event_id !== 'string' || !ev.event_id) {
-        normalized.event_id = await computeWireEventId(ev as Record<string, unknown>, roomVersion);
+        normalized.event_id = await computeWireEventId(
+          ev as Record<string, unknown>, roomVersion,
+          redactionOptionsForEvent(ev as Record<string, unknown>, roomVersion)
+        );
       }
       if (ev.type === 'm.room.create' && typeof ev.room_id !== 'string') {
         normalized.room_id = `!${String(normalized.event_id).slice(1)}`;
@@ -859,7 +879,9 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
     const normalized = await Promise.all(valid.map(async (ev) => {
       const copy: Record<string, unknown> = { ...ev };
       if (typeof copy.event_id !== 'string' || !copy.event_id) {
-        copy.event_id = await computeWireEventId(copy, roomVersion);
+        copy.event_id = await computeWireEventId(
+          copy, roomVersion, redactionOptionsForEvent(copy, roomVersion)
+        );
       }
       if (ev.type === 'm.room.create' && typeof copy.room_id !== 'string') {
         copy.room_id = `!${String(copy.event_id).slice(1)}`;
@@ -879,8 +901,8 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
         const streamOrdering = stateOnly ? -(first + i) : first + i;
         statements.push(this.env.DB.prepare(
           `INSERT OR IGNORE INTO events (event_id, room_id, sender, event_type, state_key, content,
-           origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           origin_server_ts, unsigned, depth, auth_events, prev_events, hashes, signatures, stream_ordering, origin)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
         ).bind(
           String(ev.event_id), String(ev.room_id ?? roomId), String(ev.sender ?? ''), String(ev.type),
           typeof ev.state_key === 'string' ? ev.state_key : null,
@@ -889,7 +911,8 @@ export class RoomJoinWorkflow extends WorkflowEntrypoint<Env, JoinParams> {
           JSON.stringify(ev.auth_events ?? []), JSON.stringify(ev.prev_events ?? []),
           ev.hashes ? JSON.stringify(ev.hashes) : null,
           ev.signatures ? JSON.stringify(ev.signatures) : null,
-          streamOrdering
+          streamOrdering,
+          typeof ev.origin === 'string' ? ev.origin : null
         ));
         // Only a CURRENT-STATE snapshot may replace room_state/room_memberships.
         // Real timeline backfill legitimately contains historical membership

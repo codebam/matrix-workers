@@ -95,6 +95,7 @@ type EventRow = {
   hashes: string | null;
   signatures: string | null;
   stream_ordering: number;
+  origin?: string | null;
 };
 
 type MembershipRow = {
@@ -146,6 +147,7 @@ function eventRowFromPdu(event: PDU, streamOrdering: number): EventRow {
     hashes: event.hashes ? JSON.stringify(event.hashes) : null,
     signatures: event.signatures ? JSON.stringify(event.signatures) : null,
     stream_ordering: streamOrdering,
+    origin: event.origin ?? null,
   };
 }
 
@@ -553,6 +555,7 @@ function createCrudDb(seed: {
             sticky,
             receivedTs,
             streamOrdering,
+            origin,
           ] = args as [
             string,
             string,
@@ -570,6 +573,7 @@ function createCrudDb(seed: {
             string | null,
             number | null,
             number,
+            string | null,
           ];
           const exists = events.some((e) => e.event_id === eventId);
           if (exists && sql.includes('OR IGNORE')) {
@@ -595,6 +599,7 @@ function createCrudDb(seed: {
             sticky,
             received_ts: receivedTs,
             stream_ordering: streamOrdering,
+            origin,
           });
           return { meta: { changes: 1 } };
         }
@@ -1357,6 +1362,17 @@ describe('database storeEvent / getEvent', () => {
     expect(db._state.events[1].unsigned).toBeNull();
     expect(db._state.events[1].hashes).toBeNull();
     expect(db._state.events[1].signatures).toBeNull();
+  });
+
+  it('storeEvent persists the top-level origin and defaults it to null', async () => {
+    const db = createCrudDb({ streamPosition: 0 });
+    await storeEvent(db, pdu({ event_id: '$origin1', type: 'm.room.member', origin: 'remote.example' }));
+    await storeEvent(db, pdu({ event_id: '$origin2', type: 'm.room.message' }));
+    expect(db._state.events[0].origin).toBe('remote.example');
+    expect(db._state.events[1].origin).toBeNull();
+    await expect(getEvent(db, '$origin1')).resolves.toMatchObject({ origin: 'remote.example' });
+    await expect(getEvent(db, '$origin2')).resolves.toMatchObject({ event_id: '$origin2' });
+    await expect(getEvent(db, '$origin2')).resolves.not.toHaveProperty('origin');
   });
 
   it('storeEventIdempotent inserts new events and updates state when inserted', async () => {
@@ -2184,6 +2200,7 @@ describe('database CRUD contracts / isolation', () => {
       null,
       NOW,
       1,
+      null,
     ]);
   });
 });

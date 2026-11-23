@@ -52,6 +52,11 @@ export interface PDU extends MatrixEvent {
   auth_events: EventId[];
   prev_events: EventId[];
   depth: number;
+  // Server that created the event. Optional on modern wires, but mandatory on
+  // federation membership endpoints (/send_join, /send_knock) and part of the
+  // redaction-preserved event in room versions 1-10, so it is hashed/signed
+  // when present and must be persisted verbatim.
+  origin?: string;
   // MSC4354 / spec v1.20: a message event may be "sticky" for a limited time.
   // The object is part of the federated event (content hash) and is stripped
   // by redaction.

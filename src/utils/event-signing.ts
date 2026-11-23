@@ -79,14 +79,34 @@ const REDACTION_KEEP_CONTENT_V10: Record<string, string[]> = {
 // m.room.create keeps its full content at v11+ (creator + room_version).
 const CONTENT_KEEP_ALL_V11 = new Set(['m.room.create']);
 
-function isLegacyRedaction(roomVersion: string | undefined): boolean {
+/**
+ * Options for the redaction form used when hashing/signing an event.
+ */
+export interface RedactionOptions {
+  /**
+   * Retain `origin`/`prev_state` for room versions 3-10. The spec keeps both
+   * fields until v11 ([Room Version 11](https://spec.matrix.org/latest/rooms/v11/)),
+   * and an event that CARRIES them (e.g. a Tuwunel / pre-2023 Synapse PDU)
+   * must be hashed and signed with them, otherwise its reference-hash ID and
+   * signature differ from every spec-compliant verifier's.
+   *
+   * This server's default outbound derivation treats v3-10 as modern to stay
+   * byte-compatible with current Synapse traffic (which omits the fields), so
+   * the spec form must be requested explicitly for origin-bearing events.
+   */
+  preserveLegacyFields?: boolean;
+}
+
+function isLegacyRedaction(
+  roomVersion: string | undefined,
+  options?: RedactionOptions
+): boolean {
   const num = parseInt(roomVersion ?? '', 10);
-  // Only room versions 1 and 2 use the legacy redaction keep-list (with
-  // `origin` and `prev_state`). From v3 onwards those fields are stripped;
-  // keeping them breaks signatures from modern Synapse on v3-v10 rooms.
-  // Pre-2023 events that still use the old shape are handled by the
-  // legacy-form fallback in federation-verify.ts.
-  return Number.isFinite(num) && num <= 2;
+  if (!Number.isFinite(num)) return false;
+  if (num <= 2) return true;
+  // v3-v10: `origin`/`prev_state` are still redaction-protected. Opt in when
+  // the event actually carries them (send_join PDUs must carry `origin`).
+  return options?.preserveLegacyFields === true && num <= 10;
 }
 
 /**
@@ -97,10 +117,11 @@ function isLegacyRedaction(roomVersion: string | undefined): boolean {
  */
 export function redactEventForSigning(
   event: Record<string, unknown>,
-  roomVersion?: string
+  roomVersion?: string,
+  options?: RedactionOptions
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
-  const keepTopLevel = isLegacyRedaction(roomVersion)
+  const keepTopLevel = isLegacyRedaction(roomVersion, options)
     ? REDACTION_KEEP_TOP_LEVEL_LEGACY
     : REDACTION_KEEP_TOP_LEVEL;
   for (const key of keepTopLevel) {
@@ -110,7 +131,7 @@ export function redactEventForSigning(
   }
 
   const type = typeof event.type === 'string' ? event.type : '';
-  const legacy = isLegacyRedaction(roomVersion);
+  const legacy = isLegacyRedaction(roomVersion, options);
 
   if (!legacy && CONTENT_KEEP_ALL_V11.has(type)) {
     // Full content retained.
@@ -144,14 +165,32 @@ export function redactEventForSigning(
 }
 
 /**
+ * Redaction options an event itself demands: a v3-v10 event that carries
+ * `origin` or `prev_state` was hashed/signed by its creator with those fields
+ * retained (the spec keeps them until v11), so re-deriving it with the modern
+ * shape would change its reference-hash ID and invalidate its signature.
+ */
+export function redactionOptionsForEvent(
+  event: Record<string, unknown>,
+  roomVersion?: string
+): RedactionOptions | undefined {
+  const num = parseInt(roomVersion ?? '', 10);
+  if (!Number.isFinite(num) || num < 3 || num > 10) return undefined;
+  return 'origin' in event || 'prev_state' in event
+    ? { preserveLegacyFields: true }
+    : undefined;
+}
+
+/**
  * Canonical JSON of the event as used for both the reference hash and event
  * signatures: the redacted event with `signatures` and `unsigned` removed.
  */
 export function eventSigningCanonicalJson(
   event: Record<string, unknown>,
-  roomVersion?: string
+  roomVersion?: string,
+  options?: RedactionOptions
 ): string {
-  const redacted = redactEventForSigning(event, roomVersion);
+  const redacted = redactEventForSigning(event, roomVersion, options);
   delete redacted['signatures'];
   delete redacted['unsigned'];
   return canonicalJson(redacted);
@@ -163,9 +202,10 @@ export function eventSigningCanonicalJson(
  */
 export async function computeEventReferenceHash(
   event: Record<string, unknown>,
-  roomVersion?: string
+  roomVersion?: string,
+  options?: RedactionOptions
 ): Promise<string> {
-  return sha256(eventSigningCanonicalJson(event, roomVersion));
+  return sha256(eventSigningCanonicalJson(event, roomVersion, options));
 }
 
 /**
@@ -174,9 +214,10 @@ export async function computeEventReferenceHash(
  */
 export async function computeWireEventId(
   event: Record<string, unknown>,
-  roomVersion?: string
+  roomVersion?: string,
+  options?: RedactionOptions
 ): Promise<string> {
-  return `$${await computeEventReferenceHash(event, roomVersion)}`;
+  return `$${await computeEventReferenceHash(event, roomVersion, options)}`;
 }
 
 /**

@@ -75,6 +75,13 @@ vi.mock('../src/utils/event-signing', () => ({
     redactEventForSigning(...(args as [Record<string, unknown>])),
   toWireEventObject: (...args: unknown[]) =>
     toWireEventObject(...(args as [Record<string, unknown>])),
+  redactionOptionsForEvent: (event: Record<string, unknown>, roomVersion?: string) => {
+    const num = parseInt(roomVersion ?? '', 10);
+    if (!Number.isFinite(num) || num < 3 || num > 10) return undefined;
+    return 'origin' in event || 'prev_state' in event
+      ? { preserveLegacyFields: true }
+      : undefined;
+  },
 }));
 
 vi.mock('../src/utils/ids', () => ({

@@ -71,6 +71,13 @@ vi.mock('../src/utils/event-signing', () => ({
     return wire;
   }),
   isMsc4291RoomVersion: vi.fn((v: string) => v === '12'),
+  redactionOptionsForEvent: (event: Record<string, unknown>, roomVersion?: string) => {
+    const num = parseInt(roomVersion ?? '', 10);
+    if (!Number.isFinite(num) || num < 3 || num > 10) return undefined;
+    return 'origin' in event || 'prev_state' in event
+      ? { preserveLegacyFields: true }
+      : undefined;
+  },
 }));
 
 const deriveRoomWireEvents = vi.fn();

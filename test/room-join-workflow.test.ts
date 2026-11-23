@@ -67,6 +67,13 @@ vi.mock('../src/utils/event-signing', () => ({
     redactEventForSigning(...(args as [Record<string, unknown>])),
   toWireEventObject: (...args: unknown[]) =>
     toWireEventObject(...(args as [Record<string, unknown>])),
+  redactionOptionsForEvent: (event: Record<string, unknown>, roomVersion?: string) => {
+    const num = parseInt(roomVersion ?? '', 10);
+    if (!Number.isFinite(num) || num < 3 || num > 10) return undefined;
+    return 'origin' in event || 'prev_state' in event
+      ? { preserveLegacyFields: true }
+      : undefined;
+  },
 }));
 
 vi.mock('../src/utils/ids', () => ({
@@ -306,7 +313,9 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
   });
 
   it('remote join happy path: make_join → validate → create from template → send_join → persist', async () => {
-    const template = validRemoteTemplate();
+    // Tuwunel's make_join template carries its own origin; the joining PDU
+    // must replace it with ours (send_join rejects a PDU without `origin`).
+    const template = validRemoteTemplate({ origin: 'remote.example' });
     federationGet.mockResolvedValue(
       new Response(JSON.stringify(template), { status: 200 })
     );
@@ -414,6 +423,12 @@ describe('RoomJoinWorkflow local/remote/clock/edge paths after #65', () => {
     expect((stored as { signatures: unknown }).signatures).toEqual({
       'example.com': { 'ed25519:test': 'sig' },
     });
+    // Tuwunel requires the top-level origin on /send_join. For room v10 it is
+    // redaction-protected, so it has to be hashed/signed with the event.
+    expect((stored as { origin?: string }).origin).toBe('example.com');
+    expect(federationPut.mock.calls[0][2]).toMatchObject({ origin: 'example.com' });
+    // ...and signed with the pre-v11 (origin-preserving) redaction form.
+    expect(computeWireEventId.mock.calls[0][2]).toEqual({ preserveLegacyFields: true });
     expect(federationPut).toHaveBeenCalled();
     const putPath = federationPut.mock.calls[0][1];
     expect(putPath).toContain('/_matrix/federation/v2/send_join/');

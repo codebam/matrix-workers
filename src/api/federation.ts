@@ -4,7 +4,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Env, PDU } from '../types';
 import { Errors } from '../utils/errors';
 import { generateSigningKeyPair, signJson, sha256, verifySignature, verifyContentHash } from '../utils/crypto';
-import { computeWireEventId, inboundWireEventIdCandidates, isMsc4291RoomVersion, redactEventForSigning, toWireEventObject, omitWireEventId } from '../utils/event-signing';
+import { computeWireEventId, inboundWireEventIdCandidates, isMsc4291RoomVersion, redactEventForSigning, redactionOptionsForEvent, toWireEventObject, omitWireEventId } from '../utils/event-signing';
 import { requireFederationAuth } from '../middleware/federation-auth';
 import { federationOriginRateLimit } from '../middleware/rate-limit';
 import {
@@ -1249,8 +1249,8 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
           const insertResult = await c.env.DB.prepare(
             `INSERT OR IGNORE INTO events
-             (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+             (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures, stream_ordering, origin)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
             eventId,
             roomId,
@@ -1264,7 +1264,8 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             JSON.stringify(pdu.prev_events || []),
             pdu.hashes ? JSON.stringify(pdu.hashes) : null,
             pdu.signatures ? JSON.stringify(pdu.signatures) : null,
-            streamOrdering
+            streamOrdering,
+            typeof pdu.origin === 'string' ? pdu.origin : null
           ).run();
 
           // Update room state
@@ -1622,7 +1623,7 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
 
   let event = await c.env.DB.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+     origin_server_ts, depth, auth_events, prev_events, hashes, signatures, origin
      FROM events WHERE event_id = ?`
   ).bind(eventId).first<{
     event_id: string;
@@ -1637,6 +1638,7 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
     prev_events: string;
     hashes: string | null;
     signatures: string | null;
+    origin: string | null;
   }>();
 
   if (!event) {
@@ -1697,6 +1699,7 @@ app.get('/_matrix/federation/v1/event/:eventId', async (c) => {
     prev_events: JSON.parse(event.prev_events),
     hashes: event.hashes ? JSON.parse(event.hashes) : undefined,
     signatures: event.signatures ? JSON.parse(event.signatures) : undefined,
+    ...(event.origin ? { origin: event.origin } : {}),
   };
 
   return c.json({
@@ -1804,6 +1807,7 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     prev_events: string;
     hashes: string | null;
     signatures: string | null;
+    origin: string | null;
   };
   const scoped = eventId ? await stateBeforeEvent(c.env.DB, roomId, eventId) : null;
   if (eventId && !scoped) return Errors.notFound('Event not found').toResponse();
@@ -1824,12 +1828,13 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
       prev_events: JSON.stringify(p.prev_events ?? []),
       hashes: p.hashes ? JSON.stringify(p.hashes) : null,
       signatures: p.signatures ? JSON.stringify(p.signatures) : null,
+      origin: p.origin ?? null,
     }));
     authSeeds = scoped.authSeeds;
   } else {
     stateEvents = (await c.env.DB.prepare(
       `SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content,
-       e.origin_server_ts, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures
+       e.origin_server_ts, e.depth, e.auth_events, e.prev_events, e.hashes, e.signatures, e.origin
        FROM room_state rs
        JOIN events e ON rs.event_id = e.event_id
        WHERE rs.room_id = ?`
@@ -1850,6 +1855,7 @@ app.get('/_matrix/federation/v1/state/:roomId', async (c) => {
     prev_events: JSON.parse(e.prev_events),
     hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
     signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
+    ...(e.origin ? { origin: e.origin } : {}),
   }));
 
   const authChain = await collectAuthChain(c.env.DB, authSeeds);
@@ -1980,7 +1986,7 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
 
     const authEvent = await c.env.DB.prepare(
       `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+       origin_server_ts, depth, auth_events, prev_events, hashes, signatures, origin
        FROM events WHERE event_id = ?`
     ).bind(authId).first<{
       event_id: string;
@@ -1995,6 +2001,7 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
       prev_events: string;
       hashes: string | null;
       signatures: string | null;
+      origin: string | null;
     }>();
 
     if (authEvent) {
@@ -2012,6 +2019,7 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
         prev_events: JSON.parse(authEvent.prev_events),
         hashes: authEvent.hashes ? JSON.parse(authEvent.hashes) : undefined,
         signatures: authEvent.signatures ? JSON.parse(authEvent.signatures) : undefined,
+        ...(authEvent.origin ? { origin: authEvent.origin } : {}),
       }, room.room_version)) as PDU);
 
       // Add this event's auth_events to process (wire IDs when derived)
@@ -2088,7 +2096,7 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
 
   const events = (await c.env.DB.prepare(
     `SELECT event_id, room_id, sender, event_type, state_key, content,
-     origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+     origin_server_ts, depth, auth_events, prev_events, hashes, signatures, origin
      FROM events
      WHERE room_id = ? AND depth < ?
      ORDER BY depth DESC
@@ -2108,6 +2116,7 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     prev_events: JSON.parse(e.prev_events),
     hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
     signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
+    ...(e.origin ? { origin: e.origin } : {}),
   }));
 
   const bfWire = await wireForRoom(c.env, roomId, room.room_version);
@@ -2188,7 +2197,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
 
     const event = await c.env.DB.prepare(
       `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+       origin_server_ts, depth, auth_events, prev_events, hashes, signatures, origin
        FROM events
        WHERE event_id = ? AND room_id = ? AND depth >= ?`
     ).bind(eventId, roomId, minDepth).first<{
@@ -2204,6 +2213,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
       prev_events: string;
       hashes: string | null;
       signatures: string | null;
+      origin: string | null;
     }>();
 
     if (event) {
@@ -2220,6 +2230,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
         prev_events: JSON.parse(event.prev_events),
         hashes: event.hashes ? JSON.parse(event.hashes) : undefined,
         signatures: event.signatures ? JSON.parse(event.signatures) : undefined,
+        ...(event.origin ? { origin: event.origin } : {}),
       });
 
       // Add prev_events to process
@@ -2285,8 +2296,13 @@ async function persistInboundJoin(
   const signingKey = await getServerSigningKey(env.DB);
   if (!signingKey) return null;
 
+  // A pre-v11 event carrying `origin` was signed with the spec keep-list;
+  // countersign (and derive its ID) with the same form or the joining
+  // server's peers will reject our signature.
+  const wireEvent = toWireEventObject(joinEvent);
+  const redactionOptions = redactionOptionsForEvent(wireEvent, roomVersion);
   const signed = await signJson(
-    redactEventForSigning(toWireEventObject(joinEvent), roomVersion),
+    redactEventForSigning(wireEvent, roomVersion, redactionOptions),
     env.SERVER_NAME,
     signingKey.keyId,
     signingKey.privateKeyJwk
@@ -2297,7 +2313,7 @@ async function persistInboundJoin(
     ...(ourSig ? { [env.SERVER_NAME]: ourSig } : {}),
   };
 
-  const wireId = await computeWireEventId(joinEvent, roomVersion);
+  const wireId = await computeWireEventId(joinEvent, roomVersion, redactionOptions);
   joinEvent['event_id'] = wireId;
 
   const event = joinEvent as unknown as PDU;
@@ -2322,7 +2338,8 @@ async function persistLegacyInboundJoin(
   env: Env,
   roomId: string,
   joinEvent: Record<string, unknown>,
-  origin?: string
+  origin?: string,
+  roomVersion?: string
 ): Promise<string | null> {
   if (
     joinEvent['room_id'] !== roomId ||
@@ -2348,10 +2365,12 @@ async function persistLegacyInboundJoin(
   const signingKey = await getServerSigningKey(env.DB);
   if (signingKey) {
     // v4+ signatures cover the wire form: no event_id, no unsigned. Signing
-    // with event_id present produces a signature peers cannot verify.
+    // with event_id present produces a signature peers cannot verify. Keep
+    // origin/prev_state when the event carries them: pre-v11 redaction
+    // protects both, and dropping them invalidates the signature.
     const wire = toWireEventObject(joinEvent);
     const signed = await signJson(
-      redactEventForSigning(wire),
+      redactEventForSigning(wire, roomVersion, redactionOptionsForEvent(wire, roomVersion)),
       env.SERVER_NAME,
       signingKey.keyId,
       signingKey.privateKeyJwk
@@ -2738,7 +2757,8 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
       c.env,
       roomId,
       body as Record<string, unknown>,
-      joinOrigin
+      joinOrigin,
+      room.room_version
     );
     if (!storedJoinId) {
       return Errors.forbidden('Join event was rejected').toResponse();
@@ -2796,7 +2816,7 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
   for (const authId of authChainIds) {
     const authEvent = await c.env.DB.prepare(
       `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+       origin_server_ts, depth, auth_events, prev_events, hashes, signatures, origin
        FROM events WHERE event_id = ?`
     ).bind(authId).first();
 
@@ -2814,6 +2834,7 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
         prev_events: JSON.parse((authEvent as any).prev_events),
         hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
         signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
+        ...((authEvent as any).origin ? { origin: (authEvent as any).origin } : {}),
       });
     }
   }
@@ -2834,6 +2855,7 @@ app.put('/_matrix/federation/v1/send_join/:roomId/:eventId', async (c) => {
       prev_events: JSON.parse(e.prev_events),
       hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
       signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
+      ...(e.origin ? { origin: e.origin } : {}),
     }, room.room_version)),
     event: omitWireEventId(body, room.room_version),
   });
@@ -2901,7 +2923,8 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
       c.env,
       roomId,
       body as Record<string, unknown>,
-      joinOrigin
+      joinOrigin,
+      room.room_version
     );
     if (!storedJoinId) {
       return Errors.forbidden('Join event was rejected').toResponse();
@@ -2973,7 +2996,7 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
   for (const authId of authChainIds) {
     const authEvent = await c.env.DB.prepare(
       `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+       origin_server_ts, depth, auth_events, prev_events, hashes, signatures, origin
        FROM events WHERE event_id = ?`
     ).bind(authId).first();
 
@@ -2991,6 +3014,7 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
         prev_events: JSON.parse((authEvent as any).prev_events),
         hashes: (authEvent as any).hashes ? JSON.parse((authEvent as any).hashes) : undefined,
         signatures: (authEvent as any).signatures ? JSON.parse((authEvent as any).signatures) : undefined,
+        ...((authEvent as any).origin ? { origin: (authEvent as any).origin } : {}),
       });
     }
   }
@@ -3024,6 +3048,7 @@ app.put('/_matrix/federation/v2/send_join/:roomId/:eventId', async (c) => {
       prev_events: JSON.parse(e.prev_events),
       hashes: e.hashes ? JSON.parse(e.hashes) : undefined,
       signatures: e.signatures ? JSON.parse(e.signatures) : undefined,
+      ...(e.origin ? { origin: e.origin } : {}),
     }, room.room_version)),
     event: omitWireEventId(body, room.room_version),
     members_omitted: false,
@@ -3373,6 +3398,7 @@ async function storeInboundInvite(
       prev_events: Array.isArray(inviteEvent.prev_events) ? inviteEvent.prev_events : [],
       hashes: inviteEvent.hashes,
       signatures: inviteEvent.signatures,
+      ...(typeof inviteEvent.origin === 'string' ? { origin: inviteEvent.origin } : {}),
     };
     const { inserted } = await storeEventIdempotent(env.DB, invitePdu);
 
@@ -4366,8 +4392,8 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
 
     await db.prepare(`
       INSERT OR IGNORE INTO events
-      (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures, stream_ordering)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, depth, auth_events, prev_events, hashes, signatures, stream_ordering, origin)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       eventId,
       roomId,
@@ -4381,7 +4407,8 @@ app.put('/_matrix/federation/v1/send_knock/:roomId/:eventId', async (c) => {
       JSON.stringify(body.prev_events || []),
       body.hashes ? JSON.stringify(body.hashes) : null,
       body.signatures ? JSON.stringify(body.signatures) : null,
-      knockStreamOrdering
+      knockStreamOrdering,
+      typeof body.origin === 'string' ? body.origin : null
     ).run();
 
     // Update room state
