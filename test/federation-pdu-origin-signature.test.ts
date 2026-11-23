@@ -114,7 +114,7 @@ function makeHarness() {
     return {
       status: response.status,
       body: (await response.json()) as {
-        pdus: Record<string, { error?: string }>;
+        pdus: Record<string, { error?: { errcode: string; error: string } }>;
       },
     };
   }
@@ -147,8 +147,8 @@ describe('inbound PDU origin signature enforcement', () => {
     const { status, body } = await send(pdu);
 
     expect(status).toBe(200);
-    expect(body.pdus['$unsigned'].error).toMatch(/without valid signature/);
-    expect(body.pdus['$unsigned'].error).toMatch(/no signature/);
+    expect(body.pdus['$unsigned'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
+    expect(body.pdus['$unsigned'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/no signature/) });
     expect(storedEvents()).toHaveLength(0);
     expect(processed.get('$unsigned')?.accepted).toBe(0);
   });
@@ -161,8 +161,8 @@ describe('inbound PDU origin signature enforcement', () => {
 
     const { body } = await send(pdu);
 
-    expect(body.pdus['$foreign'].error).toMatch(/without valid signature/);
-    expect(body.pdus['$foreign'].error).toMatch(/no signature from remote.example.com/);
+    expect(body.pdus['$foreign'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
+    expect(body.pdus['$foreign'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/no signature from remote.example.com/) });
     expect(storedEvents()).toHaveLength(0);
   });
 

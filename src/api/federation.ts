@@ -35,6 +35,13 @@ import {
   verifyPolicySignature,
 } from '../services/policy-server';
 
+// Spec (PUT /_matrix/federation/v1/send/{txnId}): every entry of the 200
+// `pdus` map is either `{}` (accepted) or `{ error: <Matrix error object> }`.
+// A bare reason string is not a valid Matrix error object, so all per-PDU
+// failures go through this helper. Authorisation/policy denials use
+// M_FORBIDDEN; malformed or unverifiable events stay M_UNKNOWN.
+const pduError = (error: string, errcode: string = 'M_UNKNOWN') => ({ error: { errcode, error } });
+
 // Spec module "Server ACLs" (MSC4436): denied servers get no room content
 // from any federation surface. The transaction, make_join, send_join and
 // invite paths enforce this at their auth points; this guard covers the
@@ -942,25 +949,21 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         if (existingPdu.accepted) {
           pduResults[eventId] = {};
         } else {
-          pduResults[eventId] = {
-            error: existingPdu.rejection_reason || 'Previously rejected',
-          };
+          pduResults[eventId] = pduError(existingPdu.rejection_reason || 'Previously rejected');
         }
         continue;
       }
 
       // Validate basic PDU structure
       if (!eventId || !roomId || !pdu.sender || !pdu.type || !pdu.content) {
-        pduResults[eventId || 'unknown'] = {
-          error: 'Invalid PDU structure',
-        };
+        pduResults[eventId || 'unknown'] = pduError('Invalid PDU structure');
         continue;
       }
 
       // Get the origin server from the sender
       const pduOrigin = (pdu.sender as string).split(':')[1];
       if (!pduOrigin) {
-        pduResults[eventId] = { error: 'Invalid sender format' };
+        pduResults[eventId] = pduError('Invalid sender format');
         continue;
       }
 
@@ -979,7 +982,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
       if (requiresHash && !hasSha256) {
         const reason = `Missing required hashes.sha256 (room_version=${roomVersion ?? 'unknown'})`;
-        pduResults[eventId] = { error: reason };
+        pduResults[eventId] = pduError(reason);
         await c.env.DB.prepare(
           `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
            VALUES (?, ?, ?, ?, 0, ?)`
@@ -1001,7 +1004,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         try {
           const hashValid = await verifyContentHash(pdu as Record<string, unknown>, pdu.hashes.sha256);
           if (!hashValid) {
-            pduResults[eventId] = { error: 'Content hash mismatch' };
+            pduResults[eventId] = pduError('Content hash mismatch');
             await c.env.DB.prepare(
               `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
                VALUES (?, ?, ?, ?, 0, ?)`
@@ -1015,7 +1018,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           // requirement above.
           if (requiresHash) {
             const reason = 'Content hash verification error';
-            pduResults[eventId] = { error: reason };
+            pduResults[eventId] = pduError(reason);
             await c.env.DB.prepare(
               `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
                VALUES (?, ?, ?, ?, 0, ?)`
@@ -1055,7 +1058,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       );
       if ('error' in verification) {
         const reason = `PDU from origin server ${pduOrigin} without valid signature: ${verification.error}`;
-        pduResults[eventId] = { error: reason };
+        pduResults[eventId] = pduError(reason);
         await c.env.DB.prepare(
           `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
            VALUES (?, ?, ?, ?, 0, ?)`
@@ -1089,7 +1092,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
         }
         const strictReason = checkAuthRules(pdu as PDU, room.room_version, { byId, state: stateMap });
         if (strictReason) {
-          pduResults[eventId] = { error: strictReason };
+          pduResults[eventId] = pduError(strictReason, 'M_FORBIDDEN');
           await c.env.DB.prepare(
             `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
              VALUES (?, ?, ?, ?, 0, ?)`
@@ -1117,7 +1120,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             const senderServer = serverNameFromId((pdu as { sender: string }).sender);
             if (!isServerAllowedByAcl(acl, senderServer)) {
               const reason = `Server ${senderServer} is denied by the room's server ACL`;
-              pduResults[eventId] = { error: reason };
+              pduResults[eventId] = pduError(reason, 'M_FORBIDDEN');
               await c.env.DB.prepare(
                 `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
                  VALUES (?, ?, ?, ?, 0, ?)`
@@ -1135,7 +1138,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
             );
             if (modBan) {
               const modReason = `Server is banned by a moderation policy list (${modBan.reason || modBan.entity})`;
-              pduResults[eventId] = { error: modReason };
+              pduResults[eventId] = pduError(modReason, 'M_FORBIDDEN');
               await c.env.DB.prepare(
                 `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
                  VALUES (?, ?, ?, ?, 0, ?)`
@@ -1146,7 +1149,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
 
           const authResult = checkEventAuth(pdu as PDU, roomState, room.room_version);
           if (!authResult.allowed) {
-            pduResults[eventId] = { error: authResult.error || 'Event authorization failed' };
+            pduResults[eventId] = pduError(authResult.error || 'Event authorization failed', 'M_FORBIDDEN');
             await c.env.DB.prepare(
               `INSERT OR REPLACE INTO processed_pdus (event_id, origin, room_id, processed_at, accepted, rejection_reason)
                VALUES (?, ?, ?, ?, 0, ?)`
@@ -1392,9 +1395,9 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
           pduResults[eventId] = {};
         } catch (e) {
           console.error(`Failed to store event ${eventId}:`, e);
-          pduResults[eventId] = {
-            error: e instanceof Error ? e.message : 'Transient storage failure',
-          };
+          pduResults[eventId] = pduError(
+            e instanceof Error ? e.message : 'Transient storage failure'
+          );
           transientStorageFailure = true;
         }
       } else {
@@ -1408,9 +1411,7 @@ app.put('/_matrix/federation/v1/send/:txnId', async (c) => {
       }
     } catch (e: any) {
       const eventId = pdu?.event_id || 'unknown';
-      pduResults[eventId] = {
-        error: e.message || 'Unknown error',
-      };
+      pduResults[eventId] = pduError(e.message || 'Unknown error');
 
       // Record rejection
       if (pdu?.event_id && pdu?.room_id) {

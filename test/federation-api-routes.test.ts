@@ -1247,9 +1247,9 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
       ],
     });
     expect(status).toBe(200);
-    const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
-    expect(pdus['$bad1'].error).toMatch(/Invalid PDU/);
-    expect(pdus['$bad2'].error).toMatch(/Invalid sender/);
+    const pdus = (body as { pdus: Record<string, { error?: { errcode: string; error: string } }> }).pdus;
+    expect(pdus['$bad1'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/Invalid PDU/) });
+    expect(pdus['$bad2'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/Invalid sender/) });
   });
 
   it('rejects PDUs from servers denied by the room ACL', async () => {
@@ -1298,8 +1298,8 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
       pdus: [evilPdu, okPdu],
     });
     expect(status).toBe(200);
-    const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
-    expect(pdus['$evil-msg'].error).toMatch(/server ACL/);
+    const pdus = (body as { pdus: Record<string, { error?: { errcode: string; error: string } }> }).pdus;
+    expect(pdus['$evil-msg'].error).toMatchObject({ errcode: 'M_FORBIDDEN', error: expect.stringMatching(/server ACL/) });
     expect(pdus['$ok-msg'].error).toBeUndefined();
     // The denied PDU never reaches the (mocked) DAG auth check.
     expect(checkEventAuth).toHaveBeenCalledTimes(1);
@@ -1372,9 +1372,9 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
         { event_id: '$no', room_id: ROOM, sender: REMOTE_USER, type: 'm.room.message', content: {} },
       ],
     });
-    const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
+    const pdus = (body as { pdus: Record<string, { error?: { errcode: string; error: string } }> }).pdus;
     expect(pdus['$ok']).toEqual({});
-    expect(pdus['$no'].error).toBe('nope');
+    expect(pdus['$no'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'nope' });
   });
 
   it('rejects PDUs with invalid signatures', async () => {
@@ -1394,9 +1394,7 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
         },
       ],
     });
-    expect((body as { pdus: Record<string, { error: string }> }).pdus['$sig'].error).toMatch(
-      /without valid signature/
-    );
+    expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$sig'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
   });
 
   it('rejects modern room PDUs missing hashes.sha256', async () => {
@@ -1414,9 +1412,7 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
         },
       ],
     });
-    expect((body as { pdus: Record<string, { error: string }> }).pdus['$nohash'].error).toMatch(
-      /Missing required hashes.sha256/
-    );
+    expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$nohash'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/Missing required hashes.sha256/) });
   });
 
   it('rejects auth-failed PDUs when room exists', async () => {
@@ -1440,9 +1436,7 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
         },
       ],
     });
-    expect((body as { pdus: Record<string, { error: string }> }).pdus['$authfail'].error).toMatch(
-      /power levels|authorization/i
-    );
+    expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$authfail'].error).toMatchObject({ errcode: 'M_FORBIDDEN', error: expect.stringMatching(/power levels|authorization/i) });
   });
 
   it('derives reference-hash event ids for modern PDUs that omit event_id', async () => {
@@ -1468,7 +1462,7 @@ describe('PUT /_matrix/federation/v1/send/:txnId', () => {
     );
 
     expect(status).toBe(200);
-    const pdus = (body as { pdus: Record<string, { error?: string }> }).pdus;
+    const pdus = (body as { pdus: Record<string, { error?: { errcode: string; error: string } }> }).pdus;
     expect(Object.keys(pdus)).toEqual([derivedId]);
     expect(pdus[derivedId].error).toBeUndefined();
   });
@@ -3095,9 +3089,7 @@ describe('additional send / query / claim edges', () => {
         },
       ],
     });
-    expect((body as { pdus: Record<string, { error: string }> }).pdus['$3p'].error).toMatch(
-      /without valid signature/
-    );
+    expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$3p'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
   });
 
   it('send rejects unknown-room PDUs missing hash under strict default', async () => {
@@ -3115,9 +3107,7 @@ describe('additional send / query / claim edges', () => {
         },
       ],
     });
-    expect((body as { pdus: Record<string, { error: string }> }).pdus['$unk'].error).toMatch(
-      /Missing required hashes/
-    );
+    expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$unk'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/Missing required hashes/) });
   });
 
   it('send caches empty PDU transaction response', async () => {

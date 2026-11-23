@@ -1185,8 +1185,7 @@ describe('race quaternary federation empty-ts / leave / v2 / crop after #279', (
     expect(statusesOf([legacy, nohash])).toEqual([200, 200]);
     expect((legacy.body as { pdus: Record<string, unknown> }).pdus['$qv2ok']).toEqual({});
     expect(
-      (nohash.body as { pdus: Record<string, { error: string }> }).pdus['$qv11miss'].error
-    ).toBe('Missing required hashes.sha256 (room_version=11)');
+      (nohash.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$qv11miss'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Missing required hashes.sha256 (room_version=11)' });
   });
 
   it('make_leave not-member∥send_leave not-leave isolation', async () => {

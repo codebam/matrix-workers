@@ -2318,12 +2318,8 @@ describe('race residual send hash∥prev-rejected after #252', () => {
     ]);
     expect(miss.status).toBe(200);
     expect(prev.status).toBe(200);
-    expect((miss.body as { pdus: Record<string, { error: string }> }).pdus[eidMiss].error).toBe(
-      'Content hash mismatch'
-    );
-    expect((prev.body as { pdus: Record<string, { error: string }> }).pdus[eidPrev].error).toBe(
-      'Previously rejected'
-    );
+    expect((miss.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eidMiss].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Content hash mismatch' });
+    expect((prev.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eidPrev].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Previously rejected' });
   });
 
   it('origin-sig∥auth-throw accept isolation', async () => {
@@ -2374,9 +2370,7 @@ describe('race residual send hash∥prev-rejected after #252', () => {
     ]);
     expect(sig.status).toBe(200);
     expect(accept.status).toBe(200);
-    expect((sig.body as { pdus: Record<string, { error: string }> }).pdus['$racesig'].error).toMatch(
-      /without valid signature/
-    );
+    expect((sig.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$racesig'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
     expect((accept.body as { pdus: Record<string, unknown> }).pdus['$raceaccept']).toEqual({});
   });
 
@@ -2577,12 +2571,8 @@ describe('race residual third-party∥origin / missing-hash∥auth-denied after 
       }),
     ]);
     expect(statusesOf([third, origin])).toEqual([200, 200]);
-    expect((third.body as { pdus: Record<string, { error: string }> }).pdus['$r265third'].error).toMatch(
-      /without valid signature/
-    );
-    expect((origin.body as { pdus: Record<string, { error: string }> }).pdus['$r265origin'].error).toMatch(
-      /without valid signature/
-    );
+    expect((third.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$r265third'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
+    expect((origin.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$r265origin'].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
   });
 
   it('missing-hash v10∥auth-denied isolation', async () => {
@@ -2621,12 +2611,8 @@ describe('race residual third-party∥origin / missing-hash∥auth-denied after 
       }),
     ]);
     expect(statusesOf([nohash, deny])).toEqual([200, 200]);
-    expect((nohash.body as { pdus: Record<string, { error: string }> }).pdus['$r265nohash'].error).toBe(
-      'Missing required hashes.sha256 (room_version=10)'
-    );
-    expect((deny.body as { pdus: Record<string, { error: string }> }).pdus['$r265deny'].error).toBe(
-      'power levels'
-    );
+    expect((nohash.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$r265nohash'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Missing required hashes.sha256 (room_version=10)' });
+    expect((deny.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$r265deny'].error).toEqual({ errcode: 'M_FORBIDDEN', error: 'power levels' });
   });
 
   for (let i = 0; i < 8; i++) {
@@ -2708,9 +2694,7 @@ describe('race residual previously-accepted∥rejected / invalid PDU∥sender af
     ]);
     expect(statusesOf([ok, no])).toEqual([200, 200]);
     expect((ok.body as { pdus: Record<string, unknown> }).pdus['$r265ok']).toEqual({});
-    expect((no.body as { pdus: Record<string, { error: string }> }).pdus['$r265no'].error).toBe(
-      'Previously rejected'
-    );
+    expect((no.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$r265no'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Previously rejected' });
   });
 
   it('invalid PDU structure∥invalid sender dual', async () => {
@@ -2735,12 +2719,8 @@ describe('race residual previously-accepted∥rejected / invalid PDU∥sender af
       }),
     ]);
     expect(statusesOf([struct, sender])).toEqual([200, 200]);
-    expect((struct.body as { pdus: Record<string, { error: string }> }).pdus['$r265struct'].error).toBe(
-      'Invalid PDU structure'
-    );
-    expect((sender.body as { pdus: Record<string, { error: string }> }).pdus['$r265sender'].error).toBe(
-      'Invalid sender format'
-    );
+    expect((struct.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$r265struct'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid PDU structure' });
+    expect((sender.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$r265sender'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid sender format' });
   });
 
   for (let i = 0; i < 8; i++) {
@@ -2909,9 +2889,7 @@ describe('race second-wave legacy∥hash-v10 / custom-reject∥auth-fallback aft
     ]);
     expect(statusesOf([legacy, nohash])).toEqual([200, 200]);
     expect((legacy.body as { pdus: Record<string, unknown> }).pdus['$swlegacy']).toEqual({});
-    expect((nohash.body as { pdus: Record<string, { error: string }> }).pdus['$swnohash'].error).toBe(
-      'Missing required hashes.sha256 (room_version=10)'
-    );
+    expect((nohash.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$swnohash'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Missing required hashes.sha256 (room_version=10)' });
   });
 
   it('custom rejection_reason∥auth-fallback isolation', async () => {
@@ -2950,12 +2928,8 @@ describe('race second-wave legacy∥hash-v10 / custom-reject∥auth-fallback aft
       }),
     ]);
     expect(statusesOf([prev, deny])).toEqual([200, 200]);
-    expect((prev.body as { pdus: Record<string, { error: string }> }).pdus['$swcustom'].error).toBe(
-      'custom-reason-race'
-    );
-    expect((deny.body as { pdus: Record<string, { error: string }> }).pdus['$swauthfb'].error).toBe(
-      'Event authorization failed'
-    );
+    expect((prev.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$swcustom'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'custom-reason-race' });
+    expect((deny.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$swauthfb'].error).toEqual({ errcode: 'M_FORBIDDEN', error: 'Event authorization failed' });
   });
 
   for (let i = 0; i < 8; i++) {
@@ -2988,8 +2962,7 @@ describe('race second-wave legacy∥hash-v10 / custom-reject∥auth-fallback aft
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
       expect(
-        (results[1].body as { pdus: Record<string, { error: string }> }).pdus[derivedId].error
-      ).toBe('Invalid PDU structure');
+        (results[1].body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[derivedId].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid PDU structure' });
     });
   }
 });
@@ -3404,9 +3377,7 @@ describe('race quaternary legacy-v2∥timestamp empty∥hierarchy via+next_batch
     ]);
     expect(statusesOf([legacy, nohash])).toEqual([200, 200]);
     expect((legacy.body as { pdus: Record<string, unknown> }).pdus['$qlegacy2']).toEqual({});
-    expect((nohash.body as { pdus: Record<string, { error: string }> }).pdus['$qnohash'].error).toBe(
-      'Missing required hashes.sha256 (room_version=10)'
-    );
+    expect((nohash.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$qnohash'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Missing required hashes.sha256 (room_version=10)' });
   });
 
   it('timestamp empty exact∥timestamp hit isolation', async () => {

@@ -1064,9 +1064,7 @@ describe('soft nonary federation invite/PDU/media/auth exact after #342', () => 
         pdus: [pdus[i % pdus.length]],
       });
       expect(res.status).toBe(200);
-      expect((res.body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Invalid PDU structure'
-      );
+      expect((res.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid PDU structure' });
     });
   }
 
@@ -1088,9 +1086,7 @@ describe('soft nonary federation invite/PDU/media/auth exact after #342', () => 
         ],
       });
       expect(res.status).toBe(200);
-      expect((res.body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Invalid sender format'
-      );
+      expect((res.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid sender format' });
     });
   }
 
@@ -1116,9 +1112,7 @@ describe('soft nonary federation invite/PDU/media/auth exact after #342', () => 
         ],
       });
       expect(res.status).toBe(200);
-      expect((res.body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Content hash mismatch'
-      );
+      expect((res.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Content hash mismatch' });
     });
   }
 
@@ -1280,15 +1274,9 @@ describe('race nonary federation invite/PDU/media/auth exact after #342', () => 
         ],
       }),
     ]);
-    expect((struct.body as { pdus: Record<string, { error: string }> }).pdus['$rstruct'].error).toBe(
-      'Invalid PDU structure'
-    );
-    expect((sender.body as { pdus: Record<string, { error: string }> }).pdus['$rsender'].error).toBe(
-      'Invalid sender format'
-    );
-    expect((hash.body as { pdus: Record<string, { error: string }> }).pdus['$rhash'].error).toBe(
-      'Content hash mismatch'
-    );
+    expect((struct.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$rstruct'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid PDU structure' });
+    expect((sender.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$rsender'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid sender format' });
+    expect((hash.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$rhash'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Content hash mismatch' });
   });
 
   it('Media not found then Federation authentication required serial dual', async () => {
@@ -1351,13 +1339,10 @@ describe('race nonary federation invite/PDU/media/auth exact after #342', () => 
       }),
     ]);
     expect((ni.body as { error: string }).error).toBe('Event is not an invite event');
-    expect((hash.body as { pdus: Record<string, { error: string }> }).pdus['$4hash'].error).toBe(
-      'Content hash mismatch'
-    );
+    expect((hash.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$4hash'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Content hash mismatch' });
     expect((media.body as { error: string }).error).toBe('Media not found');
     expect(
-      (sender.body as { pdus: Record<string, { error: string }> }).pdus['$4sender'].error
-    ).toBe('Invalid sender format');
+      (sender.body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus['$4sender'].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid sender format' });
   });
 
   for (let i = 0; i < 8; i++) {
@@ -1399,8 +1384,7 @@ describe('race nonary federation invite/PDU/media/auth exact after #342', () => 
       ]);
       expect((results[0].body as { error: string }).error).toBe('Event is not an invite event');
       expect(
-        (results[1].body as { pdus: Record<string, { error: string }> }).pdus[`$fs${i}`].error
-      ).toBe('Invalid PDU structure');
+        (results[1].body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[`$fs${i}`].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid PDU structure' });
       expect((results[2].body as { error: string }).error).toBe('Media not found');
       expect((results[3].body as { error: string }).error).toBe(
         'Missing required parameter: room_version'

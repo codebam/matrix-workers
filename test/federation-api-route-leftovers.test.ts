@@ -2600,7 +2600,7 @@ describe('failure edges leftovers', () => {
   });
 
   it('edge send invalid pdu', async () => {
-    const r = await req('PUT', '/_matrix/federation/v1/send/inv', makeEnv(seedBasicRoom()), { pdus: [{ event_id: '$x' }] }); expect(r.status).toBe(200); expect((r.body as { pdus: Record<string, { error?: string }> }).pdus['$x'].error).toBeDefined();
+    const r = await req('PUT', '/_matrix/federation/v1/send/inv', makeEnv(seedBasicRoom()), { pdus: [{ event_id: '$x' }] }); expect(r.status).toBe(200); expect((r.body as { pdus: Record<string, { error?: { errcode: string; error: string } }> }).pdus['$x'].error).toBeDefined();
   });
 });
 
@@ -3134,7 +3134,7 @@ describe('soft send content-hash / prev-rejected / origin-sig leftover flood aft
         ],
       });
       expect(status).toBe(200);
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe('Content hash mismatch');
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Content hash mismatch' });
       expect(
         db.inserts.some(
           (ins) =>
@@ -3166,9 +3166,7 @@ describe('soft send content-hash / prev-rejected / origin-sig leftover flood aft
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Content hash verification error'
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Content hash verification error' });
     });
   }
 
@@ -3189,7 +3187,7 @@ describe('soft send content-hash / prev-rejected / origin-sig leftover flood aft
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe('Previously rejected');
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Previously rejected' });
     });
   }
 
@@ -3212,9 +3210,7 @@ describe('soft send content-hash / prev-rejected / origin-sig leftover flood aft
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toMatch(
-        /without valid signature/
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
     });
   }
 
@@ -3440,9 +3436,7 @@ describe('soft send third-party / missing-hash / auth-denied leftover flood afte
         ],
       });
       expect(status).toBe(200);
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toMatch(
-        /without valid signature/
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toMatchObject({ errcode: 'M_UNKNOWN', error: expect.stringMatching(/without valid signature/) });
     });
   }
 
@@ -3465,9 +3459,7 @@ describe('soft send third-party / missing-hash / auth-denied leftover flood afte
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Missing required hashes.sha256 (room_version=10)'
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Missing required hashes.sha256 (room_version=10)' });
     });
   }
 
@@ -3488,9 +3480,7 @@ describe('soft send third-party / missing-hash / auth-denied leftover flood afte
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Missing required hashes.sha256 (room_version=unknown)'
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Missing required hashes.sha256 (room_version=unknown)' });
     });
   }
 
@@ -3516,7 +3506,7 @@ describe('soft send third-party / missing-hash / auth-denied leftover flood afte
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe('power levels');
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_FORBIDDEN', error: 'power levels' });
     });
   }
 });
@@ -3561,9 +3551,7 @@ describe('soft send previously-accepted / invalid / legacy / typing leftover flo
       const { body } = await req('PUT', `/_matrix/federation/v1/send/txn-badstruct-${i}`, makeEnv(db), {
         pdus: [{ event_id: eid, room_id: ROOM }],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Invalid PDU structure'
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid PDU structure' });
     });
   }
 
@@ -3584,9 +3572,7 @@ describe('soft send previously-accepted / invalid / legacy / typing leftover flo
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Invalid sender format'
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid sender format' });
     });
   }
 
@@ -3735,7 +3721,7 @@ describe('soft second-wave send custom-reject / hash-v11 / auth-fallback / unkno
         ],
       });
       expect(status).toBe(200);
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(reason);
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: reason });
     });
   }
 
@@ -3758,9 +3744,7 @@ describe('soft second-wave send custom-reject / hash-v11 / auth-fallback / unkno
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Missing required hashes.sha256 (room_version=11)'
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Missing required hashes.sha256 (room_version=11)' });
     });
   }
 
@@ -3786,9 +3770,7 @@ describe('soft second-wave send custom-reject / hash-v11 / auth-fallback / unkno
           },
         ],
       });
-      expect((body as { pdus: Record<string, { error: string }> }).pdus[eid].error).toBe(
-        'Event authorization failed'
-      );
+      expect((body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[eid].error).toEqual({ errcode: 'M_FORBIDDEN', error: 'Event authorization failed' });
       const pduInsert = db.inserts.find(
         (ins) =>
           String(ins.sql).includes('INSERT OR REPLACE INTO processed_pdus') &&
@@ -3811,8 +3793,7 @@ describe('soft second-wave send custom-reject / hash-v11 / auth-fallback / unkno
         pdus: [pdu],
       });
       expect(
-        (body as { pdus: Record<string, { error: string }> }).pdus[derivedId].error
-      ).toBe('Invalid PDU structure');
+        (body as { pdus: Record<string, { error: { errcode: string; error: string } }> }).pdus[derivedId].error).toEqual({ errcode: 'M_UNKNOWN', error: 'Invalid PDU structure' });
     });
   }
 });
