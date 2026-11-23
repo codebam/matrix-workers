@@ -124,6 +124,7 @@ npx wrangler secret put EMAIL_FROM
 | Invite Filtering (glob rules) | [`src/services/database.ts`](src/services/database.ts) | [MSC4155](https://github.com/matrix-org/matrix-spec-proposals/pull/4155) — the stable MSC4380 toggle rides the same config |
 | Whole-profile replace | [`src/api/profile.ts`](src/api/profile.ts) | [MSC4437](https://github.com/matrix-org/matrix-spec-proposals/pull/4437) (in FCP) — `PUT /unstable/org.matrix.msc4437/profile/{userId}` |
 | Image packs (client compatibility flag) | [`src/api/versions.ts`](src/api/versions.ts) | [MSC2545](https://github.com/matrix-org/matrix-spec-proposals/pull/2545) — stable in v1.19; the flag is retained for Element clients that still probe it |
+| Threads pagination (`from` / `next_batch`) | [`src/api/relations.ts`](src/api/relations.ts) | [MSC3856](https://github.com/matrix-org/matrix-spec-proposals/pull/3856) |
 
 **Stable spec features added since v1.17**
 
@@ -153,6 +154,10 @@ npx wrangler secret put EMAIL_FROM
 | `/send` per-PDU Matrix error objects (and 52 migrated test assertions) | [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 server-server API |
 | `/backfill` and `/get_missing_events` parameter validation (required `v`, 404 on unknown events, limit caps) | [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 server-server API |
 | Media `mxc://` path-segment sanitization and MSC3916 PUT upload size cap | [`src/api/media.ts`](src/api/media.ts) | spec v1.19 security section |
+| Appservice device masquerade (`?device_id=` with ownership validation) | [`src/middleware/auth.ts`](src/middleware/auth.ts) | [MSC4326](https://github.com/matrix-org/matrix-spec-proposals/pull/4326) (v1.17) |
+| Appservice registration and device management via standard endpoints with `as_token` | [`src/api/login.ts`](src/api/login.ts), [`src/api/devices.ts`](src/api/devices.ts) | [MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190) (v1.17) |
+| v3 media config requires authentication (same as the client/v1 path) | [`src/api/media.ts`](src/api/media.ts) | spec v1.19 |
+| Federation v1 `send_join`/`send_leave` kept as lenient compat with shapes pinned in tests | [`src/api/federation.ts`](src/api/federation.ts) | [MSC4376](https://github.com/matrix-org/matrix-spec-proposals/pull/4376) (v1.18) |
 
 ## Features
 
