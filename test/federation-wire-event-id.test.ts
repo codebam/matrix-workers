@@ -114,7 +114,7 @@ describe('federation wire format per room version', () => {
   });
 
   it('/backfill omits event_id for v10', async () => {
-    const { status, body } = await get(createDb('10'), `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=5`);
+    const { status, body } = await get(createDb('10'), `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=5&v=%24wire1`);
     expect(status).toBe(200);
     expect(body.pdus.length).toBeGreaterThan(0);
     expect(body.pdus.every((p: any) => p.event_id === undefined)).toBe(true);

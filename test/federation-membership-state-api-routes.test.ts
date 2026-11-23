@@ -939,7 +939,7 @@ describe('federation GET /backfill/:roomId', () => {
     expect(res.status).toBe(404);
   });
 
-  it('returns recent events when v omitted', async () => {
+  it('returns events before the v starting point', async () => {
     const msgs = Array.from({ length: 5 }, (_, i) =>
       makeEvent({
         event_id: `$m${i}`,
@@ -955,15 +955,15 @@ describe('federation GET /backfill/:roomId', () => {
     });
     const res = await request(
       env,
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=3`
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=3&v=%24m4`
     );
     expect(res.status).toBe(200);
     expect(res.body.origin).toBe(SERVER);
     expect(res.body.pdus).toHaveLength(3);
-    expect(res.body.pdus.map((p: { depth: number }) => p.depth)).toEqual([5, 4, 3]);
+    expect(res.body.pdus.map((p: { depth: number }) => p.depth)).toEqual([4, 3, 2]);
   });
 
-  it('clamps limit to [1,1000] and defaults NaN to 100', async () => {
+  it('clamps limit to [1,100] and defaults NaN to 100', async () => {
     const msgs = Array.from({ length: 120 }, (_, i) =>
       makeEvent({ event_id: `$b${i}`, depth: i + 1 })
     );
@@ -975,19 +975,19 @@ describe('federation GET /backfill/:roomId', () => {
 
     const tooBig = await request(
       env,
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=99999`
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=99999&v=%24b119`
     );
-    expect(tooBig.body.pdus).toHaveLength(120); // only 120 exist
+    expect(tooBig.body.pdus).toHaveLength(100); // cap lowered from 1000 to 100
 
     const zero = await request(
       env,
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=0`
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=0&v=%24b119`
     );
     expect(zero.body.pdus).toHaveLength(1); // Math.max(1, ...)
 
     const nan = await request(
       env,
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=nope`
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=nope&v=%24b119`
     );
     expect(nan.body.pdus.length).toBeLessThanOrEqual(100);
   });
@@ -1052,7 +1052,10 @@ describe('federation GET /backfill/:roomId', () => {
     const env = createEnv({
       db: createMembershipDb({
         rooms: [{ room_id: ROOM, room_version: '10' }],
-        events: [makeEvent({ event_id: '$m', depth: 1 })],
+        events: [
+          makeEvent({ event_id: '$m', depth: 1 }),
+          makeEvent({ event_id: '$m2', depth: 2 }),
+        ],
         memberships: [
           { room_id: ROOM, user_id: REMOTE_USER, membership: 'join' },
         ],
@@ -1061,7 +1064,7 @@ describe('federation GET /backfill/:roomId', () => {
     });
     const res = await request(
       env,
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}`
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?v=%24m2`
     );
     expect(res.status).toBe(200);
     expect(res.body.pdus).toHaveLength(1);
@@ -1079,12 +1082,13 @@ describe('federation GET /backfill/:roomId', () => {
             signatures: null,
             depth: 1,
           }),
+          makeEvent({ event_id: '$n2', depth: 2 }),
         ],
       }),
     });
     const res = await request(
       env,
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}`
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?v=%24n2`
     );
     expect(res.body.pdus[0].state_key).toBeUndefined();
     expect(res.body.pdus[0].hashes).toBeUndefined();
@@ -1246,7 +1250,7 @@ describe('federation POST /get_missing_events/:roomId', () => {
     const res = await request(
       env,
       `/_matrix/federation/v1/get_missing_events/${encodeURIComponent(ROOM)}`,
-      jsonInit('POST', {})
+      jsonInit('POST', { earliest_events: [], latest_events: [] })
     );
     expect(res.status).toBe(200);
     expect(res.body.events).toEqual([]);
@@ -1608,13 +1612,13 @@ describe('federation GET /query/profile', () => {
     expect(res.body).toEqual({ avatar_url: 'mxc://a/b' });
   });
 
-  it('unknown field still returns full profile', async () => {
+  it('unknown field is a 404', async () => {
     const res = await request(
       createEnv(),
       `/_matrix/federation/v1/query/profile?user_id=${encodeURIComponent(USER)}&field=nope`
     );
-    expect(res.body.displayname).toBe('Alice');
-    expect(res.body.avatar_url).toBe('mxc://a/b');
+    expect(res.status).toBe(404);
+    expect(res.body.errcode).toBe('M_NOT_FOUND');
   });
 });
 

@@ -1696,7 +1696,7 @@ describe('backfill and get_missing_events', () => {
     });
     const recent = await req(
       'GET',
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=2`,
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=2&v=%24d5%3Aexample.com`,
       makeEnv(db)
     );
     expect(recent.status).toBe(200);
@@ -3264,11 +3264,17 @@ describe('additional send / query / claim edges', () => {
         content: '{}',
         depth: 1,
       }),
+      makeEvent({
+        event_id: '$b2',
+        event_type: 'm.room.message',
+        content: '{}',
+        depth: 2,
+      }),
     ];
     const db = createFedDb({ events, memberships: [] });
     const { status, body } = await req(
       'GET',
-      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=5`,
+      `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=5&v=%24b2`,
       makeEnv(db)
     );
     expect(status).toBe(200);

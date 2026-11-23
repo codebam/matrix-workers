@@ -1405,7 +1405,7 @@ describe('soft-4 query/profile soft flood', () => {
     const db = createFedDb({ users: [{ user_id: LOCAL_USER, display_name: 'Alice', avatar_url: 'mxc://example.com/a' }] });
     const q = 'unknown' ? 'user_id=' + encodeURIComponent(LOCAL_USER) + '&field=unknown' : 'user_id=' + encodeURIComponent(LOCAL_USER);
     const r = await req('GET', '/_matrix/federation/v1/query/profile?' + q, makeEnv(db));
-    expect(r.status).toBe(200);
+    expect(r.status).toBe(404);
   });
 
   it('soft-4 profile flood-4', async () => {
@@ -1433,7 +1433,7 @@ describe('soft-4 query/profile soft flood', () => {
     const db = createFedDb({ users: [{ user_id: LOCAL_USER, display_name: 'Alice', avatar_url: 'mxc://example.com/a' }] });
     const q = 'unknown' ? 'user_id=' + encodeURIComponent(LOCAL_USER) + '&field=unknown' : 'user_id=' + encodeURIComponent(LOCAL_USER);
     const r = await req('GET', '/_matrix/federation/v1/query/profile?' + q, makeEnv(db));
-    expect(r.status).toBe(200);
+    expect(r.status).toBe(404);
   });
 
   it('soft-4 profile flood-8', async () => {
@@ -2943,7 +2943,7 @@ describe('soft backfill leftover flood after #241', () => {
     it(`backfill recent soft-${i}`, async () => {
       const r = await req(
         'GET',
-        `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=${1 + (i % 5)}`,
+        `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=${1 + (i % 5)}&v=%24d5%3Aexample.com`,
         makeEnv(seedBackfill())
       );
       expect(r.status).toBe(200);

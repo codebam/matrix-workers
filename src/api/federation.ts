@@ -2019,7 +2019,7 @@ app.get('/_matrix/federation/v1/event_auth/:roomId/:eventId', async (c) => {
 app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
   const roomId = c.req.param('roomId');
   const rawLimit = parseInt(c.req.query('limit') || '100', 10);
-  const limit = Math.max(1, Math.min(isNaN(rawLimit) ? 100 : rawLimit, 1000));
+  const limit = Math.max(1, Math.min(isNaN(rawLimit) ? 100 : rawLimit, 100));
   const vParam = c.req.query('v'); // Starting event IDs
 
   // Verify room exists
@@ -2049,37 +2049,37 @@ app.get('/_matrix/federation/v1/backfill/:roomId', async (c) => {
     );
   }
 
-  // Parse starting event IDs (cap at 20 to prevent oversized IN queries)
-  const startEventIds = vParam ? vParam.split(',').slice(0, 20) : [];
-
-  let events: any[];
-  if (startEventIds.length > 0) {
-    // Get events before the specified events
-    const startEvents = await c.env.DB.prepare(
-      `SELECT MIN(depth) as min_depth FROM events WHERE event_id IN (${startEventIds.map(() => '?').join(',')})`
-    ).bind(...startEventIds).first<{ min_depth: number }>();
-
-    const maxDepth = startEvents?.min_depth || 0;
-
-    events = (await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events
-       WHERE room_id = ? AND depth < ?
-       ORDER BY depth DESC
-       LIMIT ?`
-    ).bind(roomId, maxDepth, limit).all()).results;
-  } else {
-    // Get most recent events
-    events = (await c.env.DB.prepare(
-      `SELECT event_id, room_id, sender, event_type, state_key, content,
-       origin_server_ts, depth, auth_events, prev_events, hashes, signatures
-       FROM events
-       WHERE room_id = ?
-       ORDER BY depth DESC
-       LIMIT ?`
-    ).bind(roomId, limit).all()).results;
+  if (!vParam || vParam.trim() === '') {
+    return Errors.missingParam('v').toResponse();
   }
+
+  // Parse starting event IDs (cap at 20 to prevent oversized IN queries)
+  const startEventIds = vParam.split(',').slice(0, 20);
+
+  // Every starting event must exist in this room; otherwise the spec requires a 404.
+  const existence = await c.env.DB.prepare(
+    `SELECT COUNT(DISTINCT event_id) as found FROM events WHERE room_id = ? AND event_id IN (${startEventIds.map(() => '?').join(',')})`
+  ).bind(roomId, ...startEventIds).all<{ found: number }>();
+  const foundCount = existence.results[0]?.found ?? startEventIds.length;
+  if (foundCount < startEventIds.length) {
+    return Errors.notFound('Event not found').toResponse();
+  }
+
+  // Get events before the specified events
+  const startEvents = await c.env.DB.prepare(
+    `SELECT MIN(depth) as min_depth FROM events WHERE event_id IN (${startEventIds.map(() => '?').join(',')})`
+  ).bind(...startEventIds).first<{ min_depth: number }>();
+
+  const maxDepth = startEvents?.min_depth || 0;
+
+  const events = (await c.env.DB.prepare(
+    `SELECT event_id, room_id, sender, event_type, state_key, content,
+     origin_server_ts, depth, auth_events, prev_events, hashes, signatures
+     FROM events
+     WHERE room_id = ? AND depth < ?
+     ORDER BY depth DESC
+     LIMIT ?`
+  ).bind(roomId, maxDepth, limit).all()).results;
 
   const pdus = events.map((e: any) => ({
     event_id: e.event_id,
@@ -2125,7 +2125,7 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
 
   const earliestEvents = (body.earliest_events || []).slice(0, 20);
   const latestEvents = (body.latest_events || []).slice(0, 20);
-  const limit = Math.min(body.limit || 10, 100);
+  const limit = Math.min(body.limit ?? 10, 10);
   const minDepth = body.min_depth || 0;
 
   // Verify room exists
@@ -2153,6 +2153,13 @@ app.post('/_matrix/federation/v1/get_missing_events/:roomId', async (c) => {
       { errcode: 'M_FORBIDDEN', error: "The calling server is denied by the room's server ACL" },
       403
     );
+  }
+
+  if (body.earliest_events === undefined) {
+    return Errors.missingParam('earliest_events').toResponse();
+  }
+  if (body.latest_events === undefined) {
+    return Errors.missingParam('latest_events').toResponse();
   }
 
   // Walk backwards from latest_events to earliest_events
@@ -3757,15 +3764,27 @@ app.get('/_matrix/federation/v1/query/profile', async (c) => {
     return Errors.notFound('User not found').toResponse();
   }
 
-  if (field === 'displayname') {
-    return c.json({ displayname: user.display_name });
-  } else if (field === 'avatar_url') {
-    return c.json({ avatar_url: user.avatar_url });
+  // Custom profile fields are stored in CACHE by the client profile endpoints.
+  const customJson = await c.env.CACHE.get(`profile:${userId}:custom`);
+  const customFields: Record<string, unknown> = customJson ? JSON.parse(customJson) : {};
+
+  if (field !== undefined) {
+    if (field === 'displayname') {
+      return c.json({ displayname: user.display_name });
+    }
+    if (field === 'avatar_url') {
+      return c.json({ avatar_url: user.avatar_url });
+    }
+    if (!Object.prototype.hasOwnProperty.call(customFields, field)) {
+      return Errors.notFound(`Profile field '${field}' not found`).toResponse();
+    }
+    return c.json({ [field]: customFields[field] });
   }
 
   return c.json({
     displayname: user.display_name,
     avatar_url: user.avatar_url,
+    ...customFields,
   });
 });
 

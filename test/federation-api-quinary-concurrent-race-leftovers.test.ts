@@ -1301,7 +1301,7 @@ describe('race quinary federation membership/keys/query exact after #310', () =>
       ),
       req(
         'GET',
-        `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=2`,
+        `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=2&v=%24bf2`,
         makeEnv(okDb)
       ),
     ]);

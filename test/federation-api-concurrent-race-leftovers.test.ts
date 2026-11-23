@@ -1801,7 +1801,7 @@ describe('race leftover event_auth∥backfill∥get_missing_events after #232', 
   it('backfill dual recent pdus', async () => {
     const db = seedBasicRoom();
     const env = makeEnv(db);
-    const path = `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=10`;
+    const path = `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=10&v=%24member%3Aexample.com`;
     const results = await Promise.all([req('GET', path, env), req('GET', path, env)]);
     expect(statusesOf(results)).toEqual([200, 200]);
     expect(
@@ -1846,7 +1846,7 @@ describe('race leftover event_auth∥backfill∥get_missing_events after #232', 
           `/_matrix/federation/v1/event_auth/${encodeURIComponent(ROOM)}/${encodeURIComponent('$member:example.com')}`,
           env
         ),
-        req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=${(i % 3) + 1}`, env),
+        req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=${(i % 3) + 1}&v=%24member%3Aexample.com`, env),
       ]);
       expect(statusesOf(results)).toEqual([200, 200]);
     });
@@ -2102,7 +2102,7 @@ describe('race residual hierarchy∥timestamp∥backfill triple after #241', () 
         `/_matrix/federation/v1/timestamp_to_event/${encodeURIComponent(ROOM)}?ts=1500&dir=f`,
         env
       ),
-      req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=3`, env),
+      req('GET', `/_matrix/federation/v1/backfill/${encodeURIComponent(ROOM)}?limit=3&v=%24d5%3Aexample.com`, env),
     ]);
     expect(statusesOf(results)).toEqual([200, 200, 200]);
   });
