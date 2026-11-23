@@ -23,6 +23,7 @@ export interface DelayedEventRow {
   delayed_since_ts: number;
   due_ts: number;
   txn_id: string | null;
+  sticky_duration_ms: number | null;
   finalised_ts: number | null;
   final_event_id: string | null;
   final_error: string | null;
@@ -47,7 +48,8 @@ export async function createDelayedEvent(
   content: unknown,
   delayMs: unknown,
   stateKey?: string,
-  txnId?: string
+  txnId?: string,
+  stickyDurationMs?: unknown
 ): Promise<Result<{ delayId: string }>> {
   if (typeof delayMs !== 'number' || !Number.isInteger(delayMs) || delayMs <= 0) {
     return { error: Errors.invalidParam('delay_ms', 'delay_ms must be a positive integer') };
@@ -57,6 +59,20 @@ export async function createDelayedEvent(
   }
   if (typeof content !== 'object' || content === null) {
     return { error: Errors.missingParam('content') };
+  }
+  // Spec v1.20: a delayed event may ask for its eventual send to be sticky.
+  if (
+    stickyDurationMs !== undefined &&
+    (typeof stickyDurationMs !== 'number' ||
+      !Number.isSafeInteger(stickyDurationMs) ||
+      stickyDurationMs <= 0)
+  ) {
+    return {
+      error: Errors.invalidParam(
+        'sticky_duration_ms',
+        'sticky_duration_ms must be a strictly positive integer'
+      ),
+    };
   }
 
   const membership = await getMembership(env.DB, roomId, userId);
@@ -75,11 +91,12 @@ export async function createDelayedEvent(
   const delayId = await generateOpaqueId(18);
   await env.DB.prepare(
     `INSERT INTO delayed_events
-       (delay_id, user_id, room_id, event_type, state_key, content, delay_ms, delayed_since_ts, due_ts, txn_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (delay_id, user_id, room_id, event_type, state_key, content, delay_ms, delayed_since_ts, due_ts, txn_id, sticky_duration_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     delayId, userId, roomId, eventType, stateKey ?? null,
-    JSON.stringify(content), delayMs, now, now + delayMs, txnId ?? null
+    JSON.stringify(content), delayMs, now, now + delayMs, txnId ?? null,
+    typeof stickyDurationMs === 'number' ? stickyDurationMs : null
   ).run();
 
   await scheduleAlarm(env, now + delayMs);
@@ -117,9 +134,14 @@ export function delayedEventJson(row: DelayedEventRow): Record<string, unknown> 
 
 async function dispatchRow(env: Env, row: DelayedEventRow): Promise<MatrixApiError | null> {
   const content = JSON.parse(row.content);
+  // Spec v1.20: the resulting event SHOULD NOT carry the transaction ID used
+  // to schedule it (the delayed event is identified by delay_id instead), so
+  // the send core is called without a txnId. The delay_id itself is attached
+  // per-viewer at serve time from this row's final_event_id.
+  const sticky = row.sticky_duration_ms ?? undefined;
   const result = row.state_key !== null
-    ? await performStateEvent(env, row.room_id, row.user_id, row.event_type, row.state_key, content)
-    : await performSendEvent(env, row.room_id, row.user_id, row.event_type, content, row.txn_id ?? undefined);
+    ? await performStateEvent(env, row.room_id, row.user_id, row.event_type, row.state_key, content, sticky)
+    : await performSendEvent(env, row.room_id, row.user_id, row.event_type, content, undefined, sticky);
   if ('error' in result) {
     await env.DB.prepare(
       `UPDATE delayed_events SET final_error = ? WHERE delay_id = ?`

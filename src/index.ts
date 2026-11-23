@@ -228,8 +228,13 @@ app.get('/_matrix/client/v3/capabilities', optionalAuth(), async (c) => {
       'm.profile_fields': {
         enabled: true,
       },
-      // MSC4140 delayed events: clients treat an absent capability as
-      // disabled, so advertise the server's limits explicitly.
+      // MSC4140 delayed events (spec v1.20): clients treat an absent
+      // capability as disabled, so advertise the server's limits explicitly.
+      // The unstable key is kept for clients that still probe the MSC name.
+      'm.delayed_events': {
+        max_delay_ms: 86400000,
+        max_scheduled: 10,
+      },
       'org.matrix.msc4140.delayed_events': {
         max_delay_ms: 86400000,
         max_scheduled: 10,

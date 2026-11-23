@@ -538,8 +538,10 @@ describe('MSC4140 delayed events', () => {
       env
     );
     expect(sent.status).toBe(200);
+    // Spec v1.20: the scheduled event does not inherit the scheduling txn id.
     expect(performSendEvent).toHaveBeenCalledWith(
-      env, ROOM, USER, 'm.room.message', { body: 'later', msgtype: 'm.text' }, 'txn1'
+      env, ROOM, USER, 'm.room.message', { body: 'later', msgtype: 'm.text' },
+      undefined, undefined
     );
     const got = await json(await delayedApp.request(`http://localhost${DP}/delayed_events/${delay_id}`, {}, env));
     expect(got.finalised.event_id).toBe('$delayed:1');
@@ -607,7 +609,7 @@ describe('MSC4140 delayed events', () => {
       env
     );
     expect(sent.status).toBe(200);
-    expect(performStateEvent).toHaveBeenCalledWith(env, ROOM, USER, 'm.room.message', '', { body: 'later', msgtype: 'm.text' });
+    expect(performStateEvent).toHaveBeenCalledWith(env, ROOM, USER, 'm.room.message', '', { body: 'later', msgtype: 'm.text' }, undefined);
   });
 
   it('the alarm dispatcher sends due events and reports the next due time', async () => {
