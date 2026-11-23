@@ -85,6 +85,7 @@ export function requireAuth() {
         if (appservice) {
           const url = new URL(c.req.url);
           const asUserId = url.searchParams.get('user_id');
+          const asDeviceId = url.searchParams.get('device_id');
           const serverName = c.env.SERVER_NAME;
 
           if (asUserId) {
@@ -115,9 +116,30 @@ export function requireAuth() {
           }
 
           const senderUserId = asUserId || `@${appservice.sender_localpart}:${serverName}`;
+
+          // MSC4326: an appservice may also masquerade as a specific device of
+          // the impersonated user (or of its own sender_localpart user). Validate
+          // ownership before exposing it downstream — /sync scopes to-device
+          // delivery and OTK counts by deviceId.
+          let deviceId: string | null = null;
+          if (asDeviceId) {
+            const device = await c.env.DB.prepare(
+              'SELECT device_id FROM devices WHERE user_id = ? AND device_id = ?'
+            )
+              .bind(senderUserId, asDeviceId)
+              .first<{ device_id: string }>();
+            if (!device) {
+              console.warn(
+                `[AUTH] AppService tried to masquerade as device ${asDeviceId} not owned by ${senderUserId}`
+              );
+              return Errors.forbidden('Device does not belong to masqueraded user').toResponse();
+            }
+            deviceId = asDeviceId;
+          }
+
           auth = {
             userId: senderUserId,
-            deviceId: null,
+            deviceId,
             accessToken: token,
           };
         }
