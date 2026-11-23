@@ -3934,9 +3934,9 @@ app.get('/_matrix/client/v1/room_summary/:roomIdOrAlias', async (c) => {
 // Timestamp to Event (MSC3030)
 // ============================================
 
-// GET /_matrix/client/v3/rooms/:roomId/timestamp_to_event
+// GET /_matrix/client/v1/rooms/:roomId/timestamp_to_event (spec) and the v3 legacy path
 // Finds the closest event to a given timestamp
-app.get('/_matrix/client/v3/rooms/:roomId/timestamp_to_event', requireAuth(), async (c) => {
+async function timestampToEventHandler(c: Context<AppEnv, '/_matrix/client/v1/rooms/:roomId/timestamp_to_event'>) {
   const userId = c.get('userId');
   const roomId = c.req.param('roomId');
   const db = c.env.DB;
@@ -4004,7 +4004,9 @@ app.get('/_matrix/client/v3/rooms/:roomId/timestamp_to_event', requireAuth(), as
     event_id: event.event_id,
     origin_server_ts: event.origin_server_ts,
   });
-});
+}
+app.get('/_matrix/client/v1/rooms/:roomId/timestamp_to_event', requireAuth(), timestampToEventHandler);
+app.get('/_matrix/client/v3/rooms/:roomId/timestamp_to_event', requireAuth(), timestampToEventHandler);
 
 // ============================================
 // Room Upgrade
