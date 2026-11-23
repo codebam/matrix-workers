@@ -2576,3 +2576,63 @@ describe('remote media (federation download)', () => {
     expect(res.body).toMatchObject({ errcode: 'M_NOT_FOUND', error: 'Media not found' });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Spec v1.7 two-step upload paths (M4)
+// POST /_matrix/media/v1/create + PUT /_matrix/media/v3/upload/{serverName}/{mediaId}
+// ---------------------------------------------------------------------------
+describe('spec media two-step upload paths', () => {
+  it('POST /_matrix/media/v1/create issues a placeholder', async () => {
+    const db = createMediaDb();
+    const media = createMediaBucket();
+    const res = await request('/_matrix/media/v1/create', { method: 'POST' }, { db, media });
+    expect(res.status).toBe(200);
+    const body = res.body as { content_uri: string; unused_expires_at: number };
+    expect(body.content_uri).toMatch(new RegExp(`^mxc://${SERVER}/`));
+    expect(body.unused_expires_at).toBeGreaterThan(Date.now() - 1000);
+    expect(db.rows).toHaveLength(1);
+    expect(db.rows[0]).toMatchObject({ user_id: USER, content_length: 0 });
+  });
+
+  it('PUT /_matrix/media/v3/upload/{serverName}/{mediaId} completes the upload once', async () => {
+    const db = createMediaDb();
+    const media = createMediaBucket();
+    const created = await request('/_matrix/media/v1/create', { method: 'POST' }, { db, media });
+    const contentUri = (created.body as { content_uri: string }).content_uri;
+    const mediaId = contentUri.split('/').pop() as string;
+
+    const body = bytesOf('hello');
+    const uploaded = await request(
+      `/_matrix/media/v3/upload/${SERVER}/${mediaId}?filename=notes.txt`,
+      { method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body },
+      { db, media }
+    );
+    expect(uploaded.status).toBe(200);
+    expect(uploaded.body).toEqual({});
+    expect(media.puts).toHaveLength(1);
+    expect(media.puts[0].key).toBe(mediaId);
+    expect(db.rows[0]).toMatchObject({
+      content_type: 'text/plain',
+      content_length: body.byteLength,
+      filename: 'notes.txt',
+    });
+
+    const again = await request(
+      `/_matrix/media/v3/upload/${SERVER}/${mediaId}`,
+      { method: 'PUT', headers: { 'Content-Type': 'text/plain' }, body: bytesOf('x') },
+      { db, media }
+    );
+    expect(again.status).toBe(409);
+    expect(again.body).toMatchObject({ errcode: 'M_CANNOT_OVERWRITE_MEDIA' });
+  });
+
+  it('rejects a remote serverName on the spec upload path', async () => {
+    const res = await request(`/_matrix/media/v3/upload/${REMOTE}/ph`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'image/png' },
+      body: bytesOf('x'),
+    });
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ errcode: 'M_FORBIDDEN' });
+  });
+});

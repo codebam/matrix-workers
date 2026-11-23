@@ -1,6 +1,7 @@
 // Matrix media endpoints (using R2 for storage)
 
 import { Hono } from 'hono';
+import type { Context } from 'hono';
 import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
@@ -832,8 +833,10 @@ app.post('/_matrix/client/v1/media/upload', requireAuth(), async (c) => {
   return c.json({ content_uri: mxcUri });
 });
 
-// POST /_matrix/client/v1/media/create - Create media placeholder (for async uploads)
-app.post('/_matrix/client/v1/media/create', requireAuth(), async (c) => {
+// POST /_matrix/media/v1/create (spec v1.7) - Create a media placeholder for
+// an asynchronous upload. The non-spec /client/v1 alias is kept for clients
+// that already speak it (MSC3916-era builds).
+async function handleCreateMedia(c: Context<AppEnv>) {
   const userId = c.get('userId');
 
   const mediaId = await generateOpaqueId(24);
@@ -849,13 +852,20 @@ app.post('/_matrix/client/v1/media/create', requireAuth(), async (c) => {
     content_uri: mxcUri,
     unused_expires_at: Date.now() + 24 * 60 * 60 * 1000, // 24 hours
   });
-});
+}
 
-// PUT /_matrix/client/v1/media/upload/:serverName/:mediaId - Upload to placeholder
-app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), async (c) => {
+app.post('/_matrix/media/v1/create', requireAuth(), handleCreateMedia);
+app.post('/_matrix/client/v1/media/create', requireAuth(), handleCreateMedia);
+
+// PUT /_matrix/media/v3/upload/{serverName}/{mediaId} (spec v1.7) - Upload
+// content to an mxc:// URI created earlier via POST /_matrix/media/v1/create.
+// The non-spec /client/v1 alias is kept for clients that already speak it.
+async function handleUploadToPlaceholder(c: Context<AppEnv>) {
   const userId = c.get('userId');
-  const serverName = c.req.param('serverName');
-  const mediaId = c.req.param('mediaId');
+  // Registered under both paths, so the path params exist; Hono's generic
+  // handler typing cannot infer them from the route string.
+  const serverName = c.req.param('serverName') as string;
+  const mediaId = c.req.param('mediaId') as string;
   const invalidSegments = invalidMediaSegments(serverName, mediaId);
   if (invalidSegments) return invalidSegments;
 
@@ -912,7 +922,10 @@ app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), a
   ).bind(contentType, body.byteLength, filename || null, mediaId).run();
 
   return c.json({});
-});
+}
+
+app.put('/_matrix/media/v3/upload/:serverName/:mediaId', requireAuth(), handleUploadToPlaceholder);
+app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), handleUploadToPlaceholder);
 
 // GET /_matrix/client/v1/media/download/:serverName/:mediaId - Authenticated download
 app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(), async (c) => {
