@@ -1780,7 +1780,10 @@ describe('media invalid mxc stubs already handled', () => {
     expect(res.status).toBe(404);
   });
 
-  it('mxc mediaId with odd but allowed path chars still looks up by id', async () => {
+  it('mxc mediaId with characters outside the spec v1.19 charset is rejected', async () => {
+    // Pre-v1.19 clarification this dot-bearing ID resolved; the spec's
+    // media-id charset [A-Za-z0-9_-] no longer allows it, so the route
+    // rejects before any lookup.
     const mediaId = 'abc._-XYZ';
     const key = thumbKey(mediaId);
     const db = createMediaDb({ rows: [seedRow({ media_id: mediaId })] });
@@ -1789,7 +1792,8 @@ describe('media invalid mxc stubs already handled', () => {
       [key]: { body: 'T' },
     });
     const res = await request(v3Thumb(mediaId), {}, { db, media });
-    expect(res.text).toBe('T');
+    expect(res.status).toBe(400);
+    expect(res.body).toMatchObject({ errcode: 'M_INVALID_PARAM' });
   });
 });
 
