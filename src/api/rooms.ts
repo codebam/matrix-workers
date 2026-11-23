@@ -944,6 +944,21 @@ app.post('/_matrix/client/v3/rooms/:roomId/join', requireAuth(), async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
+  // Guests may only join rooms whose m.room.guest_access permits it. The spec
+  // default (no guest_access event, or content other than can_join) forbids
+  // guests. Guest status is local to the user's own server — a remote server
+  // cannot observe it — so enforcement belongs on this C-S join path, not in
+  // federation make_join/send_join. Run before any membership state mutation.
+  const guestRow = await c.env.DB.prepare(
+    `SELECT is_guest FROM users WHERE user_id = ?`
+  ).bind(userId).first<{ is_guest: number }>();
+  if (guestRow?.is_guest) {
+    const guestAccessEvent = await getStateEvent(c.env.DB, roomId, 'm.room.guest_access');
+    if (guestAccessEvent?.content.guest_access !== 'can_join') {
+      return Errors.guestAccessForbidden().toResponse();
+    }
+  }
+
   // Check current membership
   const currentMembership = await getMembership(c.env.DB, roomId, userId);
 
@@ -3683,6 +3698,19 @@ app.post('/_matrix/client/v3/join/:roomIdOrAlias', requireAuth(), async (c) => {
   // Local rooms must exist; remote unknown rooms were handled above.
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Guests may only join rooms whose m.room.guest_access permits it (spec
+  // default forbids guests). See the room-ID join handler for the rationale
+  // on why this is enforced here rather than in federation make_join.
+  const guestRow = await db.prepare(
+    `SELECT is_guest FROM users WHERE user_id = ?`
+  ).bind(userId).first<{ is_guest: number }>();
+  if (guestRow?.is_guest) {
+    const guestAccessEvent = await getStateEvent(db, roomId, 'm.room.guest_access');
+    if (guestAccessEvent?.content.guest_access !== 'can_join') {
+      return Errors.guestAccessForbidden().toResponse();
+    }
   }
 
   // Check current membership
