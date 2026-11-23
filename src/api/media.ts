@@ -13,6 +13,31 @@ const app = new Hono<AppEnv>();
 // Maximum upload size (50MB)
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 
+// Validate the two path segments of an mxc:// URI before they reach R2 keys
+// or D1 binds. Matrix spec server-name grammar: DNS labels made of
+// alphanumerics/dots/hyphens with an optional numeric port; media IDs are
+// restricted to [A-Za-z0-9_-] by the v1.19 security section.
+/** Exported for unit tests. */
+export function isValidMediaServerName(serverName: string): boolean {
+  return /^[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?::\d+)?$/.test(serverName);
+}
+
+/** Exported for unit tests. */
+export function isValidMediaId(mediaId: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(mediaId);
+}
+
+/** Reject malformed mxc path segments with 400 M_INVALID_PARAM. */
+function invalidMediaSegments(serverName: string, mediaId: string): Response | null {
+  if (!isValidMediaServerName(serverName)) {
+    return Errors.invalidParam('serverName', 'Invalid server name in media URI').toResponse();
+  }
+  if (!isValidMediaId(mediaId)) {
+    return Errors.invalidParam('mediaId', 'Invalid media ID in media URI').toResponse();
+  }
+  return null;
+}
+
 // Supported MIME types for upload validation
 export const SUPPORTED_TYPES = [
   'image/jpeg',
@@ -471,6 +496,8 @@ async function serveRemoteThumbnail(
 app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const invalidSegments = invalidMediaSegments(serverName, mediaId);
+  if (invalidSegments) return invalidSegments;
   const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
@@ -507,6 +534,8 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId', async (c) => {
 app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const invalidSegments = invalidMediaSegments(serverName, mediaId);
+  if (invalidSegments) return invalidSegments;
   const requestedFilename = c.req.param('filename');
   const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
@@ -542,6 +571,8 @@ app.get('/_matrix/media/v3/download/:serverName/:mediaId/:filename', async (c) =
 app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const invalidSegments = invalidMediaSegments(serverName, mediaId);
+  if (invalidSegments) return invalidSegments;
   const width = clampThumbnailDimension(c.req.query('width'));
   const height = clampThumbnailDimension(c.req.query('height'));
   const method = c.req.query('method') || 'scale';
@@ -808,9 +839,18 @@ app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), a
   const userId = c.get('userId');
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const invalidSegments = invalidMediaSegments(serverName, mediaId);
+  if (invalidSegments) return invalidSegments;
 
   if (serverName !== c.env.SERVER_NAME) {
     return Errors.forbidden('Cannot upload to remote server').toResponse();
+  }
+
+  // Mirror POST /upload: early rejection from Content-Length (may be absent or falsified),
+  // then verify the actual body length below.
+  const contentLength = parseInt(c.req.header('Content-Length') || '0');
+  if (contentLength > MAX_UPLOAD_SIZE) {
+    return Errors.tooLarge('File exceeds maximum upload size').toResponse();
   }
 
   // Check placeholder exists and belongs to user
@@ -837,6 +877,9 @@ app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), a
   const filename = c.req.query('filename');
 
   const body = await c.req.arrayBuffer();
+  if (body.byteLength > MAX_UPLOAD_SIZE) {
+    return Errors.tooLarge('File exceeds maximum upload size').toResponse();
+  }
 
   await c.env.MEDIA.put(mediaId, body, {
     httpMetadata: { contentType },
@@ -858,6 +901,8 @@ app.put('/_matrix/client/v1/media/upload/:serverName/:mediaId', requireAuth(), a
 app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(), async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const invalidSegments = invalidMediaSegments(serverName, mediaId);
+  if (invalidSegments) return invalidSegments;
   const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
   if (serverName !== c.env.SERVER_NAME) {
@@ -892,6 +937,8 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId', requireAuth(),
 app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requireAuth(), async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const invalidSegments = invalidMediaSegments(serverName, mediaId);
+  if (invalidSegments) return invalidSegments;
   const requestedFilename = c.req.param('filename');
   const allowRemote = parseAllowRemote(c.req.query('allow_remote'));
 
@@ -925,6 +972,8 @@ app.get('/_matrix/client/v1/media/download/:serverName/:mediaId/:filename', requ
 app.get('/_matrix/client/v1/media/thumbnail/:serverName/:mediaId', requireAuth(), async (c) => {
   const serverName = c.req.param('serverName');
   const mediaId = c.req.param('mediaId');
+  const invalidSegments = invalidMediaSegments(serverName, mediaId);
+  if (invalidSegments) return invalidSegments;
   const width = clampThumbnailDimension(c.req.query('width'));
   const height = clampThumbnailDimension(c.req.query('height'));
   const method = c.req.query('method') || 'scale';
