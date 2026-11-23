@@ -136,6 +136,25 @@ const SUPPORTED_ROOM_VERSIONS = [
   '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', MSC4583_ROOM_VERSION,
 ];
 
+// Error bodies for M_INCOMPATIBLE_ROOM_VERSION must advertise the stability
+// of each supported version. Keep this in sync with the m.room_versions map
+// published by /_matrix/client/v3/capabilities (src/index.ts).
+function supportedRoomVersionsMap(): Record<string, 'stable' | 'unstable'> {
+  return Object.fromEntries(
+    SUPPORTED_ROOM_VERSIONS.map((version) => [
+      version,
+      version === MSC4583_ROOM_VERSION ? 'unstable' : 'stable',
+    ])
+  );
+}
+
+// `ver` values are room version IDs (e.g. `10`). Also accept a leading `v`:
+// peers commonly write `v10`, which cannot collide with any room version we
+// support (the only non-numeric one is MSC4583's `dev.zirco.msc4583.v1`).
+function offersRoomVersion(offered: string[] | undefined, version: string): boolean {
+  return Boolean(offered?.some((v) => v === version || v === `v${version}`));
+}
+
 // "Modern" room versions for the purpose of content-hash enforcement.
 // Matrix room versions 3 and later require event integrity via hashes.sha256;
 // versions 1 and 2 are legacy where hashes are optional.
@@ -2407,6 +2426,21 @@ app.get('/_matrix/federation/v1/make_join/:roomId/:userId', async (c) => {
     return Errors.notFound('Room not found').toResponse();
   }
 
+  // Spec v1.19: callers send one `ver` per room version they support. Refuse
+  // before serving a template when none matches, so a version-limited peer
+  // does not waste effort signing a join event we cannot accept.
+  const offeredVersions = c.req.queries('ver')?.filter(Boolean);
+  if (offeredVersions?.length && !offersRoomVersion(offeredVersions, room.room_version)) {
+    return c.json(
+      {
+        errcode: 'M_INCOMPATIBLE_ROOM_VERSION',
+        error: `Room version ${room.room_version} is not supported by the requesting server`,
+        room_versions: supportedRoomVersionsMap(),
+      },
+      400
+    );
+  }
+
   // A server may only ask for join templates for its own users. Without
   // this, any federated server could probe room state on behalf of users
   // it does not host.
@@ -3532,7 +3566,11 @@ app.put('/_matrix/federation/v2/invite/:roomId/:eventId', async (c) => {
   // Check room version is supported
   if (!SUPPORTED_ROOM_VERSIONS.includes(roomVersion)) {
     return c.json(
-      { errcode: 'M_INCOMPATIBLE_ROOM_VERSION', error: `Unsupported room version: ${roomVersion}` },
+      {
+        errcode: 'M_INCOMPATIBLE_ROOM_VERSION',
+        error: `Unsupported room version: ${roomVersion}`,
+        room_versions: supportedRoomVersionsMap(),
+      },
       400
     );
   }
@@ -4094,6 +4132,20 @@ app.get('/_matrix/federation/v1/make_knock/:roomId/:userId', async (c) => {
 
   if (!room) {
     return Errors.notFound('Room not found').toResponse();
+  }
+
+  // Spec v1.19: same `ver` negotiation as make_join — never hand out a
+  // knock template for a room version the requester cannot use.
+  const offeredVersions = c.req.queries('ver')?.filter(Boolean);
+  if (offeredVersions?.length && !offersRoomVersion(offeredVersions, room.room_version)) {
+    return c.json(
+      {
+        errcode: 'M_INCOMPATIBLE_ROOM_VERSION',
+        error: `Room version ${room.room_version} is not supported by the requesting server`,
+        room_versions: supportedRoomVersionsMap(),
+      },
+      400
+    );
   }
 
   // Get join_rules to verify room allows knocking
