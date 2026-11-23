@@ -230,7 +230,7 @@ npx wrangler secret put EMAIL_FROM
 | Typing | Typing indicators | ✅ |
 | Receipts | Read receipts | ✅ |
 | Account Data | User settings, room tags | ✅ |
-| Directory | Room directory, aliases | ✅ |
+| Directory | Room directory, aliases (ordered by most-recent activity first, MSC4423) | ✅ |
 | Discovery | `.well-known/matrix/*` (client, server, support) | ✅ |
 | Reporting | Report events, rooms, users | ✅ |
 | Admin | User session info (`/admin/whois`), full admin API | ✅ |
