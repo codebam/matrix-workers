@@ -420,6 +420,7 @@ describe('versions TOKENMAXX HEAVY after #83 — discovery leftovers', () => {
         'org.matrix.msc3906',
         'org.matrix.msc3916.stable',
         'org.matrix.msc4108',
+        'org.matrix.msc2545',
         'org.matrix.msc4140',
         'org.matrix.msc4143',
         'org.matrix.msc4155',

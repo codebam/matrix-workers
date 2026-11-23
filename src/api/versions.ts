@@ -227,6 +227,8 @@ app.get('/_matrix/client/versions', (c) => {
       'org.matrix.msc4140': true,
       // MSC4437 (FCP): PUT variant replacing the entire profile.
       'org.matrix.msc4437': true,
+      // MSC2545 (v1.19): image packs — Element gates custom emoji on this flag.
+      'org.matrix.msc2545': true,
       // MSC3906: sign in with QR (rendezvous flows)
       'org.matrix.msc3906': true,
       // MSC3886: simple rendezvous transport
