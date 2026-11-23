@@ -311,6 +311,9 @@ describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
           status: 200,
         });
       }
+      if (String(url).includes('/_matrix/')) {
+        return new Response(JSON.stringify({ versions: ['v1.10'] }), { status: 200 });
+      }
       return new Response('{}', { status: 404 });
     });
 
@@ -338,6 +341,9 @@ describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
           return new Response(JSON.stringify({ 'm.server': 'delegated.example.com:8443' }), { status: 200 });
         }
         return new Response('<!doctype html><html>stale cache</html>', { status: 200 });
+      }
+      if (String(url).includes('/_matrix/')) {
+        return new Response(JSON.stringify({ versions: ['v1.10'] }), { status: 200 });
       }
       return new Response('{}', { status: 404 });
     });
@@ -452,6 +458,9 @@ describe('discoverServer TOKENMAXX algorithm + cache TTL after #63', () => {
         return new Response(JSON.stringify({ 'm.server': 'delegated2.example.com' }), {
           status: 200,
         });
+      }
+      if (u.includes('/_matrix/')) {
+        return new Response(JSON.stringify({ versions: ['v1.10'] }), { status: 200 });
       }
       // SRV for delegated name fails
       return new Response(JSON.stringify({ Status: 2 }), { status: 200 });

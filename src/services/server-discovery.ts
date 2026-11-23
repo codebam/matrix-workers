@@ -182,6 +182,15 @@ async function tryWellKnown(serverName: string): Promise<ServerDiscoveryResult |
         return null;
       }
 
+      // Probe the delegated target before trusting it: it must answer as a Matrix
+      // server. Reject delegation (fall through) if the probe fails or is non-OK.
+      // (audit 007.6)
+      const probeOk = await probeDelegatedServer(delegatedServer);
+      if (!probeOk) {
+        console.warn(`Delegated server ${delegatedServer} failed Matrix probe`);
+        return null;
+      }
+
       // Parse the delegated server for host:port
       const delegatedPortMatch = delegatedServer.match(/^(.+):(\d+)$/);
       if (delegatedPortMatch) {
@@ -355,6 +364,54 @@ export function selectSRVRecord(records: SRVRecord[]): SRVRecord {
 
   // Fallback (shouldn't happen)
   return lowestPriorityRecords[0];
+}
+
+/**
+ * Probe a delegated target to verify it answers as a Matrix server.
+ * Exported for unit tests (audit 007.6).
+ *
+ * Performs GET requests to the delegated target's Matrix version endpoints
+ * (federation v1/version and client /versions) with a 5s timeout. Accepts
+ * a 2xx response whose JSON body contains `server`/`version` or `versions`.
+ * Returns true only if at least one endpoint validates.
+ */
+export async function probeDelegatedServer(delegatedServer: string): Promise<boolean> {
+  // SSRF validation on the delegated target (kept in addition to caller's check).
+  const validation = validateUrl(`https://${delegatedServer}/`);
+  if (!validation.valid) {
+    return false;
+  }
+
+  const endpoints = ['/_matrix/federation/v1/version', '/_matrix/client/versions'];
+  for (const endpoint of endpoints) {
+    const url = `https://${delegatedServer}${endpoint}`;
+    try {
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) {
+        continue;
+      }
+      let body: unknown;
+      try {
+        body = await response.json();
+      } catch {
+        continue;
+      }
+      if (body && typeof body === 'object') {
+        const obj = body as Record<string, unknown>;
+        if (obj.versions || obj.server || obj.version) {
+          return true;
+        }
+      }
+    } catch {
+      // Network error / timeout / abort — try next endpoint
+      continue;
+    }
+  }
+  return false;
 }
 
 /**

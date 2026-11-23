@@ -135,6 +135,8 @@ interface ErrorMessage {
   message: string;
 }
 
+export const MAX_SEND_FAILURES = 3;
+
 export class CallRoomDurableObject implements DurableObject {
   private state: DurableObjectState;
   private env: Env;
@@ -142,6 +144,7 @@ export class CallRoomDurableObject implements DurableObject {
   private participantsLoaded: boolean = false;
   private callId: string | null = null;
   private matrixRoomId: string | null = null;
+  private sendFailures: Map<string, number> = new Map(); // participantKey -> consecutive send failure count
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -461,6 +464,7 @@ export class CallRoomDurableObject implements DurableObject {
     // Remove participant
     this.participants.delete(participantKey);
     await this.deleteParticipant(participantKey);
+    this.sendFailures.delete(participantKey);
 
     // Notify other participants
     const leftMsg: ParticipantLeftMessage = {
@@ -553,6 +557,7 @@ export class CallRoomDurableObject implements DurableObject {
     }
 
     this.participants.clear();
+    this.sendFailures.clear();
 
     // Clear storage
     await this.state.storage.deleteAll();
@@ -565,26 +570,95 @@ export class CallRoomDurableObject implements DurableObject {
     return attachment?.participantKey ? this.participants.get(attachment.participantKey) || null : null;
   }
 
-  private send(ws: WebSocket, msg: object): void {
+  private send(ws: WebSocket, msg: object, participantKey?: string): void {
+    // Resolve participantKey from attachment if not provided
+    if (participantKey === undefined) {
+      const attachment = ws.deserializeAttachment() as CallSocketAttachment | null;
+      participantKey = attachment?.participantKey;
+    }
     try {
       ws.send(JSON.stringify(msg));
+      if (participantKey) this.sendFailures.delete(participantKey);
     } catch (error) {
       console.error('Error sending message:', error);
+      if (participantKey && this.participants.has(participantKey)) {
+        const next = (this.sendFailures.get(participantKey) || 0) + 1;
+        this.sendFailures.set(participantKey, next);
+        if (next >= MAX_SEND_FAILURES) {
+          // Evict asynchronously to avoid blocking the caller; isolated per participant.
+          void this.evictParticipant(participantKey, ws);
+        }
+      }
     }
   }
 
   private sendError(ws: WebSocket, code: string, message: string): void {
     const errorMsg: ErrorMessage = { type: 'error', code, message };
-    this.send(ws, errorMsg);
+    const attachment = ws.deserializeAttachment() as CallSocketAttachment | null;
+    this.send(ws, errorMsg, attachment?.participantKey);
   }
 
-  private broadcast(msg: object, excludeKey?: string): void {
+  private async evictParticipant(participantKey: string, ws?: WebSocket): Promise<void> {
+    const participant = this.participants.get(participantKey);
+    if (!participant) {
+      this.sendFailures.delete(participantKey);
+      return;
+    }
+    console.error(`Evicting participant ${participantKey} after ${MAX_SEND_FAILURES} consecutive send failures`);
+    this.participants.delete(participantKey);
+    try {
+      await this.deleteParticipant(participantKey);
+    } catch (error) {
+      console.error('Error deleting evicted participant:', error);
+    }
+    this.sendFailures.delete(participantKey);
+
+    // Notify others
+    const leftMsg: ParticipantLeftMessage = {
+      type: 'participant_left',
+      oderId: participant.oderId,
+      deviceId: participant.deviceId,
+    };
+    await this.broadcast(leftMsg);
+
+    // Close the failing socket
+    const targetWs = ws || this.state.getWebSockets().find((s) => {
+      const att = s.deserializeAttachment() as CallSocketAttachment | null;
+      return att?.participantKey === participantKey;
+    });
+    if (targetWs) {
+      try {
+        targetWs.close(1000, 'Send failures');
+      } catch {
+        // Already closed
+      }
+    }
+  }
+
+  private async broadcast(msg: object, excludeKey?: string): Promise<void> {
+    const toEvict = new Set<string>();
     for (const ws of this.state.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as CallSocketAttachment | null;
       const participantKey = attachment?.participantKey;
       if (participantKey && participantKey !== excludeKey && this.participants.has(participantKey)) {
-        this.send(ws, msg);
+        try {
+          ws.send(JSON.stringify(msg));
+          this.sendFailures.delete(participantKey);
+        } catch (error) {
+          console.error('Error sending message:', error);
+          const next = (this.sendFailures.get(participantKey) || 0) + 1;
+          this.sendFailures.set(participantKey, next);
+          if (next >= MAX_SEND_FAILURES) toEvict.add(participantKey);
+        }
       }
+    }
+    // Evict after the loop to avoid recursion/mutation during iteration.
+    for (const pk of toEvict) {
+      const ws = this.state.getWebSockets().find((s) => {
+        const att = s.deserializeAttachment() as CallSocketAttachment | null;
+        return att?.participantKey === pk;
+      });
+      await this.evictParticipant(pk, ws);
     }
   }
 }
