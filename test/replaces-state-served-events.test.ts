@@ -172,6 +172,7 @@ function createDb(
                   return {
                     served_event_id: eventId,
                     replaces_state: predecessors[0]?.event_id ?? null,
+                    prev_sender: predecessors[0]?.sender ?? null,
                   };
                 });
                 return { results } as unknown as { results: T[] };
@@ -361,9 +362,16 @@ describe('attachReplacesState', () => {
     // Only the event lacking a value is looked up; the already-populated one
     // and the non-state event are excluded from the batch.
     expect(JSON.parse(db.selects.find((s) => s.sql.includes('AS replaces_state'))!.args[0] as string)).toEqual(
-      [NEW]
+      // The event that stored `replaces_state` at PUT time still needs the
+      // v1.20 `prev_sender` field, so it is part of the batch too.
+      [NEW, '$written:example.com']
     );
-    expect(forwarded.unsigned).toEqual({ age: 12, transaction_id: 'tx', replaces_state: OLD });
+    expect(forwarded.unsigned).toEqual({
+      age: 12,
+      transaction_id: 'tx',
+      replaces_state: OLD,
+      prev_sender: USER,
+    });
     expect(alreadySet.unsigned).toEqual({ replaces_state: '$from-put' });
     expect(message.unsigned).toEqual({ age: 3 });
   });
@@ -384,7 +392,12 @@ describe('attachReplacesState', () => {
   it('skips the query entirely when no state event needs enrichment', async () => {
     const db = createDb([oldTopicRow, newTopicRow]);
     await attachReplacesState(db as never, [
-      { event_id: NEW, room_id: ROOM, state_key: '', unsigned: { replaces_state: OLD } },
+      {
+        event_id: NEW,
+        room_id: ROOM,
+        state_key: '',
+        unsigned: { replaces_state: OLD, prev_sender: USER },
+      },
       { event_id: MSG, room_id: ROOM },
     ]);
     expect(countEnrichmentQueries(db)).toBe(0);
@@ -399,7 +412,7 @@ describe('attachReplacesState', () => {
 
     await attachReplacesState(db as never, [event]);
 
-    expect(event.unsigned).toEqual({ replaces_state: '$p2' });
+    expect(event.unsigned).toEqual({ replaces_state: '$p2', prev_sender: USER });
   });
 });
 
@@ -452,8 +465,10 @@ describe('rooms read surfaces', () => {
       localDb
     );
     expect(local.status).toBe(200);
-    expect(local.body[0].unsigned).toEqual({ replaces_state: OLD });
-    expect(countEnrichmentQueries(localDb)).toBe(0);
+    expect(local.body[0].unsigned).toEqual({ replaces_state: OLD, prev_sender: USER });
+    // v1.20 `prev_sender` is not stored at PUT time, so even an event with a
+    // stored `replaces_state` needs the batched lookup.
+    expect(countEnrichmentQueries(localDb)).toBe(1);
 
     // Second read: federated state has no stored unsigned, so it is computed.
     getRoomState.mockResolvedValueOnce([toPdu(newTopicRow)]);
@@ -464,7 +479,7 @@ describe('rooms read surfaces', () => {
       federatedDb
     );
     expect(federated.status).toBe(200);
-    expect(federated.body[0].unsigned).toEqual({ replaces_state: OLD });
+    expect(federated.body[0].unsigned).toEqual({ replaces_state: OLD, prev_sender: USER });
     expect(countEnrichmentQueries(federatedDb)).toBe(1);
   });
 
@@ -482,7 +497,7 @@ describe('rooms read surfaces', () => {
     expect(messages.status).toBe(200);
     const stateEvent = messages.body.chunk.find((e: { event_id: string }) => e.event_id === NEW);
     const plainMessage = messages.body.chunk.find((e: { event_id: string }) => e.event_id === MSG);
-    expect(stateEvent.unsigned).toEqual({ replaces_state: OLD });
+    expect(stateEvent.unsigned).toEqual({ replaces_state: OLD, prev_sender: USER });
     expect(plainMessage.unsigned).toBeUndefined();
     expect(countEnrichmentQueries(db1)).toBe(1);
 
@@ -494,7 +509,7 @@ describe('rooms read surfaces', () => {
       db2
     );
     expect(event.status).toBe(200);
-    expect(event.body.unsigned).toEqual({ replaces_state: OLD });
+    expect(event.body.unsigned).toEqual({ replaces_state: OLD, prev_sender: USER });
     expect(countEnrichmentQueries(db2)).toBe(1);
   });
 
@@ -519,14 +534,14 @@ describe('rooms read surfaces', () => {
       noFilterDb
     );
     expect(noFilter.status).toBe(200);
-    expect(noFilter.body.state[0].unsigned).toEqual({ replaces_state: OLD });
+    expect(noFilter.body.state[0].unsigned).toEqual({ replaces_state: OLD, prev_sender: USER });
     expect(noFilter.body.events_before.map((e: { event_id: string }) => e.event_id)).toEqual([
       '$before-msg',
       '$before-state',
     ]);
     // This before-side state event supersedes the topic event in the window.
     expect(noFilter.body.events_before.find((e: { event_id: string }) => e.event_id === '$before-state').unsigned)
-      .toEqual({ replaces_state: NEW });
+      .toEqual({ replaces_state: NEW, prev_sender: USER });
     expect(noFilter.body.events_after).toHaveLength(2);
     expect(countEnrichmentQueries(noFilterDb)).toBe(1);
 
@@ -539,7 +554,7 @@ describe('rooms read surfaces', () => {
     );
     expect(filtered.status).toBe(200);
     // State still carries the enrichment; only before/after are filtered.
-    expect(filtered.body.state[0].unsigned).toEqual({ replaces_state: OLD });
+    expect(filtered.body.state[0].unsigned).toEqual({ replaces_state: OLD, prev_sender: USER });
     expect(filtered.body.events_before.map((e: { event_id: string }) => e.event_id)).toEqual([
       '$before-msg',
     ]);
