@@ -29,7 +29,7 @@ Everything in this list is live on `codebam.ca` and verified against real peers 
 - **Admin console bot** in a management room: `!admin` commands for status/counts, registration-token mint/list/revoke, user list/create/deactivate/reset-password, federation peer status, room kick/ban/unban (executed as the bot, governed by the room's power levels), and server notices — admin-gated, replies as `m.notice`.
 - **Telegram bridge** (`@BotFather` token via admin API only — never via room messages): webhook-driven (no polling), one Telegram chat ↔ one Matrix room, bidirectional — Telegram messages land as `Name: text` (display name only), and room messages (including federated users') relay out with display-name prefixes. Loop-proof by construction (all integrations skip bot senders).
 
-**Quality bar**: 345 test files / ~45,400 tests green (`npm test`), `tsc --noEmit` clean, CI on every push. In-process mock-Synapse peer tests reproduce resident-server auth rejections (the "HTTP 200 but never displayed" class) before they reach production.
+**Quality bar**: 456 test files / ~46,500 tests green (`npm test`), `tsc --noEmit` clean, CI on every push. In-process mock-Synapse peer tests reproduce resident-server auth rejections (the "HTTP 200 but never displayed" class) before they reach production.
 
 ## Quick Start
 
@@ -123,6 +123,7 @@ npx wrangler secret put EMAIL_FROM
 | Account Management | [`src/api/oidc-auth.ts`](src/api/oidc-auth.ts) | [MSC4191](https://github.com/matrix-org/matrix-spec-proposals/pull/4191) |
 | Invite Filtering (glob rules) | [`src/services/database.ts`](src/services/database.ts) | [MSC4155](https://github.com/matrix-org/matrix-spec-proposals/pull/4155) — the stable MSC4380 toggle rides the same config |
 | Whole-profile replace | [`src/api/profile.ts`](src/api/profile.ts) | [MSC4437](https://github.com/matrix-org/matrix-spec-proposals/pull/4437) (in FCP) — `PUT /unstable/org.matrix.msc4437/profile/{userId}` |
+| Image packs (client compatibility flag) | [`src/api/versions.ts`](src/api/versions.ts) | [MSC2545](https://github.com/matrix-org/matrix-spec-proposals/pull/2545) — stable in v1.19; the flag is retained for Element clients that still probe it |
 
 **Stable spec features added since v1.17**
 
@@ -134,12 +135,24 @@ npx wrangler secret put EMAIL_FROM
 | Redactions via `PUT /send` | [`src/api/rooms.ts`](src/api/rooms.ts) | [MSC4169](https://github.com/matrix-org/matrix-spec-proposals/pull/4169) (v1.18) |
 | Reporting harmonization (200-regardless, no `score`) | [`src/api/report.ts`](src/api/report.ts) | [MSC4277](https://github.com/matrix-org/matrix-spec-proposals/pull/4277) (v1.18) |
 | Mutual rooms (stable route) | [`src/api/rooms.ts`](src/api/rooms.ts) | [MSC2666](https://github.com/matrix-org/matrix-spec-proposals/pull/2666) (v1.19) |
-| `unsigned.replaces_state` on state events | [`src/api/rooms.ts`](src/api/rooms.ts) | spec v1.19 |
+| `unsigned.replaces_state` on all client-event surfaces | [`src/api/rooms.ts`](src/api/rooms.ts), [`src/api/sync.ts`](src/api/sync.ts), [`src/services/replaces-state.ts`](src/services/replaces-state.ts) | spec v1.19 (#2345/#2403); batched predecessor lookup covers federation-origin state |
 | Server ACL enforcement (case-insensitive) | [`src/services/server-acl.ts`](src/services/server-acl.ts) | spec module + [MSC4436](https://github.com/matrix-org/matrix-spec-proposals/pull/4436) (v1.19) |
 | Restricted rooms (fail-closed allow-list joins, room v8+/v10+) | [`src/services/restricted-joins.ts`](src/services/restricted-joins.ts), [`src/api/federation.ts`](src/api/federation.ts), [`src/workflows/RoomJoinWorkflow.ts`](src/workflows/RoomJoinWorkflow.ts) | [MSC3083](https://github.com/matrix-org/matrix-spec-proposals/pull/3083), [MSC3787](https://github.com/matrix-org/matrix-spec-proposals/pull/3787) |
 | Bidirectional typing/receipt EDUs (`m.typing` / `m.receipt` fan-out + inbound delivery) | [`src/services/federation-edus.ts`](src/services/federation-edus.ts), [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 |
 | Knock visibility in `/sync` and sliding sync (`knock_state`, long-poll change detection) | [`src/api/sync.ts`](src/api/sync.ts), [`src/api/sliding-sync.ts`](src/api/sliding-sync.ts) | spec v1.19 (`rooms.knock`), [MSC4186](https://github.com/matrix-org/matrix-spec-proposals/pull/4186) (sliding sync) |
-| Pagination conformance (`/messages` `to` + `filter`, `/context` `before`/`after`, `/members` `at`, hierarchy from cursor) | [`src/api/rooms.ts`](src/api/rooms.ts), [`src/api/spaces.ts`](src/api/spaces.ts) | spec v1.19 |
+| Pagination conformance (`/messages` `to` + `filter`, `/context` `before`/`after` + `filter`, `/members` `at`, hierarchy from cursor) | [`src/api/rooms.ts`](src/api/rooms.ts), [`src/api/spaces.ts`](src/api/spaces.ts) | spec v1.19 |
+| `timestamp_to_event` on the spec v1 client path (v3 kept as legacy alias) | [`src/api/rooms.ts`](src/api/rooms.ts) | MSC3030, spec v1.19 |
+| Room-version negotiation (`ver` on `make_join`/`make_knock`; `room_versions` in incompatible-version errors) | [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 server-server API |
+| `query/profile` field queries incl. custom keys and `m.tz` | [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 clarification #2326 |
+| `m.key_backup` account data | [`src/api/account-data.ts`](src/api/account-data.ts) | [MSC4287](https://github.com/matrix-org/matrix-spec-proposals/pull/4287) (v1.19) |
+| `m.recent_emoji` account data | [`src/api/account-data.ts`](src/api/account-data.ts) | [MSC4356](https://github.com/matrix-org/matrix-spec-proposals/pull/4356) (v1.18) |
+| Image packs (`m.room.image_pack` state, `m.image_pack.rooms` account data, client flag) | [`src/api/versions.ts`](src/api/versions.ts) | [MSC2545](https://github.com/matrix-org/matrix-spec-proposals/pull/2545) (v1.19) |
+| Encrypted history sharing relay (`m.room_key_bundle` to-device, `shared_history`, invited-user key queries) | [`src/api/to-device.ts`](src/api/to-device.ts) | [MSC4268](https://github.com/matrix-org/matrix-spec-proposals/pull/4268) (v1.19) |
+| Guest join enforcement on both C-S join paths (`M_GUEST_ACCESS_FORBIDDEN`) | [`src/api/rooms.ts`](src/api/rooms.ts) | spec v1.19 (guest status is local, so `make_join` cannot observe it) |
+| `M_TOKEN_INCORRECT` on identity and C-S submitToken endpoints | [`src/api/identity.ts`](src/api/identity.ts), [`src/api/account.ts`](src/api/account.ts) | [MSC4183](https://github.com/matrix-org/matrix-spec-proposals/pull/4183) (v1.18) |
+| `/send` per-PDU Matrix error objects (and 52 migrated test assertions) | [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 server-server API |
+| `/backfill` and `/get_missing_events` parameter validation (required `v`, 404 on unknown events, limit caps) | [`src/api/federation.ts`](src/api/federation.ts) | spec v1.19 server-server API |
+| Media `mxc://` path-segment sanitization and MSC3916 PUT upload size cap | [`src/api/media.ts`](src/api/media.ts) | spec v1.19 security section |
 
 ## Features
 
