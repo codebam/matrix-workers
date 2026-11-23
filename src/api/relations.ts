@@ -246,6 +246,10 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
 
   const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
   const include = c.req.query('include') || 'all'; // 'all' or 'participated'
+  // `from` uses the same token format as the sibling relations endpoints: the
+  // decimal string of the last returned root's origin_server_ts. Threads are
+  // always newest-first, so it acts as an exclusive upper bound (older roots).
+  const from = c.req.query('from');
 
   // Find thread roots (events that have replies with m.thread relation)
   let query = `
@@ -265,7 +269,14 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
     params.push(userId, userId);
   }
 
-  query += ` ORDER BY e.origin_server_ts DESC LIMIT ?`;
+  if (from) {
+    query += ` AND e.origin_server_ts < ?`;
+    params.push(parseInt(from));
+  }
+
+  // Fetch one extra row to detect another page. The +1 is applied in SQL so
+  // the bound page size stays `limit` (the value callers and tests observe).
+  query += ` ORDER BY e.origin_server_ts DESC LIMIT (? + 1)`;
   params.push(limit);
 
   const results = await db.prepare(query).bind(...params).all<{
@@ -277,7 +288,8 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
     redacted_content?: string | null;
   }>();
 
-  const threads = results.results.map(e => ({
+  const hasMore = results.results.length > limit;
+  const threads = results.results.slice(0, limit).map(e => ({
     event_id: e.event_id,
     type: e.event_type,
     sender: e.sender,
@@ -286,9 +298,15 @@ app.get('/_matrix/client/v1/rooms/:roomId/threads', requireAuth(), async (c) => 
     room_id: roomId,
   }));
 
-  return c.json({
+  const response: any = {
     chunk: threads,
-  });
+  };
+
+  if (hasMore && threads.length > 0) {
+    response.next_batch = threads[threads.length - 1].origin_server_ts.toString();
+  }
+
+  return c.json(response);
 });
 
 export default app;
