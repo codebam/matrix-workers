@@ -458,6 +458,17 @@ describe('createRoom spec parameters', () => {
     });
   });
 
+  it('accepts the m.policy room type (spec v1.20, MSC3784)', async () => {
+    const db = createDb();
+    const { status } = await request(
+      '/_matrix/client/v3/createRoom',
+      { creation_content: { type: 'm.policy' } },
+      db
+    );
+    expect(status).toBe(200);
+    expect(batchedEventContent(db, 'm.room.create')).toMatchObject({ type: 'm.policy' });
+  });
+
   it('merges power_level_content_override but keeps the creator at 100', async () => {
     const db = createDb();
     const { status } = await request('/_matrix/client/v3/createRoom', {
