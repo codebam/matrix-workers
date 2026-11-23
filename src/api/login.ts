@@ -27,6 +27,7 @@ import {
   consumeRegistrationToken,
 } from '../services/database';
 import { requireAuth, extractAccessToken } from '../middleware/auth';
+import { getAppServiceByToken } from '../services/appservice';
 
 const app = new Hono<AppEnv>();
 
@@ -458,25 +459,64 @@ app.post('/_matrix/client/v3/register', async (c) => {
     auth,
   } = body;
 
+  // MSC4190: an application service may register users in its own namespace
+  // using its as_token, without UIA or a password. Mirror requireAuth's
+  // user_id validation (format, local server, registered namespace); a valid
+  // as_token is required, and requests without one keep the existing flow.
+  let asRegistrationUserId: string | null = null;
+  // Extract the token locally: the as_token arrives either as a Bearer header
+  // or the access_token query param (same sources auth.ts accepts).
+  const bearer = c.req.raw.headers.get('Authorization')?.match(/^Bearer\s+(.+)$/i);
+  const requestToken = bearer?.[1] ?? c.req.query('access_token');
+  if (requestToken) {
+    try {
+      const appservice = await getAppServiceByToken(c.env.DB, requestToken);
+      if (appservice) {
+        const suppliedUserId = c.req.query('user_id') ?? body.user_id;
+        if (typeof suppliedUserId !== 'string' || !suppliedUserId) {
+          return Errors.missingParam('user_id').toResponse();
+        }
+        if (!/^@[a-z0-9._=/+-]+:[a-zA-Z0-9.-]+$/.test(suppliedUserId)) {
+          return Errors.forbidden('Invalid user_id format').toResponse();
+        }
+        const userServer = suppliedUserId.split(':').slice(1).join(':');
+        if (userServer !== c.env.SERVER_NAME) {
+          return Errors.forbidden('Cannot register users on other servers').toResponse();
+        }
+        const inNamespace = (appservice.namespaces?.users ?? []).some((ns) => {
+          try { return new RegExp(ns.regex).test(suppliedUserId); } catch { return false; }
+        });
+        if (!inNamespace) {
+          return Errors.forbidden('User not in application service namespace').toResponse();
+        }
+        asRegistrationUserId = suppliedUserId;
+      }
+    } catch (asErr) {
+      console.warn('[register] AppService token lookup error:', asErr);
+    }
+  }
+  const isAppserviceRegistration = asRegistrationUserId !== null;
+
   // Check registration kind
   const kind = c.req.query('kind') || 'user';
   if (kind !== 'user' && kind !== 'guest') {
     return Errors.invalidParam('kind', 'Invalid registration kind').toResponse();
   }
 
-  if (await registrationDisabled(c.env)) {
+  if (!isAppserviceRegistration && await registrationDisabled(c.env)) {
     return Errors.forbidden('Registration is disabled').toResponse();
   }
 
-  const isGuest = kind === 'guest';
+  const isGuest = !isAppserviceRegistration && kind === 'guest';
 
   // Invite-only mode (REGISTRATION_REQUIRE_TOKEN): every registration, user
   // or guest, must present a valid, unspent registration token.
   const tokenRequired =
     c.env.REGISTRATION_REQUIRE_TOKEN === 'true' || c.env.REGISTRATION_REQUIRE_TOKEN === '1';
 
-  // For non-guests, require username and password
-  if (!isGuest) {
+  // For non-guests, require username and password (appservices are exempt:
+  // they supply a validated user_id instead and have no password to give).
+  if (!isGuest && !isAppserviceRegistration) {
     // Simple auth - in production, implement UIA (User-Interactive Authentication)
     const authAccepted =
       auth?.type === 'm.login.dummy' ||
@@ -510,9 +550,16 @@ app.post('/_matrix/client/v3/register', async (c) => {
     }
   }
 
-  // Generate localpart for guests
-  const localpart = isGuest ? await generateOpaqueId(12) : username;
-  const userId = formatUserId(localpart, c.env.SERVER_NAME);
+  // Generate localpart for guests; appservices supply the full user_id.
+  let localpart: string;
+  let userId: string;
+  if (asRegistrationUserId) {
+    userId = asRegistrationUserId;
+    localpart = userId.slice(1, userId.indexOf(':'));
+  } else {
+    localpart = isGuest ? await generateOpaqueId(12) : username;
+    userId = formatUserId(localpart, c.env.SERVER_NAME);
+  }
 
   // Check if user already exists
   const existing = await getUserById(c.env.DB, userId);
@@ -523,7 +570,7 @@ app.post('/_matrix/client/v3/register', async (c) => {
   // Invite-only: consume the registration token only after every other check
   // has passed, so failed or duplicate registrations never burn a token. The
   // UPDATE is atomic, making single-use tokens safe under concurrent attempts.
-  if (tokenRequired) {
+  if (tokenRequired && !isAppserviceRegistration) {
     const candidateToken =
       (typeof auth?.token === 'string' && auth.token) ||
       (typeof token === 'string' && token) ||
@@ -539,8 +586,8 @@ app.post('/_matrix/client/v3/register', async (c) => {
     }
   }
 
-  // Hash password (null for guests)
-  const passwordHash = password ? await hashPassword(password) : null;
+  // Hash password (null for guests and appservice-provisioned users)
+  const passwordHash = isAppserviceRegistration ? null : (password ? await hashPassword(password) : null);
 
   // Create user
   await createUser(c.env.DB, userId, localpart, passwordHash, isGuest);

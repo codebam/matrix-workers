@@ -8,9 +8,53 @@ import type { AppEnv } from '../types';
 import { Errors } from '../utils/errors';
 import { requireAuth } from '../middleware/auth';
 import { verifyPassword } from '../utils/crypto';
+import { getAppServiceByToken } from '../services/appservice';
 import { deleteDeviceKeysFromDO, queueDeviceListUpdateEdus, recordKeyChange } from './keys';
 
 const app = new Hono<AppEnv>();
+
+/** Mirror auth.ts token extraction locally (no auth.ts changes needed). */
+function requestAccessToken(request: Request): string | null {
+  const header = request.headers.get('Authorization');
+  if (header) {
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    if (match) return match[1];
+  }
+  return new URL(request.url).searchParams.get('access_token');
+}
+
+/**
+ * MSC4190: appservices cannot supply the UIA password that device deletion
+ * normally requires. Detect an appservice-authenticated masquerade locally
+ * (re-looking up the bearer token with the same service auth.ts uses) so the
+ * UIA stage can be skipped — but only when the request really is for a
+ * masqueraded user inside the appservice's registered namespace.
+ */
+async function isAppserviceMasquerade(
+  db: D1Database,
+  request: Request,
+  effectiveUserId: string,
+  serverName: string
+): Promise<boolean> {
+  const token = requestAccessToken(request);
+  if (!token) return false;
+  try {
+    const appservice = await getAppServiceByToken(db, token);
+    if (!appservice) return false;
+
+    const asUserId = new URL(request.url).searchParams.get('user_id');
+    if (!asUserId || asUserId !== effectiveUserId) return false;
+    if (!/^@[a-z0-9._=/+-]+:[a-zA-Z0-9.-]+$/.test(asUserId)) return false;
+    if (asUserId.split(':').slice(1).join(':') !== serverName) return false;
+
+    return (appservice.namespaces?.users ?? []).some((ns) => {
+      try { return new RegExp(ns.regex).test(asUserId); } catch { return false; }
+    });
+  } catch {
+    // Fail closed: an unreadable AS registration means normal UIA applies.
+    return false;
+  }
+}
 
 // ============================================
 // Endpoints
@@ -120,6 +164,11 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     return Errors.notFound('Device not found').toResponse();
   }
 
+  // MSC4190: a namespaced appservice masquerade cannot supply a UIA password.
+  const appserviceDeletion = await isAppserviceMasquerade(
+    c.env.DB, c.req.raw, userId, c.env.SERVER_NAME
+  );
+
   // Try to get auth from body for UIA
   let auth: { type?: string; password?: string; session?: string } | undefined;
   try {
@@ -129,8 +178,8 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
     // No auth provided
   }
 
-  // If no auth provided, return UIA response
-  if (!auth) {
+  // If no auth provided, return UIA response (appservices are exempt)
+  if (!auth && !appserviceDeletion) {
     const sessionId = crypto.randomUUID();
     return c.json({
       flows: [{ stages: ['m.login.password'] }],
@@ -140,7 +189,7 @@ app.delete('/_matrix/client/v3/devices/:deviceId', requireAuth(), async (c) => {
   }
 
   // Verify password if auth provided
-  if (auth.type === 'm.login.password') {
+  if (!appserviceDeletion && auth?.type === 'm.login.password') {
     const user = await db.prepare(`
       SELECT password_hash FROM users WHERE user_id = ?
     `).bind(userId).first<{ password_hash: string }>();
@@ -193,8 +242,13 @@ app.post('/_matrix/client/v3/delete_devices', requireAuth(), async (c) => {
     return Errors.missingParam('devices').toResponse();
   }
 
-  // If no auth provided, return UIA response
-  if (!body.auth) {
+  // MSC4190: a namespaced appservice masquerade cannot supply a UIA password.
+  const appserviceDeletion = await isAppserviceMasquerade(
+    c.env.DB, c.req.raw, userId, c.env.SERVER_NAME
+  );
+
+  // If no auth provided, return UIA response (appservices are exempt)
+  if (!body.auth && !appserviceDeletion) {
     const sessionId = crypto.randomUUID();
     return c.json({
       flows: [{ stages: ['m.login.password'] }],
@@ -204,7 +258,7 @@ app.post('/_matrix/client/v3/delete_devices', requireAuth(), async (c) => {
   }
 
   // Verify password if auth provided
-  if (body.auth.type === 'm.login.password') {
+  if (!appserviceDeletion && body.auth?.type === 'm.login.password') {
     const user = await db.prepare(`
       SELECT password_hash FROM users WHERE user_id = ?
     `).bind(userId).first<{ password_hash: string }>();
