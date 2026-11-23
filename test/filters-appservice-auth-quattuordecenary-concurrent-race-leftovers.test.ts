@@ -1192,7 +1192,8 @@ describe('race quattuordecenary auth Negotiate∥NTLM→query AS∥unknown soft 
         ]),
       });
 
-      // Non-Bearer Authorization does not match → fall through to query
+      // Spec v1.20: non-Bearer schemes are not credentials and there is no
+      // query-string fallback.
       expect(
         extractAccessToken(
           new Request(
@@ -1200,7 +1201,7 @@ describe('race quattuordecenary auth Negotiate∥NTLM→query AS∥unknown soft 
             { headers: { Authorization: `Negotiate ${asTok}` } }
           )
         )
-      ).toBe(asTok);
+      ).toBeNull();
       expect(
         extractAccessToken(
           new Request(
@@ -1208,7 +1209,7 @@ describe('race quattuordecenary auth Negotiate∥NTLM→query AS∥unknown soft 
             { headers: { Authorization: `NTLM ${asTok}` } }
           )
         )
-      ).toBe(asTok);
+      ).toBeNull();
 
       const negotiateCtx = makeAuthCtx({
         db,
@@ -1234,13 +1235,18 @@ describe('race quattuordecenary auth Negotiate∥NTLM→query AS∥unknown soft 
         realRequireAuth()(unknown, vi.fn()),
       ]);
 
-      expect(negotiateRes).toBe('negotiate-ok');
-      expect(ntlmRes).toBe('ntlm-ok');
-      expect(negotiateNext).toHaveBeenCalledOnce();
-      expect(ntlmNext).toHaveBeenCalledOnce();
-      expect(negotiateCtx.get('userId')).toBe(`@bridge:${AUTH_SERVER}`);
-      expect(ntlmCtx.get('userId')).toBe(`@bridge:${AUTH_SERVER}`);
-      expect(negotiateCtx.get('deviceId')).toBeNull();
+      expect(await jsonBody(negotiateRes as Response)).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        status: 401,
+      });
+      expect(await jsonBody(ntlmRes as Response)).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        status: 401,
+      });
+      expect(negotiateNext).not.toHaveBeenCalled();
+      expect(ntlmNext).not.toHaveBeenCalled();
+      expect(negotiateCtx.get('userId')).toBeUndefined();
+      expect(ntlmCtx.get('userId')).toBeUndefined();
 
       const unkBody = await jsonBody(unkRes as Response);
       expect(unkBody).toMatchObject({

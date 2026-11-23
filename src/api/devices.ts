@@ -13,14 +13,16 @@ import { deleteDeviceKeysFromDO, queueDeviceListUpdateEdus, recordKeyChange } fr
 
 const app = new Hono<AppEnv>();
 
-/** Mirror auth.ts token extraction locally (no auth.ts changes needed). */
+// Token extraction mirrors auth.ts: header only. Spec v1.20 removed
+// query-string access tokens, so there is deliberately no `?access_token=`
+// fallback here either.
 function requestAccessToken(request: Request): string | null {
   const header = request.headers.get('Authorization');
   if (header) {
     const match = header.match(/^Bearer\s+(.+)$/i);
     if (match) return match[1];
   }
-  return new URL(request.url).searchParams.get('access_token');
+  return null;
 }
 
 /**

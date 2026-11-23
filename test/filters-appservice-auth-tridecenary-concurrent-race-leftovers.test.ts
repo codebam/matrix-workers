@@ -1173,7 +1173,8 @@ describe('race tridecenary auth Digest∥Token→query AS∥unknown soft after #
         ]),
       });
 
-      // Non-Bearer Authorization does not match → fall through to query
+      // Spec v1.20: a non-Bearer scheme is not a credential, and there is no
+      // query-string fallback for it to reach.
       expect(
         extractAccessToken(
           new Request(
@@ -1181,7 +1182,7 @@ describe('race tridecenary auth Digest∥Token→query AS∥unknown soft after #
             { headers: { Authorization: `Digest ${asTok}` } }
           )
         )
-      ).toBe(asTok);
+      ).toBeNull();
       expect(
         extractAccessToken(
           new Request(
@@ -1189,7 +1190,7 @@ describe('race tridecenary auth Digest∥Token→query AS∥unknown soft after #
             { headers: { Authorization: `Token ${asTok}` } }
           )
         )
-      ).toBe(asTok);
+      ).toBeNull();
 
       const digestCtx = makeAuthCtx({
         db,
@@ -1215,13 +1216,18 @@ describe('race tridecenary auth Digest∥Token→query AS∥unknown soft after #
         realRequireAuth()(unknown, vi.fn()),
       ]);
 
-      expect(digestRes).toBe('digest-ok');
-      expect(tokenRes).toBe('token-ok');
-      expect(digestNext).toHaveBeenCalledOnce();
-      expect(tokenNext).toHaveBeenCalledOnce();
-      expect(digestCtx.get('userId')).toBe(`@bridge:${AUTH_SERVER}`);
-      expect(tokenCtx.get('userId')).toBe(`@bridge:${AUTH_SERVER}`);
-      expect(digestCtx.get('deviceId')).toBeNull();
+      expect(await jsonBody(digestRes as Response)).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        status: 401,
+      });
+      expect(await jsonBody(tokenRes as Response)).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        status: 401,
+      });
+      expect(digestNext).not.toHaveBeenCalled();
+      expect(tokenNext).not.toHaveBeenCalled();
+      expect(digestCtx.get('userId')).toBeUndefined();
+      expect(tokenCtx.get('userId')).toBeUndefined();
 
       const unkBody = await jsonBody(unkRes as Response);
       expect(unkBody).toMatchObject({

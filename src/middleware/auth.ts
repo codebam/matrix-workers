@@ -16,22 +16,19 @@ export type AuthContext = {
   suspended?: boolean;
 };
 
-// Extract access token from request
+// Extract access token from the request.
+//
+// Spec v1.20 (breaking): "Sending the access token as a query string parameter
+// is no longer supported." Only the `Authorization: Bearer` header is
+// accepted. Query-string tokens leak through logs, referrers and copied URLs,
+// so the fallback is deliberately gone rather than merely deprecated.
 export function extractAccessToken(request: Request): string | null {
-  // Check Authorization header first
   const authHeader = request.headers.get('Authorization');
   if (authHeader) {
     const match = authHeader.match(/^Bearer\s+(.+)$/i);
     if (match) {
       return match[1];
     }
-  }
-
-  // Fall back to query parameter
-  const url = new URL(request.url);
-  const queryToken = url.searchParams.get('access_token');
-  if (queryToken) {
-    return queryToken;
   }
 
   return null;

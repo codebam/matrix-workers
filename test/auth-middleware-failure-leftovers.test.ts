@@ -119,25 +119,27 @@ describe('auth leftovers extractAccessToken precedence after #147', () => {
     expect(extractAccessToken(req)).toBe('header_tok');
   });
 
-  it('empty Authorization falls through to query token', () => {
+  // Spec v1.20 removed query-string access tokens: no header path may fall
+  // back to the query string any more.
+  it('empty Authorization does not fall through to the query token', () => {
     const req = new Request(`https://${SERVER}/sync?access_token=query_only`, {
       headers: { Authorization: '' },
     });
-    expect(extractAccessToken(req)).toBe('query_only');
+    expect(extractAccessToken(req)).toBeNull();
   });
 
-  it('Bearer with no token value does not match; query used', () => {
+  it('Bearer with no token value does not fall through to the query token', () => {
     const req = new Request(`https://${SERVER}/sync?access_token=q`, {
       headers: { Authorization: 'Bearer' },
     });
-    expect(extractAccessToken(req)).toBe('q');
+    expect(extractAccessToken(req)).toBeNull();
   });
 
-  it('non-Bearer Authorization scheme falls through to query', () => {
+  it('non-Bearer Authorization scheme does not fall through to the query token', () => {
     const req = new Request(`https://${SERVER}/sync?access_token=qtok`, {
       headers: { Authorization: 'Basic abc' },
     });
-    expect(extractAccessToken(req)).toBe('qtok');
+    expect(extractAccessToken(req)).toBeNull();
   });
 
   it('missing both header and query → null', () => {
@@ -184,7 +186,7 @@ describe('auth leftovers requireAuth failure matrix after #147', () => {
     expect(await jsonBody(res)).toMatchObject({ errcode: 'M_UNKNOWN_TOKEN', status: 401 });
   });
 
-  it('valid query-only user token sets context', async () => {
+  it('valid query-only user token is rejected (no header)', async () => {
     const token = 'syt_query_ok';
     const hash = await hashToken(token);
     const db = createAuthDb({
@@ -195,9 +197,10 @@ describe('auth leftovers requireAuth failure matrix after #147', () => {
       url: `https://${SERVER}/_matrix/client/v3/sync?access_token=${token}`,
     });
     const next = vi.fn(async () => 'ok');
-    await expect(requireAuth()(ctx, next)).resolves.toBe('ok');
-    expect(ctx.get('userId')).toBe(`@alice:${SERVER}`);
-    expect(ctx.get('deviceId')).toBe('DQ');
+    const res = await requireAuth()(ctx, next);
+    expect(await jsonBody(res as Response)).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+    expect(next).not.toHaveBeenCalled();
+    expect(ctx.get('userId')).toBeUndefined();
   });
 
   it('AS token + no user_id → @sender_localpart:SERVER_NAME with null deviceId', async () => {
@@ -343,8 +346,10 @@ describe('auth leftovers requireAuth failure matrix after #147', () => {
       url: `https://${SERVER}/sync?access_token=as_q`,
     });
     const next = vi.fn(async () => 'qas');
-    await expect(requireAuth()(ctx, next)).resolves.toBe('qas');
-    expect(ctx.get('userId')).toBe(`@hook:${SERVER}`);
+    const res = await requireAuth()(ctx, next);
+    // Spec v1.20: a query token is not a credential for appservices either.
+    expect(await jsonBody(res as Response)).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+    expect(next).not.toHaveBeenCalled();
   });
 
   it('deviceId null from token row preserved on requireAuth', async () => {

@@ -223,22 +223,23 @@ describe('race second-wave auth optionalAuth scheme fallthrough after #266', () 
         optionalAuth()(bearerWrong, nextW),
         optionalAuth()(queryOnly, nextQ),
       ]);
+      // Spec v1.20: optionalAuth does not fall back to a query token either.
       expect(resS).toBe('s');
-      expect(withScheme.get('userId')).toBe(`@o${i}:${SERVER}`);
-      expect(withScheme.get('accessToken')).toBe(token);
-      expect(withScheme.get('deviceId')).toBe('OD');
+      expect(withScheme.get('userId')).toBeUndefined();
+      expect(withScheme.get('accessToken')).toBeUndefined();
+      expect(withScheme.get('deviceId')).toBeUndefined();
       // invalid Bearer does not fall through under optionalAuth either
       expect(resW).toBe('w');
       expect(bearerWrong.get('userId')).toBeUndefined();
       expect(resQ).toBe('q');
-      expect(queryOnly.get('userId')).toBe(`@o${i}:${SERVER}`);
+      expect(queryOnly.get('userId')).toBeUndefined();
       expect(
         extractAccessToken(
           new Request(`https://${SERVER}/sync?access_token=${token}`, {
             headers: { Authorization: `${scheme} abc${i}` },
           })
         )
-      ).toBe(token);
+      ).toBeNull();
     });
   }
 });

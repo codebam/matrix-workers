@@ -364,7 +364,7 @@ describe('requireAuth', () => {
     expect(console.warn).toHaveBeenCalled();
   });
 
-  it('accepts access_token query param for user tokens', async () => {
+  it('rejects access_token query param (spec v1.20 removed query-string auth)', async () => {
     const token = 'syt_query';
     const hash = await hashToken(token);
     const db = createAuthDb({
@@ -375,8 +375,13 @@ describe('requireAuth', () => {
       url: `https://${SERVER}/_matrix/client/v3/sync?access_token=${token}`,
     });
     const next = vi.fn(async () => 'q');
-    await expect(requireAuth()(ctx, next)).resolves.toBe('q');
-    expect(ctx.get('userId')).toBe(`@q:${SERVER}`);
+    const res = await requireAuth()(ctx, next);
+    expect(await jsonBody(res as Response)).toMatchObject({
+      errcode: 'M_MISSING_TOKEN',
+      status: 401,
+    });
+    expect(next).not.toHaveBeenCalled();
+    expect(ctx.get('userId')).toBeUndefined();
   });
 
   it('rejects AS user_id whose server part contains a port (format regex)', async () => {

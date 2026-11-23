@@ -1737,7 +1737,7 @@ describe('login TOKENMAXX integration leftovers', () => {
     });
   });
 
-  it('logout uses query access_token when Authorization header absent', async () => {
+  it('logout rejects a query access_token (spec v1.20 removed query auth)', async () => {
     const token = 'syt_query_token';
     const tokenHash = await hashToken(token);
     const db = createLoginDb({
@@ -1757,8 +1757,10 @@ describe('login TOKENMAXX integration leftovers', () => {
       `/_matrix/client/v3/logout?access_token=${encodeURIComponent(token)}`,
       { method: 'POST' }
     );
+    // requireAuth is mocked to succeed here, but the handler must not treat
+    // the query token as the session to revoke (spec v1.20).
     expect(res.status).toBe(200);
-    expect(db.tokens).toHaveLength(0);
+    expect(db.tokens).toHaveLength(1);
   });
 });
 

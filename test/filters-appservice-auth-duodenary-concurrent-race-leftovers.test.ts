@@ -1210,7 +1210,7 @@ describe('race duodenary auth bearer case∥Basic→query AS∥unknown soft afte
           })
         )
       ).toBe(asTok);
-      // Non-Bearer Authorization does not match → fall through to query
+      // Spec v1.20: Basic + query token is not a credential.
       expect(
         extractAccessToken(
           new Request(
@@ -1218,7 +1218,7 @@ describe('race duodenary auth bearer case∥Basic→query AS∥unknown soft afte
             { headers: { Authorization: `Basic ${asTok}` } }
           )
         )
-      ).toBe(asTok);
+      ).toBeNull();
 
       const lowerCtx = makeAuthCtx({
         db,
@@ -1253,13 +1253,16 @@ describe('race duodenary auth bearer case∥Basic→query AS∥unknown soft afte
 
       expect(lowerRes).toBe('lower-ok');
       expect(upperRes).toBe('upper-ok');
-      expect(basicRes).toBe('basic-ok');
+      expect(await jsonBody(basicRes as Response)).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        status: 401,
+      });
       expect(lowerNext).toHaveBeenCalledOnce();
       expect(upperNext).toHaveBeenCalledOnce();
-      expect(basicNext).toHaveBeenCalledOnce();
+      expect(basicNext).not.toHaveBeenCalled();
       expect(lowerCtx.get('userId')).toBe(`@bridge:${AUTH_SERVER}`);
       expect(upperCtx.get('userId')).toBe(`@bridge:${AUTH_SERVER}`);
-      expect(basicQueryCtx.get('userId')).toBe(`@bridge:${AUTH_SERVER}`);
+      expect(basicQueryCtx.get('userId')).toBeUndefined();
       expect(lowerCtx.get('deviceId')).toBeNull();
 
       const unkBody = await jsonBody(unkRes as Response);

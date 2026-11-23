@@ -172,24 +172,28 @@ describe('race tertiary auth empty access_token= after #266', () => {
         requireAuth()(wsQ, nextW),
         requireAuth()(validQ, nextV),
       ]);
-      // searchParams.get('access_token') === '' is falsy → extract returns null
+      // Spec v1.20: no query-string fallback at all — every query-only
+      // request is missing a credential, whatever the token value.
       expect(await jsonBody(resE as Response)).toMatchObject({
         errcode: 'M_MISSING_TOKEN',
         status: 401,
       });
       expect(nextE).not.toHaveBeenCalled();
-      // whitespace is truthy → validate → unknown
       expect(await jsonBody(resW as Response)).toMatchObject({
-        errcode: 'M_UNKNOWN_TOKEN',
+        errcode: 'M_MISSING_TOKEN',
         status: 401,
       });
       expect(nextW).not.toHaveBeenCalled();
-      expect(resV).toBe('v');
-      expect(validQ.get('userId')).toBe(`@g${i}:${SERVER}`);
+      expect(await jsonBody(resV as Response)).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        status: 401,
+      });
+      expect(nextV).not.toHaveBeenCalled();
+      expect(validQ.get('userId')).toBeUndefined();
       expect(extractAccessToken(new Request(`https://${SERVER}/sync?access_token=`))).toBeNull();
       expect(
         extractAccessToken(new Request(`https://${SERVER}/sync?access_token=${encodeURIComponent(' ')}`))
-      ).toBe(' ');
+      ).toBeNull();
     });
   }
 
@@ -216,8 +220,9 @@ describe('race tertiary auth empty access_token= after #266', () => {
       ]);
       expect(resE).toBe('e');
       expect(empty.get('userId')).toBeUndefined();
+      // Spec v1.20: optionalAuth ignores query tokens too.
       expect(resV).toBe('v');
-      expect(valid.get('userId')).toBe(`@o${i}:${SERVER}`);
+      expect(valid.get('userId')).toBeUndefined();
     });
   }
 });

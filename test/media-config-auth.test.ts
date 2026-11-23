@@ -124,13 +124,13 @@ describe('media config requires authentication (spec v1.19, item 14)', () => {
     expect((await v1.json() as { errcode: string }).errcode).toBe('M_MISSING_TOKEN');
   });
 
-  it('accepts the access_token query parameter on v3 config', async () => {
+  it('rejects the access_token query parameter on v3 config (spec v1.20)', async () => {
     const res = await req(
       `/_matrix/media/v3/config?access_token=${TOKEN}`,
       makeEnv(await validTokenDb())
     );
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ 'm.upload.size': MAX_UPLOAD_SIZE });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
   });
 
   it('animated=true on thumbnail is accepted-and-ignored; clamped width/height unchanged', async () => {

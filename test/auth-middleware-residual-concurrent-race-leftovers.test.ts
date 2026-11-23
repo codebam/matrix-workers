@@ -178,8 +178,10 @@ describe('race residual auth garbage Bearer blocks query after #236', () => {
         status: 401,
       });
       expect(nextG).not.toHaveBeenCalled();
-      expect(resQ).toBe('q');
-      expect(queryOnly.get('userId')).toBe(`@g${i}:${SERVER}`);
+      // Spec v1.20: the query-only request is unauthenticated.
+      expect(await jsonBody(resQ as Response)).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+      expect(nextQ).not.toHaveBeenCalled();
+      expect(queryOnly.get('userId')).toBeUndefined();
       expect(resB).toBe('b');
       expect(bearerOk.get('userId')).toBe(`@g${i}:${SERVER}`);
       // extract still prefers Bearer garbage over query
@@ -582,9 +584,13 @@ describe('race residual auth Basic/Digest fallthrough to query after #236', () =
         requireAuth()(withScheme, nextS),
         requireAuth()(bearerWrong, nextW),
       ]);
-      expect(resS).toBe('s');
-      expect(withScheme.get('userId')).toBe(`@s${i}:${SERVER}`);
-      expect(withScheme.get('accessToken')).toBe(token);
+      // Spec v1.20: a non-Bearer scheme does not fall back to the query token.
+      expect(await jsonBody(resS as Response)).toMatchObject({
+        errcode: 'M_MISSING_TOKEN',
+        status: 401,
+      });
+      expect(nextS).not.toHaveBeenCalled();
+      expect(withScheme.get('userId')).toBeUndefined();
       expect(await jsonBody(resW as Response)).toMatchObject({ errcode: 'M_UNKNOWN_TOKEN' });
       expect(nextW).not.toHaveBeenCalled();
     });

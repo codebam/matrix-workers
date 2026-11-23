@@ -360,7 +360,7 @@ describe('race senary auth after #286 (real requireAuth)', () => {
           ]),
         });
 
-        // URLSearchParams.get returns first value only
+        // Spec v1.20: duplicate query tokens are not credentials at all.
         const goodFirst = makeAuthCtx({
           db,
           url: `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(good)}&access_token=${encodeURIComponent(bad)}`,
@@ -376,24 +376,27 @@ describe('race senary auth after #286 (real requireAuth)', () => {
               `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(good)}&access_token=${encodeURIComponent(bad)}`
             )
           )
-        ).toBe(good);
+        ).toBeNull();
         expect(
           extractAccessToken(
             new Request(
               `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(bad)}&access_token=${encodeURIComponent(good)}`
             )
           )
-        ).toBe(bad);
+        ).toBeNull();
 
         const [goodRes, badRes] = await Promise.all([
           realRequireAuth()(goodFirst, vi.fn(async () => 'good')),
           realRequireAuth()(badFirst, vi.fn()),
         ]);
 
-        expect(goodRes).toBe('good');
-        expect(goodFirst.get('userId')).toBe(`@dup_${i}:${AUTH_SERVER}`);
+        expect(await jsonBody(goodRes as Response)).toMatchObject({
+          errcode: 'M_MISSING_TOKEN',
+          status: 401,
+        });
+        expect(goodFirst.get('userId')).toBeUndefined();
         expect(await jsonBody(badRes as Response)).toMatchObject({
-          errcode: 'M_UNKNOWN_TOKEN',
+          errcode: 'M_MISSING_TOKEN',
           status: 401,
         });
       });

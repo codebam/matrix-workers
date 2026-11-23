@@ -838,40 +838,39 @@ describe('race octonary auth AS query soft forbid quad after #304', () => {
         ]),
       });
 
+      // Spec v1.20: credentials come from the Authorization header only.
+      const asHeaders = { Authorization: `Bearer ${tok}` };
       const badFmt = makeAuthCtx({
         db,
-        url: `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(tok)}&user_id=${encodeURIComponent('@Bad')}`,
-        headers: {},
+        url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent('@Bad')}`,
+        headers: asHeaders,
       });
       const foreign = makeAuthCtx({
         db,
-        url: `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(tok)}&user_id=${encodeURIComponent(
+        url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(
           `@_bridge_x_${i}:other.example.com`
         )}`,
-        headers: {},
+        headers: asHeaders,
       });
       const outOfNs = makeAuthCtx({
         db,
-        url: `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(tok)}&user_id=${encodeURIComponent(
+        url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(
           `@alice_${i}:${AUTH_SERVER}`
         )}`,
-        headers: {},
+        headers: asHeaders,
       });
       const ok = makeAuthCtx({
         db,
-        url: `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(tok)}&user_id=${encodeURIComponent(
+        url: `https://${AUTH_SERVER}/sync?user_id=${encodeURIComponent(
           `@_bridge_ok_${i}:${AUTH_SERVER}`
         )}`,
-        headers: {},
+        headers: asHeaders,
       });
       const next = vi.fn(async () => 'ok');
 
-      // extractAccessToken falls through to query when no Authorization
       expect(
         extractAccessToken(
-          new Request(
-            `https://${AUTH_SERVER}/sync?access_token=${encodeURIComponent(tok)}`
-          )
+          new Request(`https://${AUTH_SERVER}/sync`, { headers: asHeaders })
         )
       ).toBe(tok);
 

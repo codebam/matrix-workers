@@ -162,7 +162,8 @@ describe('race auth extractAccessToken residual soft floods after #214', () => {
       const req = new Request(`https://${SERVER}/sync?access_token=q${i}`, {
         headers: { Authorization: `${scheme} abc${i}` },
       });
-      expect(extractAccessToken(req)).toBe(`q${i}`);
+      // Spec v1.20: only a Bearer header authenticates; there is no query fallback.
+      expect(extractAccessToken(req)).toBeNull();
     });
   }
 
@@ -281,7 +282,9 @@ describe('race auth requireAuth user-token isolation after #214', () => {
         requireAuth()(ctxB, vi.fn(async () => undefined)),
         requireAuth()(ctxBoth, vi.fn(async () => undefined)),
       ]);
-      expect(ctxQ.get('userId')).toBe(`@q${i}:${SERVER}`);
+      // Spec v1.20: the query-only request is unauthenticated, while a Bearer
+      // header (alone or alongside a query token) still wins.
+      expect(ctxQ.get('userId')).toBeUndefined();
       expect(ctxB.get('userId')).toBe(`@b${i}:${SERVER}`);
       expect(ctxBoth.get('userId')).toBe(`@b${i}:${SERVER}`);
     });
@@ -917,10 +920,10 @@ describe('race auth extractAccessToken whitespace after #232', () => {
       const c = new Request(`https://${SERVER}/sync?access_token=q${i}`, {
         headers: { Authorization: 'Bearer ' },
       });
-      expect(extractAccessToken(a)).toBe(`q${i}`);
-      expect(extractAccessToken(b)).toBe(`q${i}`);
-      // "Bearer " + empty capture fails `.+` → query fallback
-      expect(extractAccessToken(c)).toBe(`q${i}`);
+      // Spec v1.20: none of these fall back to the query token.
+      expect(extractAccessToken(a)).toBeNull();
+      expect(extractAccessToken(b)).toBeNull();
+      expect(extractAccessToken(c)).toBeNull();
     });
   }
 
@@ -1083,10 +1086,11 @@ describe('race auth optionalAuth query + empty Authorization after #232', () => 
         optionalAuth()(missing, vi.fn(async () => undefined)),
         optionalAuth()(emptyAuth, vi.fn(async () => undefined)),
       ]);
-      expect(q.get('userId')).toBe(`@q${i}:${SERVER}`);
-      expect(q.get('deviceId')).toBe('QD');
+      // Spec v1.20: query tokens no longer authenticate, optionalAuth or not.
+      expect(q.get('userId')).toBeUndefined();
+      expect(q.get('deviceId')).toBeUndefined();
       expect(missing.get('userId')).toBeUndefined();
-      expect(emptyAuth.get('userId')).toBe(`@q${i}:${SERVER}`);
+      expect(emptyAuth.get('userId')).toBeUndefined();
     });
   }
 
@@ -1103,9 +1107,10 @@ describe('race auth optionalAuth query + empty Authorization after #232', () => 
         headers: { Authorization: '' },
       });
       const next = vi.fn(async () => 'ok');
-      await expect(requireAuth()(ctx, next)).resolves.toBe('ok');
-      expect(ctx.get('userId')).toBe(`@e${i}:${SERVER}`);
-      expect(ctx.get('accessToken')).toBe(token);
+      const res = await requireAuth()(ctx, next);
+      expect(await jsonBody(res as Response)).toMatchObject({ errcode: 'M_MISSING_TOKEN' });
+      expect(next).not.toHaveBeenCalled();
+      expect(ctx.get('userId')).toBeUndefined();
     });
   }
 
