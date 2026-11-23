@@ -757,7 +757,9 @@ app.get('/_matrix/media/v3/preview_url', requireAuth(), async (c) => {
 });
 
 // GET /_matrix/media/v3/config - Get media config
-app.get('/_matrix/media/v3/config', async (c) => {
+// Spec v1.19 marks the config endpoint as requiring authentication; keep parity
+// with the client/v1 route below. The dot-form `m.upload.size` field is spec-correct.
+app.get('/_matrix/media/v3/config', requireAuth(), async (c) => {
   return c.json({
     'm.upload.size': MAX_UPLOAD_SIZE,
   });
