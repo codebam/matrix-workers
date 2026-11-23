@@ -456,8 +456,10 @@ app.post('/_matrix/client/v3/account/3pid/submit_token', async (c) => {
   const result = await validateEmailToken(db, sid, client_secret, token);
 
   if (!result.success) {
+    // MSC4183: wrong/expired tokens are M_TOKEN_INCORRECT. An unknown
+    // session is a genuinely different failure and keeps the legacy code.
     return c.json({
-      errcode: 'M_THREEPID_AUTH_FAILED',
+      errcode: result.error === 'Session not found' ? 'M_THREEPID_AUTH_FAILED' : 'M_TOKEN_INCORRECT',
       error: result.error || 'Verification failed',
     }, 400);
   }
@@ -488,8 +490,10 @@ app.get('/_matrix/client/v3/account/3pid/submit_token', async (c) => {
   const result = await validateEmailToken(db, sid, client_secret, token);
 
   if (!result.success) {
+    // MSC4183: wrong/expired tokens are M_TOKEN_INCORRECT. An unknown
+    // session is a genuinely different failure and keeps the legacy code.
     return c.json({
-      errcode: 'M_THREEPID_AUTH_FAILED',
+      errcode: result.error === 'Session not found' ? 'M_THREEPID_AUTH_FAILED' : 'M_TOKEN_INCORRECT',
       error: result.error || 'Verification failed',
     }, 400);
   }

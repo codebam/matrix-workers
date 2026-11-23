@@ -198,12 +198,14 @@ app.post('/_matrix/identity/v2/validate/email/submitToken', async (c) => {
     return c.json({ errcode: 'M_NO_VALID_SESSION', error: 'Session not found' }, 400);
   }
 
+  // MSC4183: a wrong or expired token is M_TOKEN_INCORRECT. An unknown sid
+  // (including a client_secret mismatch) keeps M_NO_VALID_SESSION.
   if (session.expires_at < Date.now()) {
-    return c.json({ errcode: 'M_SESSION_EXPIRED', error: 'Session expired' }, 400);
+    return c.json({ errcode: 'M_TOKEN_INCORRECT', error: 'Session expired' }, 400);
   }
 
   if (session.token !== token) {
-    return c.json({ errcode: 'M_INVALID_PARAM', error: 'Invalid token' }, 400);
+    return c.json({ errcode: 'M_TOKEN_INCORRECT', error: 'Invalid token' }, 400);
   }
 
   // Mark as validated

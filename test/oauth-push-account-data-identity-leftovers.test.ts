@@ -2151,7 +2151,7 @@ describe('oauth identity leftovers identity validate email soft TTL after #146',
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken expires_at == now soft still valid (< check)', async () => {
@@ -2232,7 +2232,7 @@ describe('oauth identity leftovers identity validate email soft TTL after #146',
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken double validate soft still success', async () => {
@@ -4914,7 +4914,7 @@ describe('oauth identity leftovers identity submitToken missing soft after #146'
     });
   }
 
-  it('submitToken wrong token soft M_INVALID_PARAM', async () => {
+  it('submitToken wrong token soft M_TOKEN_INCORRECT', async () => {
     const db = createIdentityDb({
       emailSessions: new Map([
         [
@@ -4938,7 +4938,7 @@ describe('oauth identity leftovers identity submitToken missing soft after #146'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('account serverName soft uses env', async () => {
@@ -5833,7 +5833,7 @@ describe('oauth identity leftovers identity requestToken / submitToken soft afte
     expect(sess?.expires_at).toBe(NOW + DAY_MS);
   });
 
-  it('submitToken expired soft M_SESSION_EXPIRED', async () => {
+  it('submitToken expired soft M_TOKEN_INCORRECT', async () => {
     const db = createIdentityDb({
       emailSessions: new Map([
         [
@@ -5857,7 +5857,7 @@ describe('oauth identity leftovers identity requestToken / submitToken soft afte
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken wrong client_secret soft M_NO_VALID_SESSION', async () => {
@@ -7021,7 +7021,7 @@ describe('oauth identity leftovers identity validate soft failure flood after #1
     });
   }
 
-  it('submitToken soft wrong token M_INVALID_PARAM', async () => {
+  it('submitToken soft wrong token M_TOKEN_INCORRECT', async () => {
     const db = createIdentityDb({
       emailSessions: new Map([
         [
@@ -7045,7 +7045,7 @@ describe('oauth identity leftovers identity validate soft failure flood after #1
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
     expect(db.emailSessions.get('sid-w')?.validated).toBe(0);
   });
 
@@ -7122,7 +7122,7 @@ describe('oauth identity leftovers identity validate soft failure flood after #1
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 });
 
@@ -9311,7 +9311,7 @@ describe('oauth identity leftovers identity soft reliability round-3 after #151'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft expired session', async () => {
@@ -9338,7 +9338,7 @@ describe('oauth identity leftovers identity soft reliability round-3 after #151'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft missing session', async () => {
@@ -11682,7 +11682,7 @@ describe('oauth identity leftovers identity soft reliability round-5 after #151'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {
@@ -13010,7 +13010,7 @@ describe('oauth identity leftovers identity soft reliability round-6 after #160'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {
@@ -14339,7 +14339,7 @@ describe('oauth identity leftovers identity soft reliability round-7 after #160'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {
@@ -15669,7 +15669,7 @@ describe('oauth identity leftovers identity soft reliability round-8 after #160'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {
@@ -16999,7 +16999,7 @@ describe('oauth identity leftovers identity soft reliability round-9 after #160'
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {
@@ -18329,7 +18329,7 @@ describe('oauth identity leftovers identity soft reliability round-10 after #160
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {
@@ -19659,7 +19659,7 @@ describe('oauth identity leftovers identity soft reliability round-11 after #160
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {
@@ -20989,7 +20989,7 @@ describe('oauth identity leftovers identity soft reliability round-12 after #160
       makeIdentityEnv({ db })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('submitToken soft wrong token', async () => {

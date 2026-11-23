@@ -1672,7 +1672,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-0', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-0', async () => {
     const sid = `sid-wt-0`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1691,7 +1691,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-1', async () => {
@@ -1716,7 +1716,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-1', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-1', async () => {
     const sid = `sid-wt-1`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1735,7 +1735,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-2', async () => {
@@ -1760,7 +1760,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-2', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-2', async () => {
     const sid = `sid-wt-2`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1779,7 +1779,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-3', async () => {
@@ -1804,7 +1804,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-3', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-3', async () => {
     const sid = `sid-wt-3`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1823,7 +1823,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-4', async () => {
@@ -1848,7 +1848,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-4', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-4', async () => {
     const sid = `sid-wt-4`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1867,7 +1867,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-5', async () => {
@@ -1892,7 +1892,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-5', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-5', async () => {
     const sid = `sid-wt-5`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1911,7 +1911,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-6', async () => {
@@ -1936,7 +1936,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-6', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-6', async () => {
     const sid = `sid-wt-6`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1955,7 +1955,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-7', async () => {
@@ -1980,7 +1980,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-7', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-7', async () => {
     const sid = `sid-wt-7`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -1999,7 +1999,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-8', async () => {
@@ -2024,7 +2024,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-8', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-8', async () => {
     const sid = `sid-wt-8`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -2043,7 +2043,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-9', async () => {
@@ -2068,7 +2068,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-9', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-9', async () => {
     const sid = `sid-wt-9`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -2087,7 +2087,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-10', async () => {
@@ -2112,7 +2112,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-10', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-10', async () => {
     const sid = `sid-wt-10`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -2131,7 +2131,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('wrong secret → M_NO_VALID_SESSION soft-11', async () => {
@@ -2156,7 +2156,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
     expect(body.errcode).toBe('M_NO_VALID_SESSION');
   });
 
-  it('wrong token → M_INVALID_PARAM soft-11', async () => {
+  it('wrong token → M_TOKEN_INCORRECT soft-11', async () => {
     const sid = `sid-wt-11`;
     const sessions = new Map<string, EmailVerificationSession>();
     sessions.set(sid, {
@@ -2175,7 +2175,7 @@ describe('identity contract leftovers submitToken wrong-secret vs wrong-token af
       makeEnv({ db: createIdentityDb({ emailSessions: sessions }) })
     );
     expect(status).toBe(400);
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 });
 

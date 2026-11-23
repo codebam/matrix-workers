@@ -1521,7 +1521,7 @@ describe('identity leftovers after #147 — submitToken omitted/empty fields', (
     {
       name: 'missing token',
       body: { sid: SID, client_secret: SECRET },
-      expectCode: 'M_INVALID_PARAM',
+      expectCode: 'M_TOKEN_INCORRECT',
     },
     {
       name: 'empty sid',
@@ -1536,7 +1536,7 @@ describe('identity leftovers after #147 — submitToken omitted/empty fields', (
     {
       name: 'empty token',
       body: { sid: SID, client_secret: SECRET, token: '' },
-      expectCode: 'M_INVALID_PARAM',
+      expectCode: 'M_TOKEN_INCORRECT',
     },
     {
       name: 'null sid',
@@ -1546,7 +1546,7 @@ describe('identity leftovers after #147 — submitToken omitted/empty fields', (
     {
       name: 'null token',
       body: { sid: SID, client_secret: SECRET, token: null },
-      expectCode: 'M_INVALID_PARAM',
+      expectCode: 'M_TOKEN_INCORRECT',
     },
   ];
 

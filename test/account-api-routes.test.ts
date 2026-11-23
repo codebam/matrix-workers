@@ -1864,7 +1864,7 @@ describe('POST /_matrix/client/v3/account/3pid/submit_token', () => {
     });
   });
 
-  it('returns auth failed when validation fails', async () => {
+  it('returns M_TOKEN_INCORRECT when validation fails on token mismatch', async () => {
     emailMocks.validateEmailToken.mockResolvedValueOnce({
       success: false,
       error: 'Invalid token',
@@ -1877,7 +1877,7 @@ describe('POST /_matrix/client/v3/account/3pid/submit_token', () => {
     );
     expect(res.status).toBe(400);
     expect(res.body).toEqual({
-      errcode: 'M_THREEPID_AUTH_FAILED',
+      errcode: 'M_TOKEN_INCORRECT',
       error: 'Invalid token',
     });
   });
@@ -1892,7 +1892,7 @@ describe('POST /_matrix/client/v3/account/3pid/submit_token', () => {
     );
     expect(res.status).toBe(400);
     expect(res.body).toEqual({
-      errcode: 'M_THREEPID_AUTH_FAILED',
+      errcode: 'M_TOKEN_INCORRECT',
       error: 'Verification failed',
     });
   });
@@ -1955,7 +1955,7 @@ describe('GET /_matrix/client/v3/account/3pid/submit_token', () => {
     });
   });
 
-  it('returns auth failed on invalid GET submit', async () => {
+  it('returns M_TOKEN_INCORRECT on expired GET submit', async () => {
     emailMocks.validateEmailToken.mockResolvedValueOnce({
       success: false,
       error: 'Session expired',
@@ -1967,7 +1967,7 @@ describe('GET /_matrix/client/v3/account/3pid/submit_token', () => {
     );
     expect(res.status).toBe(400);
     expect(res.body).toEqual({
-      errcode: 'M_THREEPID_AUTH_FAILED',
+      errcode: 'M_TOKEN_INCORRECT',
       error: 'Session expired',
     });
   });
@@ -3025,10 +3025,10 @@ describe('account email requestToken / submit_token leftovers', () => {
     expect(res.body).toEqual({ success: true });
   });
 
-  it('GET submit_token failure surfaces M_THREEPID_AUTH_FAILED', async () => {
+  it('GET submit_token failure surfaces M_TOKEN_INCORRECT', async () => {
     emailMocks.validateEmailToken.mockResolvedValueOnce({
       success: false,
-      error: 'bad code',
+      error: 'Invalid token',
     });
     const env = createEnv();
     const res = await request(
@@ -3037,8 +3037,8 @@ describe('account email requestToken / submit_token leftovers', () => {
     );
     expect(res.status).toBe(400);
     expect(res.body).toEqual({
-      errcode: 'M_THREEPID_AUTH_FAILED',
-      error: 'bad code',
+      errcode: 'M_TOKEN_INCORRECT',
+      error: 'Invalid token',
     });
   });
 

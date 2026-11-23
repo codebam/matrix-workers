@@ -991,7 +991,7 @@ describe('identity leftovers POST /validate/email/submitToken — failure matrix
     expect(body).toEqual({ errcode: 'M_NO_VALID_SESSION', error: 'Session not found' });
   });
 
-  it('expires_at = FIXED_NOW - 1 → M_SESSION_EXPIRED', async () => {
+  it('expires_at = FIXED_NOW - 1 → M_TOKEN_INCORRECT', async () => {
     const db = createIdentityDb();
     seed(db, { expires_at: FIXED_NOW - 1 });
     const { body } = await jsonRequest(
@@ -999,7 +999,7 @@ describe('identity leftovers POST /validate/email/submitToken — failure matrix
       postJson({ sid: SID, client_secret: SECRET, token: TOKEN }),
       makeEnv({ db })
     );
-    expect(body.errcode).toBe('M_SESSION_EXPIRED');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
     expect(db.updates).toHaveLength(0);
   });
 
@@ -1015,7 +1015,7 @@ describe('identity leftovers POST /validate/email/submitToken — failure matrix
     expect(body).toEqual({ success: true });
   });
 
-  it('wrong token → M_INVALID_PARAM and no UPDATE', async () => {
+  it('wrong token → M_TOKEN_INCORRECT and no UPDATE', async () => {
     const db = createIdentityDb();
     seed(db);
     const { body } = await jsonRequest(
@@ -1023,7 +1023,7 @@ describe('identity leftovers POST /validate/email/submitToken — failure matrix
       postJson({ sid: SID, client_secret: SECRET, token: '999999' }),
       makeEnv({ db })
     );
-    expect(body).toEqual({ errcode: 'M_INVALID_PARAM', error: 'Invalid token' });
+    expect(body).toEqual({ errcode: 'M_TOKEN_INCORRECT', error: 'Invalid token' });
     expect(db.updates).toHaveLength(0);
     expect(db.emailSessions.get(SID)?.validated).toBe(0);
   });
@@ -1049,7 +1049,7 @@ describe('identity leftovers POST /validate/email/submitToken — failure matrix
       postJson({ sid: SID, client_secret: SECRET, token: '' }),
       makeEnv({ db })
     );
-    expect(body.errcode).toBe('M_INVALID_PARAM');
+    expect(body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('UPDATE binds validated_at=FIXED_NOW and session_id', async () => {
@@ -1152,7 +1152,7 @@ describe('identity leftovers requestToken → submitToken reliability flood', ()
         env
       );
       // generated tokens are always >= 100000, so '000000' never matches
-      expect(fail.body.errcode).toBe('M_INVALID_PARAM');
+      expect(fail.body.errcode).toBe('M_TOKEN_INCORRECT');
       expect(db.emailSessions.get(sid)?.validated).toBe(0);
 
       const ok = await jsonRequest(

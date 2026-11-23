@@ -2666,14 +2666,14 @@ describe('account leftovers email requestToken + submit_token', () => {
     expect(ok.status).toBe(200);
     expect(ok.body).toEqual({ success: true });
 
-    emailMocks.validateEmailToken.mockResolvedValueOnce({ success: false, error: 'bad' });
+    emailMocks.validateEmailToken.mockResolvedValueOnce({ success: false, error: 'Invalid token' });
     const bad = await accountRequest(
       env,
       '/_matrix/client/v3/account/3pid/submit_token',
       jsonInit('POST', { sid: 's', client_secret: 'c', token: 't' }, '')
     );
     expect(bad.status).toBe(400);
-    expect(bad.body.errcode).toBe('M_THREEPID_AUTH_FAILED');
+    expect(bad.body.errcode).toBe('M_TOKEN_INCORRECT');
   });
 
   it('GET submit_token requires query params and validates', async () => {

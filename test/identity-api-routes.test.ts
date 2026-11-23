@@ -784,7 +784,7 @@ describe('POST /_matrix/identity/v2/validate/email/submitToken', () => {
     });
   });
 
-  it('returns M_SESSION_EXPIRED when expires_at is strictly before Date.now()', async () => {
+  it('returns M_TOKEN_INCORRECT when expires_at is strictly before Date.now()', async () => {
     const db = createIdentityDb();
     seedSession(db, { expires_at: FIXED_NOW - 1 });
     const env = makeEnv({ db });
@@ -796,7 +796,7 @@ describe('POST /_matrix/identity/v2/validate/email/submitToken', () => {
     );
     expect(status).toBe(400);
     expect(body).toEqual({
-      errcode: 'M_SESSION_EXPIRED',
+      errcode: 'M_TOKEN_INCORRECT',
       error: 'Session expired',
     });
   });
@@ -817,7 +817,7 @@ describe('POST /_matrix/identity/v2/validate/email/submitToken', () => {
     expect(db.emailSessions.get(SID)?.validated).toBe(1);
   });
 
-  it('returns M_INVALID_PARAM when submitted token does not match session token', async () => {
+  it('returns M_TOKEN_INCORRECT when submitted token does not match session token', async () => {
     const db = createIdentityDb();
     seedSession(db);
     const env = makeEnv({ db });
@@ -829,7 +829,7 @@ describe('POST /_matrix/identity/v2/validate/email/submitToken', () => {
     );
     expect(status).toBe(400);
     expect(body).toEqual({
-      errcode: 'M_INVALID_PARAM',
+      errcode: 'M_TOKEN_INCORRECT',
       error: 'Invalid token',
     });
     expect(db.updates).toHaveLength(0);
