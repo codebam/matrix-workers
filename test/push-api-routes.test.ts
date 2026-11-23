@@ -4807,3 +4807,101 @@ describe('pushrules before/after relative to hardcoded default rules', () => {
     expect(get.body.room.map((r: { rule_id: string }) => r.rule_id)).toEqual([ROOM]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Spec v1.20 gap (M3): GET .../enabled and GET .../actions
+// ---------------------------------------------------------------------------
+describe('push GET rule enabled/actions', () => {
+  it('reads a default rule: .m.rule.master ships disabled', async () => {
+    const db = createPushDb();
+    const enabled = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.master/enabled',
+      authGet()
+    );
+    expect(enabled.status).toBe(200);
+    expect(enabled.body).toEqual({ enabled: false });
+
+    const actions = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/.m.rule.master/actions',
+      authGet()
+    );
+    expect(actions.status).toBe(200);
+    expect(actions.body).toEqual({ actions: ['dont_notify'] });
+  });
+
+  it('reads a default rule that ships enabled', async () => {
+    const db = createPushDb();
+    const enabled = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/underride/.m.rule.call/enabled',
+      authGet()
+    );
+    expect(enabled.status).toBe(200);
+    expect(enabled.body).toEqual({ enabled: true });
+  });
+
+  it('reflects enabled/actions written through the PUT endpoints', async () => {
+    const db = createPushDb();
+    const ruleId = encodeURIComponent('custom.rule');
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${ruleId}`,
+      jsonInit('PUT', { actions: ['notify'] })
+    );
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${ruleId}/enabled`,
+      jsonInit('PUT', { enabled: false })
+    );
+    await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${ruleId}/actions`,
+      jsonInit('PUT', { actions: ['notify', { set_tweak: 'sound', value: 'ping.ogg' }] })
+    );
+
+    const enabled = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${ruleId}/enabled`,
+      authGet()
+    );
+    expect(enabled.body).toEqual({ enabled: false });
+
+    const actions = await request(
+      db,
+      `/_matrix/client/v3/pushrules/global/override/${ruleId}/actions`,
+      authGet()
+    );
+    expect(actions.body).toEqual({
+      actions: ['notify', { set_tweak: 'sound', value: 'ping.ogg' }],
+    });
+  });
+
+  it('404s for a missing rule and 400s for bad scope/kind', async () => {
+    const db = createPushDb();
+    const missing = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/override/does.not.exist/enabled',
+      authGet()
+    );
+    expect(missing.status).toBe(404);
+    expect(missing.body.errcode).toBe('M_NOT_FOUND');
+
+    const scope = await request(
+      db,
+      '/_matrix/client/v3/pushrules/device/override/.m.rule.master/actions',
+      authGet()
+    );
+    expect(scope.status).toBe(400);
+    expect(scope.body.errcode).toBe('M_INVALID_PARAM');
+
+    const kind = await request(
+      db,
+      '/_matrix/client/v3/pushrules/global/weird/.m.rule.master/enabled',
+      authGet()
+    );
+    expect(kind.status).toBe(400);
+    expect(kind.body.errcode).toBe('M_INVALID_PARAM');
+  });
+});

@@ -1731,3 +1731,53 @@ export async function notifyRoomMembersOfMessage(
 }
 
 export default app;
+
+// ============================================
+// Push rule read endpoints (spec: .../actions and .../enabled)
+// The PUT forms shipped first; the matching GETs are required so clients can
+// read a rule's current actions/enabled state without re-fetching every rule.
+// ============================================
+
+async function resolveSinglePushRule(
+  c: any
+): Promise<{ error: Response } | { rule: PushRule }> {
+  const userId = c.get('userId') as string;
+  const scope = c.req.param('scope');
+  const kind = c.req.param('kind');
+  const ruleId = decodeURIComponent(c.req.param('ruleId'));
+
+  if (scope !== 'global') {
+    return {
+      error: c.json({ errcode: 'M_INVALID_PARAM', error: 'Only global scope is supported' }, 400),
+    };
+  }
+
+  const rules = await getUserPushRules(c.env.DB, userId);
+  const kindRules = rules.global[kind as keyof typeof rules.global];
+  if (!kindRules) {
+    return {
+      error: c.json({ errcode: 'M_INVALID_PARAM', error: `Unknown rule kind: ${kind}` }, 400),
+    };
+  }
+
+  const rule = kindRules.find((r: PushRule) => r.rule_id === ruleId);
+  if (!rule) {
+    return { error: c.json({ errcode: 'M_NOT_FOUND', error: 'Push rule not found' }, 404) };
+  }
+  return { rule };
+}
+
+// GET /_matrix/client/v3/pushrules/:scope/:kind/:ruleId/enabled - Is the rule enabled?
+app.get('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId/enabled', requireAuth(), async (c) => {
+  const resolved = await resolveSinglePushRule(c);
+  if ('error' in resolved) return resolved.error;
+  // Spec: a rule without an explicit `enabled` value is enabled.
+  return c.json({ enabled: resolved.rule.enabled !== false });
+});
+
+// GET /_matrix/client/v3/pushrules/:scope/:kind/:ruleId/actions - Get rule actions
+app.get('/_matrix/client/v3/pushrules/:scope/:kind/:ruleId/actions', requireAuth(), async (c) => {
+  const resolved = await resolveSinglePushRule(c);
+  if ('error' in resolved) return resolved.error;
+  return c.json({ actions: resolved.rule.actions ?? [] });
+});
