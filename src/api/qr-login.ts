@@ -4,12 +4,13 @@
 import { Hono } from 'hono';
 import type { Context } from 'hono';
 import type { AppEnv } from '../types';
-import { hashToken } from '../utils/crypto';
 import { Errors } from '../utils/errors';
 import login, {
+  consumeLoginCredential,
   isLoginTokenExpired,
+  isQrLoginReference,
   matchesLoginTokenVerifier,
-  type LoginTokenRecord,
+  resolveLoginCredential,
 } from './login';
 
 const app = new Hono<AppEnv>();
@@ -19,7 +20,8 @@ function generateQrLandingPage(
   serverName: string,
   token: string,
   userId: string,
-  expiresAt: number
+  expiresAt: number,
+  isReference = false
 ): string {
   const expiresInMinutes = Math.max(0, Math.ceil((expiresAt - Date.now()) / 60000));
 
@@ -299,7 +301,7 @@ function generateQrLandingPage(
     <div class="divider"><span>or login manually</span></div>
 
     <div class="manual-section">
-      <h3>Manual Login Details</h3>
+      <h3>${isReference ? 'Login Reference' : 'Manual Login Details'}</h3>
       <div class="copy-field">
         <input type="text" value="https://${serverName}" readonly id="homeserverUrl">
         <button onclick="copyField('homeserverUrl')">Copy</button>
@@ -309,7 +311,9 @@ function generateQrLandingPage(
         <button onclick="copyField('loginToken')">Copy</button>
       </div>
       <p style="font-size: 12px; color: var(--text-muted); margin-top: 8px;">
-        In Element: Settings → Advanced → "Log in with token"
+        ${isReference
+          ? 'This short-lived reference is exchanged for a session server-side. Scan the QR code or use the login link — do not paste it into Element as a raw token.'
+          : 'In Element: Settings → Advanced → "Log in with token"'}
       </p>
     </div>
 
@@ -394,6 +398,8 @@ function generateQrLandingPage(
  */
 function isQrToken(token: string, allowIssuedToken = false): boolean {
   if (!token || token.length > 512) return false;
+  // Admin-issued reference IDs (010.6) are accepted on every QR surface.
+  if (isQrLoginReference(token)) return true;
   if (allowIssuedToken) return /^[A-Za-z0-9_.-]{8,}$/.test(token);
   return token.startsWith('mlt_');
 }
@@ -417,11 +423,11 @@ h1{color:#ef4444;}</style></head>
 <body><div class="error"><h1>Invalid Token</h1><p>This login link is invalid or has been tampered with.</p></div></body></html>`, 400);
   }
 
-  // Look up the token
-  const tokenHash = await hashToken(token);
-  const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
+  // Resolve a raw token or an admin-issued reference to the same token record
+  const resolved = await resolveLoginCredential(c.env, token);
+  const tokenData = resolved?.record;
 
-  if (!tokenData) {
+  if (!tokenData || !resolved) {
     return c.html(`<!DOCTYPE html>
 <html><head><title>Token Expired</title>
 <style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#0f172a;color:#f1f5f9;}
@@ -432,8 +438,8 @@ h1{color:#f59e0b;}</style></head>
 
   // Check if expired
   if (isLoginTokenExpired(tokenData)) {
-    // Clean up
-    await c.env.SESSIONS.delete(`login_token:${tokenHash}`);
+    // Clean up the token and any reference pointing at it
+    await consumeLoginCredential(c.env, resolved);
     return c.html(`<!DOCTYPE html>
 <html><head><title>Token Expired</title>
 <style>body{font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#0f172a;color:#f1f5f9;}
@@ -442,12 +448,14 @@ h1{color:#f59e0b;}</style></head>
 <body><div class="error"><h1>Token Expired</h1><p>This login link has expired.</p><p>Please request a new QR code from your administrator.</p></div></body></html>`, 400);
   }
 
-  // Show the landing page
+  // Show the landing page. A reference is labelled as such — it is not a
+  // raw token that can be pasted into a client's token login field.
   return c.html(generateQrLandingPage(
     c.env.SERVER_NAME,
     token,
     tokenData.user_id,
-    tokenData.expires_at
+    tokenData.expires_at,
+    Boolean(resolved.referenceId)
   ));
 }
 
@@ -459,26 +467,23 @@ app.get('/login/qr/:token/check', async (c) => {
   c.header('Cache-Control', 'no-store');
   const token = c.req.param('token');
 
-  if (!token || !token.startsWith('mlt_')) {
+  if (!token || !isQrToken(token)) {
     return c.json({ valid: false, error: 'Invalid token format' }, 400);
   }
 
-  const tokenHash = await hashToken(token);
-  const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
-
-  if (!tokenData) {
+  const resolved = await resolveLoginCredential(c.env, token);
+  if (!resolved) {
     return c.json({ valid: false, error: 'Token not found or expired' }, 404);
   }
-
-  if (isLoginTokenExpired(tokenData)) {
+  if (isLoginTokenExpired(resolved.record)) {
     return c.json({ valid: false, error: 'Token expired' }, 400);
   }
 
   return c.json({
     valid: true,
-    user_id: tokenData.user_id,
+    user_id: resolved.record.user_id,
     homeserver: c.env.SERVER_NAME,
-    expires_at: tokenData.expires_at,
+    expires_at: resolved.record.expires_at,
   });
 });
 
@@ -508,11 +513,11 @@ async function handleCanonicalCheck(
     return Errors.invalidParam('token', 'Invalid token format').toResponse();
   }
 
-  const tokenHash = await hashToken(token);
-  const record = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
-  if (!record) {
+  const resolved = await resolveLoginCredential(c.env, token);
+  if (!resolved) {
     return Errors.notFound('Login token not found or expired').toResponse();
   }
+  const record = resolved.record;
   if (isLoginTokenExpired(record)) {
     return Errors.forbidden('Login token has expired').toResponse();
   }

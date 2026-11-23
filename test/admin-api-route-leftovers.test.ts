@@ -3972,7 +3972,8 @@ describe('admin leftovers login-token soft flood after #241', () => {
       );
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
-      expect(res.body.token).toBe('mlt_pinned_login_token');
+      expect(res.body.token).toBeUndefined();
+      expect(String(res.body.reference_id)).toMatch(/^qr_ref_/);
       expect(res.body.user_id).toBe(BOB);
       expect(res.body.homeserver).toBe(SERVER);
       expect(typeof res.body.ttl_seconds).toBe('number');
@@ -4226,10 +4227,13 @@ describe('admin leftovers media DELETE / login-token clamp / federation-test sof
       );
       expect(res.status).toBe(200);
       expect(res.body.ttl_seconds).toBe(c.expectSec);
-      expect(res.body.token).toBe('mlt_pinned_login_token');
-      expect(String(res.body.qr_url)).toContain('/login/qr/mlt_pinned_login_token');
+      expect(res.body.token).toBeUndefined();
+      expect(String(res.body.reference_id)).toMatch(/^qr_ref_/);
+      expect(String(res.body.qr_url)).toContain(`/login/qr/${res.body.reference_id}`);
       expect(sessions.puts[0].key).toBe('login_token:tokhash:mlt_pinned_login_token');
       expect(sessions.puts[0].options?.expirationTtl).toBe(c.expectSec);
+      expect(sessions.puts[1].key).toBe(`qr_ref:${res.body.reference_id}`);
+      expect(sessions.puts[1].options?.expirationTtl).toBe(60);
     });
   }
 

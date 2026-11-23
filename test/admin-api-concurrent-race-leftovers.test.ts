@@ -2958,7 +2958,8 @@ describe('race residual login-token∥sessions after #241', () => {
     ]);
     expect(token.status).toBe(200);
     expect(list.status).toBe(200);
-    expect(token.body.token).toBe('mlt_pinned_login_token');
+    expect(token.body.token).toBeUndefined(); // 010.6: reference-only response
+    expect(String(token.body.reference_id)).toMatch(/^qr_ref_/);
     expect(sessions.puts.length).toBeGreaterThanOrEqual(1);
   });
 
@@ -3962,7 +3963,8 @@ describe('race quaternary self-demote / self-purge / whois / login-token / regis
     expect(deact.body.errcode).toBe('M_USER_DEACTIVATED');
     expect(deact.body.error).toBe('User is deactivated');
     expect(ok.status).toBe(200);
-    expect(ok.body.token).toBe('mlt_pinned_login_token');
+    expect(ok.body.token).toBeUndefined(); // 010.6: reference-only response
+    expect(String(ok.body.reference_id)).toMatch(/^qr_ref_/);
   });
 
   it('registration non-bool exact∥GET isolation', async () => {

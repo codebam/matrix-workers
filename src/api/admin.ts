@@ -16,6 +16,7 @@ import { fetchOIDCDiscovery } from '../services/oidc';
 import { logAdminAction } from '../services/admin-audit';
 import federation from './federation';
 import versions from './versions';
+import { QR_LOGIN_REFERENCE_PREFIX, type QrLoginReferenceRecord } from './login';
 
 const app = new Hono<AppEnv>();
 
@@ -1871,12 +1872,20 @@ app.post('/admin/api/users/:userId/login-token', requireAuth(), requireAdmin, as
     // No body or invalid JSON, use defaults
   }
 
-  // Generate login token
+  // Generate the login token server-side. It is stored hashed and never
+  // returned: callers receive only a short-lived reference ID (audit 010.6).
   const loginToken = await generateLoginToken();
   const tokenHash = await hashToken(loginToken);
   const expiresAt = Date.now() + ttlMinutes * 60 * 1000;
 
-  // Store in KV with TTL
+  const referenceId = `${QR_LOGIN_REFERENCE_PREFIX}${await generateOpaqueId(24)}`;
+  // References are deliberately shorter-lived than the token itself: the
+  // minimum token TTL is 1 minute, so cap references at 60 seconds.
+  const referenceTtlSeconds = Math.min(60, ttlMinutes * 60);
+  const referenceExpiresAt = Date.now() + referenceTtlSeconds * 1000;
+
+  // Store both records in KV with TTL. The reference maps only to the token's
+  // hash — the raw token is never persisted or exposed.
   await c.env.SESSIONS.put(
     `login_token:${tokenHash}`,
     JSON.stringify({
@@ -1887,24 +1896,36 @@ app.post('/admin/api/users/:userId/login-token', requireAuth(), requireAdmin, as
       expirationTtl: ttlMinutes * 60, // KV TTL in seconds
     }
   );
+  const referenceRecord: QrLoginReferenceRecord = {
+    token_hash: tokenHash,
+    user_id: userId,
+    created_at: Date.now(),
+    expires_at: referenceExpiresAt,
+  };
+  await c.env.SESSIONS.put(`qr_ref:${referenceId}`, JSON.stringify(referenceRecord), {
+    expirationTtl: referenceTtlSeconds,
+  });
 
-  // Build the QR URL that users will scan
+  // Build the QR URL that users will scan — it carries the reference, not
+  // the login token. The landing page exchanges it server-side on redemption.
   const protocol = c.req.url.startsWith('https') ? 'https' : 'https'; // Always use https for production
   const host = c.req.header('host') || c.env.SERVER_NAME;
-  const qrUrl = `${protocol}://${host}/login/qr/${loginToken}`;
+  const qrUrl = `${protocol}://${host}/login/qr/${referenceId}`;
 
   // Never let intermediaries or the browser cache a response carrying a live
-  // login token (audit 010.6), and record the issuance in the admin audit log.
+  // login credential (audit 010.6), and record the issuance in the admin audit
+  // log. The reference ID is logged; the raw token never is.
   c.header('Cache-Control', 'no-store');
   await logAdminAction(c, {
     action: 'user.login-token.create',
     target: userId,
-    details: { ttl_seconds: ttlMinutes * 60, expires_at: expiresAt },
+    details: { ttl_seconds: ttlMinutes * 60, expires_at: expiresAt, reference_id: referenceId },
   });
 
   return c.json({
     success: true,
-    token: loginToken,
+    reference_id: referenceId,
+    reference_expires_at: referenceExpiresAt,
     qr_url: qrUrl,
     expires_at: expiresAt,
     ttl_seconds: ttlMinutes * 60,

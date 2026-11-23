@@ -2086,7 +2086,7 @@ describe('race quaternary admin exact strings + keys after #279', () => {
     expect(deact.status).toBe(400);
     expect(deact.body.error).toBe('User is deactivated');
     expect(mint.status).toBe(200);
-    expect(typeof mint.body.token).toBe('string');
+    expect(typeof mint.body.reference_id).toBe('string');
   });
 
   it('whois forbid exact∥self-ok isolation', async () => {

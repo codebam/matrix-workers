@@ -3381,7 +3381,8 @@ export const adminDashboardHtml = (serverName: string) => `
               </div>
             </div>
             <p style="font-size: 12px; color: var(--text-tertiary);">
-              Expires in \${Math.floor(tokenData.ttl_seconds / 60)} minutes
+              Login link expires in \${Math.max(1, Math.ceil((tokenData.reference_expires_at - Date.now()) / 1000))} seconds
+              \${tokenData.reference_id ? '(the login token itself is valid for ' + Math.floor(tokenData.ttl_seconds / 60) + ' minutes)' : ''}
             </p>
           </div>
         </div>

@@ -107,4 +107,4 @@ Ideas from the issue docs that go beyond the reported findings, for future consi
 
 - **007.6**: extend the well-known TTL only after a delegation proves stable across lookups; probe that the delegated target answers as a Matrix server before trusting it.
 - **005.6**: evict participants whose sends keep failing (failures are already isolated and logged).
-- **010.6**: replace the raw-token issuance response with a short-lived reference ID exchanged server-side (larger admin-UI change; current mitigations already cover proxy/CDN caching and replay).
+- **010.6**: DONE — admin QR issuance now returns a 60-second `qr_ref_…` reference instead of the raw login token; redemption burns both reference and token. Legacy raw-token redemption is preserved. See `docs/10-6-qr-login-token-reference-id.md`.

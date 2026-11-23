@@ -1,7 +1,7 @@
 # Design Note: 010.6 QR Login Token — Reference-ID Exchange Flow
 
-**Status:** Design only — **not implemented**. Current mitigations remain in place (see below).  
-**HITL:** Any change to how sessions/tokens are stored requires human review per `AGENTS.md`.
+**Status:** **Implemented** (human-approved HITL change; see below).  
+**HITL:** Any change to how sessions/tokens are stored requires human review per `AGENTS.md`; this change was explicitly approved by the repository owner before implementation.
 
 ## Context
 
@@ -90,11 +90,26 @@ storage, so it is recorded as a design note only.
 
 ## Status
 
-- **Not implemented.** Current mitigations remain authoritative:
-  - `Cache-Control: no-store` on issuance response
-  - Token stored hashed in KV with TTL
-  - Single-use delete on first redemption
-  - Issuance recorded in `admin_audit_log`
-- Tracked as optional hardening in `docs/issues/README.md`. Implementation is
-  HITL-gated and should be scheduled as its own PR with tests for both raw-token
-  (legacy) and reference-id redemption paths.
+- **Implemented** after explicit human approval. What landed:
+  - `POST /admin/api/users/:userId/login-token` now returns `reference_id`
+    (`qr_ref_…`) plus a `qr_url` carrying that reference; **no raw token** in
+    the response body. The raw token remains stored hashed in KV with its TTL.
+  - New KV key `qr_ref:<reference_id>` → `{token_hash, user_id, created_at,
+    expires_at}` with a 60-second TTL (≤ token TTL).
+  - `m.login.token` accepts either the legacy raw `token` or a reference
+    (via `token` or `reference_id`). Successful redemption burns **both**
+    keys; a wrong verifier burns neither. Stale/expired references are cleaned
+    up on access; replay returns `M_FORBIDDEN`.
+  - QR landing and check routes (legacy + namespaced) resolve references
+    without consuming them and label the landing page as a reference, not a
+    raw token.
+  - `Cache-Control: no-store` retained on issuance/landing/check responses;
+    issuance is audited with the reference ID, and successful reference
+    redemptions write `user.login-token.redeem` (reference ID only, never the
+    token or its hash).
+  - Admin UI shows the 60-second link lifetime alongside the token lifetime.
+- **Backward compatibility:** legacy raw-token redemption and the
+  `POST /_matrix/client/v1/login/get_token` flow are unchanged. Removing raw
+  token acceptance would be a separate HITL decision.
+- Coverage: `test/qr-login-reference-id.test.ts` plus updated admin-route tests
+  for the new response contract.

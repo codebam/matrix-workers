@@ -2071,7 +2071,7 @@ describe('race senary admin report/auth/404/keys four-way after #317', () => {
     expect(miss.body.error).toBe('User not found');
     expect(ok.status).toBe(200);
     expect(ok.body.user_id).toBe(BOB);
-    expect(ok.body.token).toBe('mlt_pinned_login_token');
+    expect(String(ok.body.reference_id)).toMatch(/^qr_ref_/);
   });
 
   it('Room not found∥room detail ok isolation', async () => {

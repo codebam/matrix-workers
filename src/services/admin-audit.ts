@@ -28,6 +28,42 @@ export function getActorIp(c: Context<AppEnv>): string | null {
   return null;
 }
 
+// Record redemption of an admin-issued QR login reference. This runs on the
+// unauthenticated m.login.token path, so the actor comes from the token record
+// rather than c.get('userId'). Best-effort: auditing never blocks a login.
+// Only the reference ID is recorded — never the raw login token or its hash.
+export async function logLoginTokenRedemption(
+  c: Context<AppEnv>,
+  entry: {
+    userId: string;
+    referenceId: string;
+    deviceId?: string;
+    success?: boolean;
+  }
+): Promise<void> {
+  try {
+    await c.env.DB.prepare(
+      `INSERT INTO admin_audit_log (ts, actor_user_id, action, target, ip, success, details)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+      .bind(
+        Date.now(),
+        entry.userId,
+        'user.login-token.redeem',
+        entry.userId,
+        getActorIp(c),
+        entry.success === false ? 0 : 1,
+        JSON.stringify({
+          reference_id: entry.referenceId,
+          ...(entry.deviceId ? { device_id: entry.deviceId } : {}),
+        }),
+      )
+      .run();
+  } catch (err) {
+    console.error('[admin-audit] Failed to write login-token redemption audit:', err);
+  }
+}
+
 // Write a single audit log entry. Failures are logged but never surfaced —
 // the audit log must not break the admin operation it is recording.
 export async function logAdminAction(

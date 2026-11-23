@@ -2385,10 +2385,14 @@ describe('admin config / registration / audit / reports / notices', () => {
     );
     expect(ok.status).toBe(200);
     const body = await ok.json();
-    expect(body.token).toBe('mlt_pinned_login_token');
+    expect(body.token).toBeUndefined(); // 010.6: raw token never leaves the server
+    expect(String(body.reference_id)).toMatch(/^qr_ref_/);
+    expect(String(body.qr_url)).toContain(`/login/qr/${body.reference_id}`);
     expect(body.ttl_seconds).toBe(60 * 60); // clamped to 60 min
     expect(sessions.puts[0].key).toBe('login_token:tokhash:mlt_pinned_login_token');
     expect(sessions.puts[0].options?.expirationTtl).toBe(3600);
+    expect(sessions.puts[1].key).toBe(`qr_ref:${body.reference_id}`);
+    expect(sessions.puts[1].options?.expirationTtl).toBe(60);
   });
 });
 

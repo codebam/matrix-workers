@@ -2,7 +2,7 @@
 
 import { Hono } from 'hono';
 import type { Context } from 'hono';
-import type { AppEnv } from '../types';
+import type { AppEnv, Env } from '../types';
 import { Errors } from '../utils/errors';
 import { initiateIdpLogin, type IdPProvider } from './oidc-auth';
 import { createVerificationSession, sendVerificationEmail } from '../services/email';
@@ -28,6 +28,7 @@ import {
 } from '../services/database';
 import { requireAuth, extractAccessToken } from '../middleware/auth';
 import { getAppServiceByToken } from '../services/appservice';
+import { logLoginTokenRedemption } from '../services/admin-audit';
 
 const app = new Hono<AppEnv>();
 
@@ -66,6 +67,88 @@ export async function matchesLoginTokenVerifier(
   if (typeof verifier !== 'string' || verifier.length === 0 || verifier.length > 512) return false;
   const presentedHash = await hashToken(verifier);
   return timingSafeEqual(presentedHash, record.secure_oob.verifier_hash);
+}
+
+// 010.6: admin-issued QR login tokens are no longer returned in the issuance
+// response. A short-lived reference stands in for the token; redemption
+// resolves it to the hashed token record entirely server-side.
+export const QR_LOGIN_REFERENCE_PREFIX = 'qr_ref_';
+const QR_REFERENCE_ID_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+
+/** Shape stored under `qr_ref:<reference_id>` in SESSIONS. */
+export interface QrLoginReferenceRecord {
+  token_hash: string;
+  user_id: string;
+  created_at: number;
+  expires_at: number;
+}
+
+export interface ResolvedLoginCredential {
+  record: LoginTokenRecord;
+  tokenKey: string;
+  referenceKey?: string;
+  referenceId?: string;
+}
+
+export function isQrLoginReference(credential: string): boolean {
+  return (
+    credential.startsWith(QR_LOGIN_REFERENCE_PREFIX) &&
+    QR_REFERENCE_ID_PATTERN.test(credential.slice(QR_LOGIN_REFERENCE_PREFIX.length))
+  );
+}
+
+/**
+ * Resolve a legacy raw login token OR an admin-issued reference ID to the
+ * underlying hashed token record. Malformed, missing, stale and already-
+ * consumed credentials return null; stale references are cleaned up here.
+ * Record expiry and verifier checks remain the caller's responsibility.
+ */
+export async function resolveLoginCredential(
+  env: Env,
+  credential: string
+): Promise<ResolvedLoginCredential | null> {
+  if (!credential || credential.length > 512) return null;
+
+  let referenceKey: string | undefined;
+  let referenceId: string | undefined;
+  let tokenHash: string;
+
+  if (isQrLoginReference(credential)) {
+    referenceId = credential;
+    referenceKey = `qr_ref:${credential}`;
+    const reference = await env.SESSIONS.get(referenceKey, 'json') as QrLoginReferenceRecord | null;
+    if (!reference || typeof reference.token_hash !== 'string' || !reference.token_hash) {
+      if (reference) await env.SESSIONS.delete(referenceKey);
+      return null;
+    }
+    if (Date.now() > reference.expires_at) {
+      await env.SESSIONS.delete(referenceKey);
+      return null;
+    }
+    tokenHash = reference.token_hash;
+  } else {
+    // A malformed reference must not fall through to the raw-token path.
+    if (credential.startsWith(QR_LOGIN_REFERENCE_PREFIX)) return null;
+    tokenHash = await hashToken(credential);
+  }
+
+  const tokenKey = `login_token:${tokenHash}`;
+  const record = await env.SESSIONS.get(tokenKey, 'json') as LoginTokenRecord | null;
+  if (!record) {
+    // The reference outlived its token (already redeemed); clean it up.
+    if (referenceKey) await env.SESSIONS.delete(referenceKey);
+    return null;
+  }
+  return { record, tokenKey, referenceKey, referenceId };
+}
+
+/** Single-use consumption: burn the token AND its reference, if any. */
+export async function consumeLoginCredential(
+  env: Env,
+  resolved: ResolvedLoginCredential
+): Promise<void> {
+  await env.SESSIONS.delete(resolved.tokenKey);
+  if (resolved.referenceKey) await env.SESSIONS.delete(resolved.referenceKey);
 }
 
 // The admin portal's registration toggle lives in the Admin Durable Object.
@@ -173,28 +256,32 @@ app.post('/_matrix/client/v3/login', async (c) => {
     return Errors.badJson().toResponse();
   }
 
-  const { type, identifier, password, token, verifier, device_id, initial_device_display_name } = body;
+  const {
+    type, identifier, password, token, reference_id, verifier, device_id, initial_device_display_name
+  } = body;
 
   let userId: string;
 
   if (type === 'm.login.token') {
-    // Token-based login (for QR codes)
-    if (!token) {
+    // 010.6: accept the legacy raw token OR an admin-issued reference ID.
+    // The reference never leaves the server as a live credential.
+    const credential = typeof reference_id === 'string' && reference_id ? reference_id : token;
+    if (!credential || typeof credential !== 'string') {
       return Errors.missingParam('token').toResponse();
     }
+    if (typeof reference_id === 'string' && reference_id && !isQrLoginReference(reference_id)) {
+      return Errors.invalidParam('reference_id', 'Invalid reference ID format').toResponse();
+    }
 
-    // Look up the token in KV
-    const tokenHash = await hashToken(token);
-    const tokenData = await c.env.SESSIONS.get(`login_token:${tokenHash}`, 'json') as LoginTokenRecord | null;
-
-    if (!tokenData) {
+    const resolved = await resolveLoginCredential(c.env, credential);
+    if (!resolved) {
       return Errors.forbidden('Invalid or expired login token').toResponse();
     }
+    const tokenData = resolved.record;
 
     // Check expiration
     if (isLoginTokenExpired(tokenData)) {
-      // Clean up expired token
-      await c.env.SESSIONS.delete(`login_token:${tokenHash}`);
+      await consumeLoginCredential(c.env, resolved);
       return Errors.forbidden('Login token has expired').toResponse();
     }
 
@@ -207,8 +294,15 @@ app.post('/_matrix/client/v3/login', async (c) => {
 
     userId = tokenData.user_id;
 
-    // Delete the token (one-time use)
-    await c.env.SESSIONS.delete(`login_token:${tokenHash}`);
+    // Delete the token and its reference (single-use)
+    await consumeLoginCredential(c.env, resolved);
+    if (resolved.referenceId) {
+      await logLoginTokenRedemption(c, {
+        userId,
+        referenceId: resolved.referenceId,
+        ...(typeof device_id === 'string' ? { deviceId: device_id } : {}),
+      });
+    }
 
   } else if (type === 'm.login.password') {
     // Password-based login
