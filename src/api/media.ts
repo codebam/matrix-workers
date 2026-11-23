@@ -591,6 +591,21 @@ app.get('/_matrix/media/v3/thumbnail/:serverName/:mediaId', async (c) => {
     return Errors.notFound('Media not found').toResponse();
   }
 
+  // MSC4230: animated GIF/WebP thumbnail passthrough — return the original
+  // animated bytes instead of a static first frame when animation is requested.
+  const animated = c.req.query('animated') === 'true';
+  if (animated && (metadata.content_type === 'image/gif' || metadata.content_type === 'image/webp')) {
+    const object = await c.env.MEDIA.get(mediaId);
+    if (!object) {
+      return Errors.notFound('Media not found').toResponse();
+    }
+    const headers = new Headers();
+    headers.set('Content-Type', metadata.content_type);
+    headers.set('Cache-Control', 'public, max-age=31536000, immutable');
+    addMediaSecurityHeaders(headers);
+    return new Response(object.body, { headers });
+  }
+
   // Only generate thumbnails for images
   const isImage = metadata.content_type.startsWith('image/');
 
@@ -1107,7 +1122,27 @@ app.get('/_matrix/client/v1/media/preview_url', requireAuth(), async (c) => {
       return c.json({});
     }
 
-    const html = await response.text();
+    let html: string;
+
+    // Try Browser Rendering for JS-rendered pages (if available)
+    if (c.env.BROWSER) {
+      try {
+        const browserResponse = await c.env.BROWSER.fetch(new Request(url, {
+          headers: { 'Accept': 'text/html' },
+        }));
+        if (browserResponse.ok) {
+          html = await browserResponse.text();
+        } else {
+          html = await response.text();
+        }
+      } catch (browserErr) {
+        console.warn('[media] Browser Rendering failed, falling back to basic fetch:', browserErr);
+        html = await response.text();
+      }
+    } else {
+      html = await response.text();
+    }
+
     const preview = extractOpenGraphPreview(html, {
       protocol: parsedUrl.protocol,
       host: parsedUrl.host,

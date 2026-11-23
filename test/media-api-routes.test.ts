@@ -2127,7 +2127,7 @@ describe('media API TOKENMAXX edges after #109/#111 — preview_url SSRF + OG', 
     expect(res.body).toMatchObject({ errcode: 'M_UNKNOWN' });
   });
 
-  it('v1 preview_url does not use BROWSER binding (basic fetch only)', async () => {
+  it('v1 preview_url uses BROWSER binding like v3 when available', async () => {
     const url = 'https://spa.example.org/';
     const browser = {
       fetch: vi.fn(async () => new Response('<meta property="og:title" content="Browser" />', { status: 200 })),
@@ -2147,8 +2147,8 @@ describe('media API TOKENMAXX edges after #109/#111 — preview_url SSRF + OG', 
       {},
       { browser }
     );
-    expect(res.body).toEqual({ 'og:title': 'Basic' });
-    expect(browser.fetch).not.toHaveBeenCalled();
+    expect(res.body).toEqual({ 'og:title': 'Browser' });
+    expect(browser.fetch).toHaveBeenCalled();
   });
 });
 
