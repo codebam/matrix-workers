@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tuwunel is a Matrix homeserver (spec v1.17) running entirely on Cloudflare Workers edge infrastructure. It uses D1 (SQLite), KV, R2, Durable Objects, and Workflows. This fork's live instance runs at `matrix.fuzzywigg.com` (upstream demo: `m.easydemo.org`).
+Tuwunel is a Matrix homeserver (spec v1.19 baseline; v1.20 items tracked in `ROADMAP-2026-11-23.md`) running entirely on Cloudflare Workers edge infrastructure. It uses D1 (SQLite), KV, R2, Durable Objects, and Workflows. This fork's live instance runs at `matrix.fuzzywigg.com` (upstream demo: `m.easydemo.org`).
 
 ## Development Commands
 
@@ -45,7 +45,7 @@ Numbered files `migrations/002_*.sql` … `migrations/019_*.sql` are separate �
 **Durable Object migrations:** every DO class must be declared via `new_sqlite_classes` in a `wrangler.jsonc` `migrations` entry (all 8 classes covered by tags `v1`–`v6`). New DOs need a new migration tag with the class in `new_sqlite_classes` — never `new_classes` (legacy KV-backed, unavailable on free plan), never edit deployed tags.
 
 **Key patterns:**
-- Auth: token from `Authorization: Bearer` or `?access_token=`, SHA-256 hashed, looked up in D1 `access_tokens`. Middleware sets `userId`/`deviceId` on context.
+- Auth: token from the `Authorization: Bearer` header only (query-string `?access_token=` was removed in spec v1.20), SHA-256 hashed, looked up in D1 `access_tokens`. Middleware sets `userId`/`deviceId` on context.
 - Errors: Use `MatrixApiError` class and `Errors` factory for standardized Matrix JSON responses (`errcode`, `error`).
 - Database: Direct D1 prepared statements — no ORM. All queries in `src/services/database.ts` or inline in route handlers.
 - IDs follow Matrix format: `@user:domain`, `!room_id:domain`, `$event_id:domain`, `#alias:domain`.

@@ -84,7 +84,7 @@ npx wrangler secret put EMAIL_FROM
 
 ## Spec Compliance
 
-**[Matrix Specification v1.19](https://spec.matrix.org/v1.19/) Compliance**
+**[Matrix Specification v1.19](https://spec.matrix.org/v1.19/) Compliance** plus the spec v1.20 (unreleased) modules marked below. Note the v1.20 breaking change: access tokens are accepted only in the `Authorization: Bearer` header, never via `?access_token=`.
 
 | Spec Section | Implementation | Spec Reference |
 |--------------|----------------|----------------|
@@ -103,6 +103,8 @@ npx wrangler secret put EMAIL_FROM
 | [VoIP](https://spec.matrix.org/v1.19/client-server-api/#voice-over-ip) | [`src/api/voip.ts`](src/api/voip.ts), [`src/api/calls.ts`](src/api/calls.ts) | TURN servers, MatrixRTC |
 | [Account Data](https://spec.matrix.org/v1.19/client-server-api/#client-config) | [`src/api/account-data.ts`](src/api/account-data.ts) | User/room account data |
 | [3PID Management](https://spec.matrix.org/v1.19/client-server-api/#adding-account-administrative-contact-information) | [`src/api/account.ts`](src/api/account.ts) | Email verification, 3PID binding |
+| [Delayed Events](https://spec.matrix.org/unstable/client-server-api/#delayed-events) | [`src/api/delayed-events.ts`](src/api/delayed-events.ts), [`src/services/delayed-events.ts`](src/services/delayed-events.ts) | Spec v1.20/MSC4140: stable v3 + v1 paths, `m.delayed_events` capability, sender-only `unsigned.delay_id`; unstable names retained for older clients |
+| [Sticky Events](https://spec.matrix.org/unstable/client-server-api/#sticky-events) | [`src/api/rooms.ts`](src/api/rooms.ts), [`src/services/served-events.ts`](src/services/served-events.ts), [`src/api/sync.ts`](src/api/sync.ts) | Spec v1.20/MSC4354: sticky PDUs (top-level `sticky`), `sticky_duration_ms` on send and delayed send, `unsigned.sticky_duration_remaining_ms`, `/sync` `sticky.events`, federation wire; migration 032 |
 | [Invite Permission](https://spec.matrix.org/v1.19/client-server-api/#invite-permission) | [`src/services/database.ts`](src/services/database.ts) | MSC4155 globs + MSC4380 block-all toggle |
 | [Account Moderation](https://spec.matrix.org/v1.19/client-server-api/#account-moderation) | [`src/api/admin.ts`](src/api/admin.ts), [`src/middleware/auth.ts`](src/middleware/auth.ts) | MSC4323 lock/suspend + enforcement |
 | [Server ACLs](https://spec.matrix.org/v1.19/client-server-api/#server-access-control-lists-acls-for-rooms) | [`src/services/server-acl.ts`](src/services/server-acl.ts) | m.room.server_acl enforcement (inbound + outbound destinations), MSC4436 case-insensitive |

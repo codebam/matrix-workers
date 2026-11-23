@@ -59,7 +59,7 @@ Leave `d1_databases[0].database_name` as `matrix-db` — the `db:migrate` npm sc
 npm run db:migrate
 ```
 
-This applies `migrations/schema.sql` (the base schema) to your remote D1 database. The numbered migration files (`migrations/002_*.sql` … `migrations/020_*.sql`) are **not** applied by this script — apply them in order afterwards:
+This applies `migrations/schema.sql` (the base schema) to your remote D1 database. The numbered migration files (`migrations/002_*.sql` and everything later, through `032_*.sql`) are **not** applied by this script — apply them in order afterwards:
 
 ```bash
 for f in $(ls migrations/0*.sql | sort); do
