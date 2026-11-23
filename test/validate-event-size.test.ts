@@ -17,6 +17,28 @@ function baseEvent(content: Record<string, unknown> = { body: 'hi' }): PDU {
   };
 }
 
+/**
+ * Inflate a PDU to exactly `target` serialized bytes via one long pad string.
+ * Popping a 40k-element auth_events array and re-stringifying on each iteration
+ * made the boundary tests hit Vitest's 15s timeout (O(n²) over ~1 MB payloads).
+ */
+function inflateToExactSerializedSize(event: PDU, target: number): void {
+  const baseLen = JSON.stringify(event).length;
+  const roughNeed = Math.max(0, target - baseLen - 4);
+  event.prev_events = [...event.prev_events, 'x'.repeat(roughNeed)];
+  let len = JSON.stringify(event).length;
+  const idx = event.prev_events.length - 1;
+  while (len > target && event.prev_events[idx].length > 0) {
+    event.prev_events[idx] = event.prev_events[idx].slice(0, -1);
+    len = JSON.stringify(event).length;
+  }
+  while (len < target) {
+    event.prev_events[idx] += 'x';
+    len = JSON.stringify(event).length;
+  }
+  expect(JSON.stringify(event).length).toBe(target);
+}
+
 describe('validateEventSize', () => {
   it('accepts a normal-sized event', () => {
     expect(() => validateEventSize(baseEvent())).not.toThrow();
@@ -86,23 +108,8 @@ describe('validateEventSize TOKENMAXX edge paths after #50', () => {
     const event = baseEvent({ body: 'ok' });
     const target = 921_600;
     // Inflate non-content fields so content stays under the soft cap
-    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
     expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
-    expect(JSON.stringify(event).length).toBeGreaterThan(target);
-    while (JSON.stringify(event).length > target) {
-      event.auth_events.pop();
-    }
-    const need = target - JSON.stringify(event).length;
-    if (need > 0) {
-      event.auth_events.push(`$p${'x'.repeat(Math.max(0, need - 2))}`);
-      while (JSON.stringify(event).length < target) {
-        event.auth_events[event.auth_events.length - 1] += 'x';
-      }
-      while (JSON.stringify(event).length > target) {
-        const last = event.auth_events[event.auth_events.length - 1];
-        event.auth_events[event.auth_events.length - 1] = last.slice(0, -1);
-      }
-    }
+    inflateToExactSerializedSize(event, target);
     expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
     expect(JSON.stringify(event).length).toBe(target);
     expect(() => validateEventSize(event)).not.toThrow();
@@ -119,21 +126,7 @@ describe('validateEventSize TOKENMAXX leftovers after #241', () => {
   it('rejects a full PDU one byte over the hard cap with errcode/status/got count', () => {
     const event = baseEvent({ body: 'ok' });
     const target = 921_601;
-    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
-    while (JSON.stringify(event).length > target) {
-      event.auth_events.pop();
-    }
-    const need = target - JSON.stringify(event).length;
-    if (need > 0) {
-      event.auth_events.push(`$p${'x'.repeat(Math.max(0, need - 2))}`);
-      while (JSON.stringify(event).length < target) {
-        event.auth_events[event.auth_events.length - 1] += 'x';
-      }
-      while (JSON.stringify(event).length > target) {
-        const last = event.auth_events[event.auth_events.length - 1];
-        event.auth_events[event.auth_events.length - 1] = last.slice(0, -1);
-      }
-    }
+    inflateToExactSerializedSize(event, target);
     expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
     expect(JSON.stringify(event).length).toBe(target);
     try {
@@ -162,21 +155,7 @@ describe('validateEventSize TOKENMAXX residual leftovers after #252', () => {
   it('accepts a full PDU one byte under the hard cap', () => {
     const event = baseEvent({ body: 'ok' });
     const target = 921_599;
-    event.auth_events = Array.from({ length: 40_000 }, (_, i) => `$auth-${i}:example.com`);
-    while (JSON.stringify(event).length > target) {
-      event.auth_events.pop();
-    }
-    const need = target - JSON.stringify(event).length;
-    if (need > 0) {
-      event.auth_events.push(`$p${'x'.repeat(Math.max(0, need - 2))}`);
-      while (JSON.stringify(event).length < target) {
-        event.auth_events[event.auth_events.length - 1] += 'x';
-      }
-      while (JSON.stringify(event).length > target) {
-        const last = event.auth_events[event.auth_events.length - 1];
-        event.auth_events[event.auth_events.length - 1] = last.slice(0, -1);
-      }
-    }
+    inflateToExactSerializedSize(event, target);
     expect(JSON.stringify(event.content).length).toBeLessThanOrEqual(65_536);
     expect(JSON.stringify(event).length).toBe(target);
     expect(() => validateEventSize(event)).not.toThrow();
@@ -792,29 +771,6 @@ describe('validateEventSize TOKENMAXX residual senary leftovers after #330', () 
 });
 
 describe('validateEventSize TOKENMAXX residual septenary leftovers after #336', () => {
-  /**
-   * Inflate a PDU to exactly `target` serialized bytes via one long pad string.
-   * Avoids O(n²) JSON.stringify loops that timed out #346's 35k prev_events builder.
-   */
-  function inflateToExactSerializedSize(event: PDU, target: number): void {
-    const baseLen = JSON.stringify(event).length;
-    // JSON array string element costs: `,"` + body + `"` when non-first, or `["` + body + `"]` alone.
-    // Start slightly under and fine-tune with a handful of stringifies.
-    const roughNeed = Math.max(0, target - baseLen - 4);
-    event.prev_events = [...event.prev_events, 'x'.repeat(roughNeed)];
-    let len = JSON.stringify(event).length;
-    const idx = event.prev_events.length - 1;
-    while (len > target && event.prev_events[idx].length > 0) {
-      event.prev_events[idx] = event.prev_events[idx].slice(0, -1);
-      len = JSON.stringify(event).length;
-    }
-    while (len < target) {
-      event.prev_events[idx] += 'x';
-      len = JSON.stringify(event).length;
-    }
-    expect(JSON.stringify(event).length).toBe(target);
-  }
-
   it('hard exact-boundary ok ∥ hard one-over ∥ soft-over triple race', async () => {
     const hardOk = baseEvent({ body: 'ok' });
     inflateToExactSerializedSize(hardOk, 921_600);
@@ -1068,26 +1024,6 @@ describe('validateEventSize TOKENMAXX residual octonary leftovers after #356', (
 });
 
 describe('validateEventSize TOKENMAXX residual denary leftovers after #380', () => {
-  /**
-   * Inflate a PDU to exactly `target` serialized bytes via one long pad string.
-   * Same O(1) pad strategy as septenary/nonary (avoids prev_events explosion).
-   */
-  function inflateToExactSerializedSize(event: PDU, target: number): void {
-    const baseLen = JSON.stringify(event).length;
-    const roughNeed = Math.max(0, target - baseLen - 4);
-    event.prev_events = [...event.prev_events, 'x'.repeat(roughNeed)];
-    let len = JSON.stringify(event).length;
-    const idx = event.prev_events.length - 1;
-    while (len > target && event.prev_events[idx].length > 0) {
-      event.prev_events[idx] = event.prev_events[idx].slice(0, -1);
-      len = JSON.stringify(event).length;
-    }
-    while (len < target) {
-      event.prev_events[idx] += 'x';
-      len = JSON.stringify(event).length;
-    }
-    expect(JSON.stringify(event).length).toBe(target);
-  }
 
   it('object content ok ∥ empty-array content ok ∥ soft-over under race', async () => {
     const objEvt = baseEvent({ nested: { a: 1 } });
@@ -1215,27 +1151,6 @@ describe('validateEventSize TOKENMAXX residual denary leftovers after #380', () 
 });
 
 describe('validateEventSize TOKENMAXX residual undecenary leftovers after #395', () => {
-  /**
-   * Inflate a PDU to exactly `target` serialized bytes via one long pad string.
-   * Same O(1) pad strategy as septenary/denary (avoids prev_events explosion).
-   */
-  function inflateToExactSerializedSize(event: PDU, target: number): void {
-    const baseLen = JSON.stringify(event).length;
-    const roughNeed = Math.max(0, target - baseLen - 4);
-    event.prev_events = [...event.prev_events, 'x'.repeat(roughNeed)];
-    let len = JSON.stringify(event).length;
-    const idx = event.prev_events.length - 1;
-    while (len > target && event.prev_events[idx].length > 0) {
-      event.prev_events[idx] = event.prev_events[idx].slice(0, -1);
-      len = JSON.stringify(event).length;
-    }
-    while (len < target) {
-      event.prev_events[idx] += 'x';
-      len = JSON.stringify(event).length;
-    }
-    expect(JSON.stringify(event).length).toBe(target);
-  }
-
   it('string content ok ∥ array content ok ∥ soft-over under race', async () => {
     const strEvt = baseEvent({ body: 'x' });
     (strEvt as { content: unknown }).content = 'plain-string';
