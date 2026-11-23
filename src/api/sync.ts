@@ -905,9 +905,16 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     // room's served window (timeline + state sections share object refs).
     await attachReplacesState(c.env.DB, [...stateEvents, ...timelineEvents]);
 
-    // Apply filters to state and timeline events
+    // Apply filters to state and timeline events. The timeline limit is handled
+    // separately below so an explicit filter.room.timeline.limit selects the
+    // NEWEST N events in ascending order (applyEventFilter's generic limit
+    // slices the OLDEST N, which is wrong for the timeline). Strip the limit
+    // here so type/sender filtering still applies without truncating.
     stateEvents = applyEventFilter(stateEvents, withEventFormat(filter, filter?.room?.state));
-    timelineEvents = applyEventFilter(timelineEvents, withEventFormat(filter, filter?.room?.timeline));
+    const timelineFilterNoLimit = filter?.room?.timeline
+      ? { ...filter.room.timeline, limit: undefined }
+      : undefined;
+    timelineEvents = applyEventFilter(timelineEvents, withEventFormat(filter, timelineFilterNoLimit));
 
     // MSC2732 lazy loading: clients (Element Web by default) ask for only
     // their own membership plus the memberships of timeline senders, instead
@@ -934,10 +941,24 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     // On initial sync return only a recent timeline window so clients show the
     // latest messages and backfill older history on demand, instead of walking
-    // the room's entire history.
-    const timelineLimit = filter?.room?.timeline?.limit ?? 20;
-    if (isInitial && timelineEvents.length > timelineLimit) {
-      timelineEvents = timelineEvents.slice(-timelineLimit);
+    // the room's entire history. An explicit filter.room.timeline.limit caps
+    // the window to that many of the NEWEST events; otherwise the default 20.
+    const explicitTimelineLimit = filter?.room?.timeline?.limit;
+    const initialTimelineLimit = explicitTimelineLimit && explicitTimelineLimit > 0
+      ? explicitTimelineLimit
+      : 20;
+    if (isInitial && timelineEvents.length > initialTimelineLimit) {
+      timelineEvents = timelineEvents.slice(-initialTimelineLimit);
+      joinedRoom.timeline!.limited = true;
+    }
+
+    // Incremental sync: an explicit timeline.limit also caps the returned page
+    // to the NEWEST N events (ascending), composing with the type/sender filter
+    // applied above. Default incremental sync returns everything since the
+    // token (no cap).
+    if (!isInitial && explicitTimelineLimit && explicitTimelineLimit > 0
+        && timelineEvents.length > explicitTimelineLimit) {
+      timelineEvents = timelineEvents.slice(-explicitTimelineLimit);
       joinedRoom.timeline!.limited = true;
     }
 

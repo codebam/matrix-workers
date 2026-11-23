@@ -414,6 +414,10 @@ webhooks (no polling).
 | R2 Object | Single-part: 5 GiB; Multipart: 5 TiB | Cloudflare R2 platform max. This homeserver media API caps uploads at 50 MB (`MAX_UPLOAD_SIZE`); no multipart chunked upload |
 | KV Value | 25MB | Split large datasets |
 
+## Known deviations
+
+- `/sync` always emits left rooms (`rooms.leave`) even when `filter.room.include_leave` is `false`; a room left on another device otherwise lingers in an open session (every room endpoint 403s) until a full client reload. Bounded by the leave event's stream position vs. `since`, so each client sees a given leave exactly once. Rationale in `src/api/sync.ts` (around the left-rooms handling).
+
 ## License
 
 MIT
