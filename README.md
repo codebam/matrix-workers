@@ -387,6 +387,7 @@ The D1 database name in `wrangler.jsonc` is `matrix-db` (binding `DB`); the `db:
 - **Federation Auth**: Ed25519 request signing with X-Matrix header validation
 - **PDU Validation**: Signature verification on incoming federation events
 - **Media Auth**: Authenticated media endpoints (MSC3916)
+- **v3 upload MIME whitelist**: Deliberately retained as a security-sensitive control (audit finding 003); do not relax without review.
 
 ## Compatibility
 
