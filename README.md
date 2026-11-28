@@ -5,7 +5,9 @@
 
 [![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/codebam/matrix-workers)
 
-> **Fork status**: codebam's fork of [fuzzywigg/matrix-workers](https://github.com/fuzzywigg/matrix-workers) (itself a fork of [nkuntz1934/matrix-workers](https://github.com/nkuntz1934/matrix-workers), "Tuwunel"), running live at **`codebam.ca`** with a second instance at `dev.codebam.ca` for federation testing. See [DEPLOY.md](./DEPLOY.md) for setup and [docs/federation-handoff.md](./docs/federation-handoff.md) for hard-won federation debugging notes.
+> **Fork status**: codebam's fork of [fuzzywigg/matrix-workers](https://github.com/fuzzywigg/matrix-workers) (itself a fork of [nkuntz1934/matrix-workers](https://github.com/nkuntz1934/matrix-workers), "Tuwunel"), previously running live at **`codebam.ca`** with a second instance at `dev.codebam.ca` for federation testing (currently disabled due to Cloudflare operating cost — see [Operating Cost](#operating-cost)). See [DEPLOY.md](./DEPLOY.md) for setup and [docs/federation-handoff.md](./docs/federation-handoff.md) for hard-won federation debugging notes.
+
+> **Operating Cost Warning**: Based on observed Cloudflare billing (**$24.05** total over **Nov 17 – Nov 28, 2026**), running this homeserver costs approximately **$2.00/day** (~$60/month). See [Operating Cost](#operating-cost) and [DEPLOY.md](./DEPLOY.md#cost-estimate) before deploying.
 
 What began as a proof-of-concept homeserver on Cloudflare's edge is now a working homeserver in daily use: Element clients with full E2EE, verified live federation with matrix.org (including 2022-era v9 rooms), and native bots including a Telegram bridge. The sections below describe exactly what is implemented and what is verified working in production.
 
@@ -30,6 +32,16 @@ Everything in this list is live on `codebam.ca` and verified against real peers 
 - **Telegram bridge** (`@BotFather` token via admin API only — never via room messages): webhook-driven (no polling), one Telegram chat ↔ one Matrix room, bidirectional — Telegram messages land as `Name: text` (display name only), and room messages (including federated users') relay out with display-name prefixes. Loop-proof by construction (all integrations skip bot senders).
 
 **Quality bar**: 456 test files / ~46,500 tests green (`npm test`), `tsc --noEmit` clean, CI on every push. In-process mock-Synapse peer tests reproduce resident-server auth rejections (the "HTTP 200 but never displayed" class) before they reach production.
+
+## Operating Cost
+
+Running this homeserver in real use on Cloudflare costs approximately **$2.00/day** (~$60/month), based on observed Cloudflare billing data:
+
+- **Total cost**: $24.05
+- **Usage observed**: Nov 17 – Nov 28, 2026
+- **Average daily cost**: $2.00/day (based on observed usage in this cycle)
+
+While the stack is technically deployable on Cloudflare Workers Free (using SQLite-backed Durable Objects), active Matrix clients, long-polling/sliding sync, federation traffic, and Durable Objects/D1/KV usage significantly exceed free-tier and base $5/month Workers Paid expectations.
 
 ## Quick Start
 

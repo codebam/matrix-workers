@@ -4,7 +4,7 @@ This guide covers deploying a personal Matrix homeserver to your own Cloudflare 
 
 ## Prerequisites
 
-- Cloudflare account (free tier works for small personal deployments)
+- Cloudflare account (note: observed real-world usage costs ~$2.00/day on Workers Paid — see [Cost Estimate](#cost-estimate))
 - Wrangler CLI: `npm install -g wrangler && wrangler login`
 - Domain with Cloudflare DNS (e.g., `matrix.fuzzywigg.com`)
 - Node.js 22+ (matches `package.json` `engines.node` and CI)
@@ -166,6 +166,8 @@ For `smtp.eth` — this requires an ENS text record or an HTTP gateway that serv
 
 ## Cost Estimate
 
+> **Observed Real-World Cost (~$2.00/day)**: Based on observed Cloudflare usage from **Nov 17 – Nov 28, 2026**, actual operating cost was **$24.05** total — an average of **$2.00/day** (~$60/month) in that billing cycle.
+
 | Resource | Free Tier | Paid ($5/mo plan) |
 |---|---|---|
 | Workers | 100K req/day | No daily limit |
@@ -176,7 +178,7 @@ For `smtp.eth` — this requires an ENS text record or an HTTP gateway that serv
 | R2 storage | 10GB | 10GB + $0.015/GB |
 | R2 Class B (reads) | 10M/month | 10M/month |
 
-**Verdict**: Free tier is suitable for personal/family use with a few active users. Upgrade to $5/mo Workers Paid if you plan to run a small community.
+**Verdict**: Although the stack can be deployed on the free tier, real personal use with active clients, sync, federation, and Durable Objects runs approximately **$2.00/day** on Cloudflare ($24.05 observed over Nov 17 – Nov 28, 2026). Plan for metered Workers Paid overages rather than the free tier or base $5/month plan.
 
 ## Recommended Domains for Andrew
 

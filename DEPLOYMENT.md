@@ -126,10 +126,10 @@ For more control, deploy manually using the steps below.
 
 ### Required
 
-1. **Cloudflare Account** (Workers Free is enough for this repo)
+1. **Cloudflare Account** (Workers Free can deploy this repo, but expect metered Paid usage in practice)
    - Durable Objects are essential for real-time sync. This codebase declares them with `new_sqlite_classes` (SQLite-backed), which Workers Free can create and use — same fact as `DEPLOY.md` Cost Estimate and the README Durable Object Migrations note
    - Legacy `new_classes` (KV-backed) DOs require Workers Paid and are not what this tree uses
-   - Upgrade to Workers Paid ($5/month) only if you need higher request/storage limits
+   - **Observed operating cost**: Real-world usage on Cloudflare averaged approximately **$2.00/day** (**$24.05** total observed Nov 17 – Nov 28, 2026), well above the free tier and base $5/month Workers Paid plan
    - Sign up at [cloudflare.com](https://cloudflare.com)
 
 2. **Node.js 22+** (matches `package.json` `engines.node` and CI)
