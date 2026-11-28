@@ -66,39 +66,43 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
     const now = Date.now();
     const entry = this.counters.get(clientId);
 
-    // Schedule cleanup if not already scheduled
-    await this.scheduleCleanup();
+    let response: CheckLimitResponse;
 
-    // Check if entry exists and is within the window
+    // Check if entry exists and is within the window (update synchronously
+    // before any await to avoid TOCTOU lost updates across concurrent fetches)
     if (entry && entry.windowStart > now - windowMs) {
-      // Still in window
       if (entry.count >= limit) {
-        // Rate limited
         const retryAfterMs = entry.windowStart + windowMs - now;
-        return {
+        response = {
           allowed: false,
           remaining: 0,
           retryAfterMs,
           resetAt: entry.windowStart + windowMs,
         };
+      } else {
+        entry.count++;
+        response = {
+          allowed: true,
+          remaining: limit - entry.count,
+          resetAt: entry.windowStart + windowMs,
+        };
       }
-
-      // Increment count
-      entry.count++;
-      return {
+    } else {
+      // New window or expired - start fresh
+      this.counters.set(clientId, { count: 1, windowStart: now });
+      response = {
         allowed: true,
-        remaining: limit - entry.count,
-        resetAt: entry.windowStart + windowMs,
+        remaining: limit - 1,
+        resetAt: now + windowMs,
       };
     }
 
-    // New window or expired - start fresh
-    this.counters.set(clientId, { count: 1, windowStart: now });
-    return {
-      allowed: true,
-      remaining: limit - 1,
-      resetAt: now + windowMs,
-    };
+    // Avoid redundant storage.getAlarm()/setAlarm() calls while cleanupAlarm is active
+    if (!this.cleanupAlarm || this.cleanupAlarm < now) {
+      await this.scheduleCleanup(now);
+    }
+
+    return response;
   }
 
   private cleanupExpiredEntries() {
@@ -113,16 +117,24 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
     }
   }
 
-  private async scheduleCleanup() {
-    const now = Date.now();
+  private async scheduleCleanup(now: number = Date.now()) {
     const fiveMinutes = 5 * 60 * 1000;
 
     if (!this.cleanupAlarm || this.cleanupAlarm < now) {
-      this.cleanupAlarm = now + fiveMinutes;
-      // Schedule a real DO alarm so cleanup runs even without incoming requests
-      const currentAlarm = await this.ctx.storage.getAlarm();
-      if (!currentAlarm) {
-        await this.ctx.storage.setAlarm(now + fiveMinutes);
+      const target = now + fiveMinutes;
+      // Set synchronously so concurrent requests in the same tick don't all hit getAlarm()
+      this.cleanupAlarm = target;
+      try {
+        // Schedule a real DO alarm so cleanup runs even without incoming requests
+        const currentAlarm = await this.ctx.storage.getAlarm();
+        if (!currentAlarm) {
+          await this.ctx.storage.setAlarm(target);
+        } else if (currentAlarm > now) {
+          this.cleanupAlarm = currentAlarm;
+        }
+      } catch (error) {
+        this.cleanupAlarm = null;
+        throw error;
       }
     }
   }
@@ -131,8 +143,9 @@ export class RateLimitDurableObject extends DurableObject<Record<string, unknown
     this.cleanupExpiredEntries();
     // Reschedule if there are still entries to track
     if (this.counters.size > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + 5 * 60 * 1000);
-      this.cleanupAlarm = Date.now() + 5 * 60 * 1000;
+      const nextAlarm = Date.now() + 5 * 60 * 1000;
+      await this.ctx.storage.setAlarm(nextAlarm);
+      this.cleanupAlarm = nextAlarm;
     } else {
       this.cleanupAlarm = null;
     }

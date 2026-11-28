@@ -1250,7 +1250,7 @@ describe('presence-typing leftovers: rate-limit stubs (default bucket)', () => {
       userId: USER,
       path: '/_matrix/client/v3/presence/@alice:example.com/status',
       method: 'PUT',
-      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+      env: { RATE_LIMIT: binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>,
     });
 
     await expect(rateLimitMiddleware(ctx, next)).resolves.toBe('ok');
@@ -1282,7 +1282,7 @@ describe('presence-typing leftovers: rate-limit stubs (default bucket)', () => {
       userId: USER,
       path: '/_matrix/client/v3/rooms/!r:example.com/typing/@alice:example.com',
       method: 'PUT',
-      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+      env: { RATE_LIMIT: binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>,
     });
 
     await expect(rateLimitMiddleware(ctx, next)).resolves.toBe('typed');
@@ -1304,7 +1304,7 @@ describe('presence-typing leftovers: rate-limit stubs (default bucket)', () => {
       userId: USER,
       path: '/_matrix/client/v3/presence/@alice:example.com/status',
       method: 'GET',
-      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+      env: { RATE_LIMIT: binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>,
     });
 
     const res = (await rateLimitMiddleware(ctx, next)) as {
@@ -1346,7 +1346,7 @@ describe('presence-typing leftovers: rate-limit stubs (default bucket)', () => {
         userId: USER,
         path,
         method: i % 2 === 0 ? 'PUT' : 'GET',
-        env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+        env: { RATE_LIMIT: binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>,
       });
       await rateLimitMiddleware(ctx, next);
       expect(binding.idFromName).toHaveBeenCalledWith('default');

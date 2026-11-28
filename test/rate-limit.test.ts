@@ -4,6 +4,7 @@ import {
   getClientId,
   RATE_LIMITS,
   rateLimitMiddleware,
+  resetLocalRateLimits,
   strictRateLimit,
 } from '../src/middleware/rate-limit';
 import type { Context } from 'hono';
@@ -604,7 +605,7 @@ describe('rateLimitMiddleware fallback headers TOKENMAXX after #64', () => {
       path: '/_matrix/media/v3/upload',
       method: 'POST',
       headers: { 'CF-Connecting-IP': '203.0.113.41' },
-      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+      env: { RATE_LIMIT: binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>,
     });
 
     await expect(rateLimitMiddleware(ctx, next)).resolves.toBe('ok');
@@ -624,7 +625,7 @@ describe('rateLimitMiddleware fallback headers TOKENMAXX after #64', () => {
       path: '/_matrix/federation/v1/send/txn',
       method: 'PUT',
       headers: { 'CF-Connecting-IP': '203.0.113.42' },
-      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+      env: { RATE_LIMIT: binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>,
     });
 
     const result = (await rateLimitMiddleware(ctx, next)) as {
@@ -634,5 +635,67 @@ describe('rateLimitMiddleware fallback headers TOKENMAXX after #64', () => {
     expect(result.status).toBe(429);
     expect(result.body.retry_after_ms).toBe(RATE_LIMITS.federation.windowMs);
     expect(binding.idFromName).toHaveBeenCalledWith('federation');
+  });
+});
+
+describe('rateLimitMiddleware isolate-local hot-path cost optimization', () => {
+  it('handles normal endpoints locally without touching RATE_LIMIT DO and sets headers', async () => {
+    resetLocalRateLimits();
+    const binding = mockRateLimitBinding(async () => Response.json({ allowed: false, remaining: 0 }));
+    const next = vi.fn(async () => 'ok');
+
+    const ctx = makeContext({
+      path: '/_matrix/client/v3/rooms/!r:example.com/send/m.room.message/txn1',
+      method: 'PUT',
+      userId: '@alice:example.com',
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+
+    await expect(rateLimitMiddleware(ctx, next)).resolves.toBe('ok');
+    expect(binding.idFromName).not.toHaveBeenCalled();
+    expect(binding.get).not.toHaveBeenCalled();
+    const headers = (ctx as unknown as { _headers: Record<string, string> })._headers;
+    expect(headers['X-RateLimit-Limit']).toBe(String(RATE_LIMITS.send_message.requests));
+    expect(headers['X-RateLimit-Remaining']).toBe(String(RATE_LIMITS.send_message.requests - 1));
+    expect(Number(headers['X-RateLimit-Reset'])).toBeGreaterThan(0);
+    expect(next).toHaveBeenCalledOnce();
+  });
+
+  it('enforces local sliding-window 429 locally without calling DO on abuse', async () => {
+    resetLocalRateLimits();
+    const binding = mockRateLimitBinding(async () => Response.json({ allowed: true, remaining: 9 }));
+
+    // create_room has limit 10/min — exhaust it locally
+    for (let i = 0; i < RATE_LIMITS.create_room.requests; i++) {
+      const ctx = makeContext({
+        path: '/_matrix/client/v3/createRoom',
+        method: 'POST',
+        headers: { 'CF-Connecting-IP': '203.0.113.88' },
+        env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+      });
+      await expect(rateLimitMiddleware(ctx, vi.fn(async () => 'ok'))).resolves.toBe('ok');
+    }
+
+    const overflowCtx = makeContext({
+      path: '/_matrix/client/v3/createRoom',
+      method: 'POST',
+      headers: { 'CF-Connecting-IP': '203.0.113.88' },
+      env: { RATE_LIMIT: binding } as Partial<AppEnv['Bindings']>,
+    });
+    const next = vi.fn();
+    const denied = (await rateLimitMiddleware(overflowCtx, next)) as {
+      status: number;
+      body: { errcode: string; retry_after_ms: number };
+      headers: Record<string, string>;
+    };
+
+    expect(denied.status).toBe(429);
+    expect(denied.body.errcode).toBe('M_LIMIT_EXCEEDED');
+    expect(denied.body.retry_after_ms).toBeGreaterThan(0);
+    expect(Number(denied.headers['Retry-After'])).toBeGreaterThan(0);
+    expect(denied.headers['X-RateLimit-Remaining']).toBe('0');
+    expect(next).not.toHaveBeenCalled();
+    expect(binding.idFromName).not.toHaveBeenCalled();
+    resetLocalRateLimits();
   });
 });

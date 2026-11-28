@@ -75,7 +75,84 @@ export function getClientId(c: Context<AppEnv>): string {
   return 'ip:unknown';
 }
 
-// Rate limiter using Durable Objects
+// Buckets that require strict globally-consistent Durable Object enforcement
+// (credential-stuffing / signup-abuse targets). All other high-frequency
+// buckets use the isolate-local fast path to avoid doubling request costs
+// with a DO RPC on every normal Matrix API call.
+const STRICT_DO_LIMIT_TYPES = new Set(['login', 'register']);
+
+interface LocalRateLimitEntry {
+  count: number;
+  windowStart: number;
+}
+
+interface RateLimitCheckResult {
+  allowed: boolean;
+  remaining: number;
+  retryAfterMs?: number;
+  resetAt?: number;
+}
+
+const MAX_LOCAL_RATE_LIMIT_ENTRIES = 10_000;
+const localRateLimitCounters = new Map<string, LocalRateLimitEntry>();
+
+/** Reset isolate-local rate limit counters. Exported for unit tests. */
+export function resetLocalRateLimits(): void {
+  localRateLimitCounters.clear();
+}
+
+function checkLocalRateLimit(
+  bucketKey: string,
+  limit: number,
+  windowMs: number
+): RateLimitCheckResult {
+  const now = Date.now();
+  const entry = localRateLimitCounters.get(bucketKey);
+
+  if (entry && entry.windowStart > now - windowMs) {
+    if (entry.count >= limit) {
+      const resetAt = entry.windowStart + windowMs;
+      return {
+        allowed: false,
+        remaining: 0,
+        retryAfterMs: resetAt - now,
+        resetAt,
+      };
+    }
+
+    entry.count++;
+    return {
+      allowed: true,
+      remaining: limit - entry.count,
+      resetAt: entry.windowStart + windowMs,
+    };
+  }
+
+  // Lazy eviction when map reaches cap to bound isolate memory
+  if (localRateLimitCounters.size >= MAX_LOCAL_RATE_LIMIT_ENTRIES) {
+    for (const [k, v] of localRateLimitCounters) {
+      if (v.windowStart <= now - windowMs) {
+        localRateLimitCounters.delete(k);
+      }
+    }
+    while (localRateLimitCounters.size >= MAX_LOCAL_RATE_LIMIT_ENTRIES) {
+      const oldest = localRateLimitCounters.keys().next().value;
+      if (oldest === undefined) break;
+      localRateLimitCounters.delete(oldest);
+    }
+  }
+
+  localRateLimitCounters.set(bucketKey, { count: 1, windowStart: now });
+  return {
+    allowed: true,
+    remaining: limit - 1,
+    resetAt: now + windowMs,
+  };
+}
+
+// Rate limiter: uses isolate-local sliding windows on hot-path endpoints to
+// avoid a Durable Object RPC per request, reserving RateLimitDurableObject
+// for strict auth/register buckets (or when RATE_LIMIT_DISTRIBUTED=true).
 export async function rateLimitMiddleware(c: Context<AppEnv>, next: Next) {
   const path = c.req.path;
   const method = c.req.method;
@@ -95,8 +172,37 @@ export async function rateLimitMiddleware(c: Context<AppEnv>, next: Next) {
   const config = RATE_LIMITS[limitType];
   const clientId = getClientId(c);
 
+  const useDurableObject =
+    STRICT_DO_LIMIT_TYPES.has(limitType) || c.env.RATE_LIMIT_DISTRIBUTED === 'true';
+
+  if (!useDurableObject) {
+    const result = checkLocalRateLimit(`${limitType}:${clientId}`, config.requests, config.windowMs);
+
+    c.header('X-RateLimit-Limit', String(config.requests));
+    c.header('X-RateLimit-Remaining', String(result.remaining));
+    if (result.resetAt) {
+      c.header('X-RateLimit-Reset', String(Math.ceil(result.resetAt / 1000)));
+    }
+
+    if (!result.allowed) {
+      const retryAfter = Math.ceil((result.retryAfterMs || config.windowMs) / 1000);
+      c.header('Retry-After', String(retryAfter));
+
+      return c.json(
+        {
+          errcode: 'M_LIMIT_EXCEEDED',
+          error: 'Too many requests',
+          retry_after_ms: result.retryAfterMs || config.windowMs,
+        },
+        429
+      );
+    }
+
+    return next();
+  }
+
   // Use rate limit type as the DO ID to distribute load
-  // Each limit type gets its own DO instance
+  // Each strict limit type gets its own DO instance
   const doId = c.env.RATE_LIMIT.idFromName(limitType);
   const stub = c.env.RATE_LIMIT.get(doId);
 
@@ -114,12 +220,7 @@ export async function rateLimitMiddleware(c: Context<AppEnv>, next: Next) {
       })
     );
 
-    const result = (await response.json()) as {
-      allowed: boolean;
-      remaining: number;
-      retryAfterMs?: number;
-      resetAt?: number;
-    };
+    const result = (await response.json()) as RateLimitCheckResult;
 
     // Set rate limit headers
     c.header('X-RateLimit-Limit', String(config.requests));

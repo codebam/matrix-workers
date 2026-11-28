@@ -601,7 +601,7 @@ describe('race rate-limit media∥e2ee∥search buckets after #223', () => {
       const ctl = installDoBinding({
         defaultResult: { allowed: true, remaining: 2 },
       });
-      const env = { RATE_LIMIT: ctl.binding } as Partial<AppEnv['Bindings']>;
+      const env = { RATE_LIMIT: ctl.binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>;
       const results = await Promise.all([
         rateLimitMiddleware(
           makeContext({
@@ -853,7 +853,7 @@ describe('race rate-limit createRoom∥send_message buckets after #223', () => {
       const ctl = installDoBinding({
         defaultResult: { allowed: true, remaining: 1 },
       });
-      const env = { RATE_LIMIT: ctl.binding } as Partial<AppEnv['Bindings']>;
+      const env = { RATE_LIMIT: ctl.binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>;
       const [roomRes, sendRes] = await Promise.all([
         rateLimitMiddleware(
           makeContext({
@@ -887,7 +887,7 @@ describe('race rate-limit federation∥media-download after #223', () => {
       const ctl = installDoBinding({
         defaultResult: { allowed: true, remaining: 10 },
       });
-      const env = { RATE_LIMIT: ctl.binding } as Partial<AppEnv['Bindings']>;
+      const env = { RATE_LIMIT: ctl.binding, RATE_LIMIT_DISTRIBUTED: 'true' } as Partial<AppEnv['Bindings']>;
       const [fedRes, mediaRes] = await Promise.all([
         rateLimitMiddleware(
           makeContext({

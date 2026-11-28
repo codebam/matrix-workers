@@ -320,4 +320,17 @@ describe('RateLimitDurableObject TOKENMAXX clock boundaries after #60', () => {
     });
     expect(state.storage.alarm).toBe(NOW + 5 * 60 * 1000);
   });
+
+  it('avoids redundant getAlarm/setAlarm calls while cleanupAlarm is active', async () => {
+    const { state, do: rateLimitDo } = makeDo();
+    const getAlarmSpy = vi.spyOn(state.storage, 'getAlarm');
+    const setAlarmSpy = vi.spyOn(state.storage, 'setAlarm');
+
+    for (let i = 0; i < 20; i++) {
+      await check(rateLimitDo, `ip:burst-${i}`, 10, WINDOW_MS);
+    }
+
+    expect(getAlarmSpy).toHaveBeenCalledTimes(1);
+    expect(setAlarmSpy).toHaveBeenCalledTimes(1);
+  });
 });

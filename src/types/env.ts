@@ -43,6 +43,11 @@ export interface Env {
   //   Otherwise the header is client-spoofable and must NOT be trusted.
   TRUST_FORWARDED_FOR?: string;
 
+  // Set to "true" to route all rate-limit buckets through the distributed
+  // RateLimitDurableObject instead of using the isolate-local fast path for
+  // non-auth endpoints.
+  RATE_LIMIT_DISTRIBUTED?: string;
+
   // Support contact info (optional)
   ADMIN_CONTACT_EMAIL?: string;
   ADMIN_CONTACT_MXID?: string;
