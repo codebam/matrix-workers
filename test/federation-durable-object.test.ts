@@ -1094,4 +1094,85 @@ describe('FederationDurableObject queue/keys/discovery edges after #71', () => {
       [...state.storage.map.keys()].filter((k) => k.startsWith('edu:both.example.com:'))
     ).toEqual([]);
   });
+
+  it('batches storage deletes on 200 OK and storage puts on retry and /receive', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    for (let i = 0; i < 4; i++) {
+      await state.storage.put(`queue:batch.example.com:$p${i}`, {
+        event_id: `$p${i}`,
+        room_id: '!r:ex.com',
+        destination: 'batch.example.com',
+        pdu: { event_id: `$p${i}`, type: 'm.room.message' },
+        created_at: NOW + i,
+        retry_count: 0,
+      });
+    }
+    await state.storage.put('edu:batch.example.com:1:a', {
+      edu_type: 'm.typing',
+      destination: 'batch.example.com',
+      content: {},
+      created_at: NOW,
+    });
+    await state.storage.put('server:batch.example.com', {
+      serverName: 'batch.example.com',
+      lastContact: 0,
+      retryCount: 0,
+      nextRetry: NOW,
+    });
+
+    // First: simulate failure -> scheduleRetry should batch server + 4 queue puts into 1 storage.put call
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('down', { status: 503 })));
+    const putSpy = vi.spyOn(state.storage, 'put');
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+    expect(putSpy).toHaveBeenCalledTimes(1);
+    expect(typeof putSpy.mock.calls[0][0]).toBe('object');
+    expect(Object.keys(putSpy.mock.calls[0][0] as Record<string, unknown>)).toHaveLength(5);
+
+    // Next: advance time and succeed -> 4 PDUs + 1 EDU deleted in 1 batched storage.delete call
+    vi.setSystemTime(NOW + 60_000);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })));
+    const deleteSpy = vi.spyOn(state.storage, 'delete');
+    await (fed as unknown as { alarm: () => Promise<void> }).alarm();
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(Array.isArray(deleteSpy.mock.calls[0][0])).toBe(true);
+    expect((deleteSpy.mock.calls[0][0] as string[]).length).toBe(5);
+
+    // /receive with multiple PDUs batches all received:* + server:* into 1 storage.put call
+    putSpy.mockClear();
+    const recvRes = await fed.fetch(
+      new Request('https://do/receive', {
+        method: 'POST',
+        headers: { 'X-Matrix-Origin': 'peer.example.com' },
+        body: JSON.stringify({
+          pdus: [{ event_id: '$r1' }, { event_id: '$r2' }, { event_id: '$r3' }],
+        }),
+      })
+    );
+    expect(recvRes.status).toBe(200);
+    expect(putSpy).toHaveBeenCalledTimes(1);
+    expect(Object.keys(putSpy.mock.calls[0][0] as Record<string, unknown>)).toHaveLength(4);
+  });
+
+  it('/send scans the destination queue only once (reuses preloaded events)', async () => {
+    const { state, do: fed } = makeFed(new FakeDurableObjectState(), nullKeyEnv());
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 200 })));
+    const listSpy = vi.spyOn(state.storage, 'list');
+
+    await fed.fetch(
+      new Request('https://do/send', {
+        method: 'POST',
+        body: JSON.stringify({
+          destination: 'single-scan.example.com',
+          event_id: '$s1',
+          room_id: '!r:ex.com',
+          pdu: { event_id: '$s1' },
+        }),
+      })
+    );
+
+    const queueLists = listSpy.mock.calls.filter(
+      ([opts]) => opts && (opts as { prefix: string }).prefix === 'queue:single-scan.example.com:'
+    );
+    expect(queueLists).toHaveLength(1);
+  });
 });

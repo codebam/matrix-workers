@@ -43,9 +43,37 @@ interface OutboundInvite {
   retry_count: number;
 }
 
+const STORAGE_BATCH_LIMIT = 128;
+
 export class FederationDurableObject extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+  }
+
+  // Batch storage puts in chunks of 128 (Cloudflare DO storage limit)
+  private async batchPut(entries: Record<string, unknown>): Promise<void> {
+    const pairs = Object.entries(entries);
+    if (pairs.length === 0) return;
+    if (pairs.length === 1) {
+      await this.ctx.storage.put(pairs[0][0], pairs[0][1]);
+      return;
+    }
+    for (let i = 0; i < pairs.length; i += STORAGE_BATCH_LIMIT) {
+      const chunk = Object.fromEntries(pairs.slice(i, i + STORAGE_BATCH_LIMIT));
+      await this.ctx.storage.put(chunk);
+    }
+  }
+
+  // Batch storage deletes in chunks of 128 (Cloudflare DO storage limit)
+  private async batchDelete(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    if (keys.length === 1) {
+      await this.ctx.storage.delete(keys[0]);
+      return;
+    }
+    for (let i = 0; i < keys.length; i += STORAGE_BATCH_LIMIT) {
+      await this.ctx.storage.delete(keys.slice(i, i + STORAGE_BATCH_LIMIT));
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -102,7 +130,7 @@ export class FederationDurableObject extends DurableObject<Env> {
     };
 
     // Check queue size to prevent unbounded growth when remote server is down
-    const allQueueKeys = await this.ctx.storage.list({ prefix: `queue:${data.destination}:`, limit: 10000 });
+    const allQueueKeys = await this.ctx.storage.list<OutboundEvent>({ prefix: `queue:${data.destination}:`, limit: 10000 });
     if (allQueueKeys.size >= 10000) {
       console.warn(`[federation] Queue for ${data.destination} full (${allQueueKeys.size} events), rejecting`);
       return new Response(JSON.stringify({
@@ -117,8 +145,13 @@ export class FederationDurableObject extends DurableObject<Env> {
 
     console.log(`[federation] Queued PDU ${data.event_id} for ${data.destination}`);
 
+    // Reuse the queue snapshot we just listed (plus the newly queued event)
+    // to avoid a duplicate full storage.list scan in processFederationQueue.
+    allQueueKeys.set(key, outboundEvent);
+    const preloadedEvents = Array.from(allQueueKeys.values());
+
     // Try to send immediately
-    await this.processFederationQueue(data.destination);
+    await this.processFederationQueue(data.destination, preloadedEvents);
 
     return new Response('Queued');
   }
@@ -133,24 +166,31 @@ export class FederationDurableObject extends DurableObject<Env> {
       room_id: string;
       pdu: any;
     };
+    const now = Date.now();
     const outboundEvent: OutboundEvent = {
       event_id: data.event_id,
       room_id: data.room_id,
       destination: data.destination,
       pdu: data.pdu,
-      created_at: Date.now(),
+      created_at: now,
       retry_count: 0,
     };
-    await this.ctx.storage.put(`queue:${data.destination}:${data.event_id}`, outboundEvent);
-    // Register a due target so alarm() drains this destination.
+    // Register a due target so alarm() drains this destination, batching both puts.
     const existing = await this.ctx.storage.get(`server:${data.destination}`) as FederationTarget | undefined;
-    await this.ctx.storage.put(`server:${data.destination}`, {
-      serverName: data.destination,
-      lastContact: existing?.lastContact ?? 0,
-      retryCount: existing?.retryCount ?? 0,
-      nextRetry: Date.now(),
+    await this.batchPut({
+      [`queue:${data.destination}:${data.event_id}`]: outboundEvent,
+      [`server:${data.destination}`]: {
+        serverName: data.destination,
+        lastContact: existing?.lastContact ?? 0,
+        retryCount: existing?.retryCount ?? 0,
+        nextRetry: now,
+      },
     });
-    await this.ctx.storage.setAlarm(Date.now() + 100);
+    const targetAlarm = now + 100;
+    const currentAlarm = await this.ctx.storage.getAlarm();
+    if (!currentAlarm || currentAlarm <= now || currentAlarm > targetAlarm) {
+      await this.ctx.storage.setAlarm(targetAlarm);
+    }
     return new Response('Queued');
   }
 
@@ -172,26 +212,27 @@ export class FederationDurableObject extends DurableObject<Env> {
       edus?: any[];
     };
 
-    // Process incoming PDUs
+    // Process incoming PDUs and batch-write with server status update
+    const now = Date.now();
     const processedPdus: string[] = [];
+    const writes: Record<string, unknown> = {};
     for (const pdu of data.pdus || []) {
-      // Store the event
-      await this.ctx.storage.put(`received:${pdu.event_id}`, {
+      writes[`received:${pdu.event_id}`] = {
         pdu,
         origin,
-        received_at: Date.now(),
-      });
+        received_at: now,
+      };
       processedPdus.push(pdu.event_id);
     }
 
-    // Update server status
     const target: FederationTarget = {
       serverName: origin,
-      lastContact: Date.now(),
+      lastContact: now,
       retryCount: 0,
       nextRetry: null,
     };
-    await this.ctx.storage.put(`server:${origin}`, target);
+    writes[`server:${origin}`] = target;
+    await this.batchPut(writes);
 
     return new Response(JSON.stringify({
       pdus: processedPdus.reduce((acc, id) => ({ ...acc, [id]: {} }), {}),
@@ -303,13 +344,17 @@ export class FederationDurableObject extends DurableObject<Env> {
     return new Response('Queued');
   }
 
-  private async processFederationQueue(destination: string): Promise<void> {
-    const prefix = `queue:${destination}:`;
-    const allKeys = await this.ctx.storage.list({ prefix });
-
-    const events: OutboundEvent[] = [];
-    for (const [, value] of allKeys) {
-      events.push(value as OutboundEvent);
+  private async processFederationQueue(destination: string, preloadedEvents?: OutboundEvent[]): Promise<void> {
+    let events: OutboundEvent[];
+    if (preloadedEvents) {
+      events = preloadedEvents;
+    } else {
+      const prefix = `queue:${destination}:`;
+      const allKeys = await this.ctx.storage.list({ prefix });
+      events = [];
+      for (const [, value] of allKeys) {
+        events.push(value as OutboundEvent);
+      }
     }
 
     // Collect pending EDUs
@@ -396,8 +441,9 @@ export class FederationDurableObject extends DurableObject<Env> {
             JSON.stringify(responseBody?.pdus ?? {}).slice(0, 1200)
         );
 
-        // Remove accepted events from queue, re-queue rejected ones
+        // Batch-remove accepted/maxed-out events and sent EDUs from queue
         const pduResults = responseBody?.pdus || {};
+        const keysToDelete: string[] = [];
         for (const event of events) {
           const result = pduResults[event.event_id];
           if (result?.error) {
@@ -405,17 +451,18 @@ export class FederationDurableObject extends DurableObject<Env> {
             // Keep in queue for retry unless it's a permanent failure
             if (event.retry_count >= 32) {
               console.error(`[federation] Dropping PDU ${event.event_id} after 32 retries to ${destination}`);
-              await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+              keysToDelete.push(`queue:${destination}:${event.event_id}`);
             }
           } else {
             // Accepted — remove from queue
-            await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+            keysToDelete.push(`queue:${destination}:${event.event_id}`);
           }
         }
         // Remove sent EDUs (EDUs are fire-and-forget per spec)
         for (const key of eduKeyNames) {
-          await this.ctx.storage.delete(key);
+          keysToDelete.push(key);
         }
+        await this.batchDelete(keysToDelete);
 
         // Update server status
         const target: FederationTarget = {
@@ -429,13 +476,15 @@ export class FederationDurableObject extends DurableObject<Env> {
         // Schedule retry (with max retry cap)
         const maxedOut = events.some(e => e.retry_count >= 32);
         if (maxedOut) {
-          // Drop events that have exceeded max retries
+          // Batch-drop events that have exceeded max retries
+          const droppedKeys: string[] = [];
           for (const event of events) {
             if (event.retry_count >= 32) {
               console.error(`[federation] Dropping PDU ${event.event_id} after ${event.retry_count} retries to ${destination}`);
-              await this.ctx.storage.delete(`queue:${destination}:${event.event_id}`);
+              droppedKeys.push(`queue:${destination}:${event.event_id}`);
             }
           }
+          await this.batchDelete(droppedKeys);
           // Re-filter events that still have retries left
           const remainingEvents = events.filter(e => e.retry_count < 32);
           if (remainingEvents.length > 0) {
@@ -459,20 +508,22 @@ export class FederationDurableObject extends DurableObject<Env> {
     const delay = Math.min(60000 * Math.pow(2, retryCount - 1), 86400000);
     const nextRetry = Date.now() + delay;
 
-    // Update server status
+    // Batch server status and updated retry counts into storage puts
     const newTarget: FederationTarget = {
       serverName: destination,
       lastContact: target?.lastContact || 0,
       retryCount,
       nextRetry,
     };
-    await this.ctx.storage.put(`server:${destination}`, newTarget);
+    const updates: Record<string, unknown> = {
+      [`server:${destination}`]: newTarget,
+    };
 
-    // Update events with retry count
     for (const event of events) {
       event.retry_count = retryCount;
-      await this.ctx.storage.put(`queue:${destination}:${event.event_id}`, event);
+      updates[`queue:${destination}:${event.event_id}`] = event;
     }
+    await this.batchPut(updates);
 
     // Set alarm for retry
     await this.ctx.storage.setAlarm(nextRetry);
@@ -525,6 +576,15 @@ export class FederationDurableObject extends DurableObject<Env> {
     invites.sort((a, b) => a.created_at - b.created_at);
 
     let failures = 0;
+    let successes = 0;
+    const keysToDelete: string[] = [];
+    const invitesToUpdate: Record<string, unknown> = {};
+
+    // Hoist signing key and server discovery once per destination batch
+    let signingKey: Awaited<ReturnType<typeof getServerSigningKey>> | undefined;
+    let signingKeyLoaded = false;
+    let serverUrl: string | undefined;
+
     for (const invite of invites) {
       try {
         const path = `/_matrix/federation/v2/invite/${encodeURIComponent(invite.room_id)}/${encodeURIComponent(invite.event_id)}`;
@@ -539,7 +599,10 @@ export class FederationDurableObject extends DurableObject<Env> {
           'Accept': 'application/json',
         };
 
-        const signingKey = await getServerSigningKey(this.env.DB);
+        if (!signingKeyLoaded) {
+          signingKey = await getServerSigningKey(this.env.DB);
+          signingKeyLoaded = true;
+        }
         if (signingKey) {
           headers['Authorization'] = await signFederationRequest(
             'PUT',
@@ -553,12 +616,13 @@ export class FederationDurableObject extends DurableObject<Env> {
           console.warn(`[federation] No signing key available — sending unsigned invite to ${destination}`);
         }
 
-        let serverUrl: string;
-        try {
-          const discovery = await discoverServer(destination, this.env.CACHE);
-          serverUrl = buildServerUrl(discovery);
-        } catch {
-          serverUrl = `https://${destination}`;
+        if (!serverUrl) {
+          try {
+            const discovery = await discoverServer(destination, this.env.CACHE);
+            serverUrl = buildServerUrl(discovery);
+          } catch {
+            serverUrl = `https://${destination}`;
+          }
         }
 
         const response = await federationFetch(`${serverUrl}${path}`, {
@@ -571,14 +635,8 @@ export class FederationDurableObject extends DurableObject<Env> {
         console.log(`[federation] Invite ${invite.event_id} to ${destination}: HTTP ${response.status}`);
 
         if (response.ok) {
-          await this.ctx.storage.delete(`invite:${destination}:${invite.event_id}`);
-          const target: FederationTarget = {
-            serverName: destination,
-            lastContact: Date.now(),
-            retryCount: 0,
-            nextRetry: null,
-          };
-          await this.ctx.storage.put(`server:${destination}`, target);
+          keysToDelete.push(`invite:${destination}:${invite.event_id}`);
+          successes += 1;
         } else {
           let bodyText = '';
           try {
@@ -590,9 +648,9 @@ export class FederationDurableObject extends DurableObject<Env> {
           invite.retry_count += 1;
           if (invite.retry_count >= 32) {
             console.error(`[federation] Dropping invite ${invite.event_id} after ${invite.retry_count} retries to ${destination}`);
-            await this.ctx.storage.delete(`invite:${destination}:${invite.event_id}`);
+            keysToDelete.push(`invite:${destination}:${invite.event_id}`);
           } else {
-            await this.ctx.storage.put(`invite:${destination}:${invite.event_id}`, invite);
+            invitesToUpdate[`invite:${destination}:${invite.event_id}`] = invite;
             failures += 1;
           }
         }
@@ -600,13 +658,15 @@ export class FederationDurableObject extends DurableObject<Env> {
         console.error(`[federation] Invite ${invite.event_id} to ${destination} failed:`, e);
         invite.retry_count += 1;
         if (invite.retry_count >= 32) {
-          await this.ctx.storage.delete(`invite:${destination}:${invite.event_id}`);
+          keysToDelete.push(`invite:${destination}:${invite.event_id}`);
         } else {
-          await this.ctx.storage.put(`invite:${destination}:${invite.event_id}`, invite);
+          invitesToUpdate[`invite:${destination}:${invite.event_id}`] = invite;
           failures += 1;
         }
       }
     }
+
+    await this.batchDelete(keysToDelete);
 
     if (failures > 0) {
       // Exponential backoff shared with the PDU queue, so a down destination
@@ -615,13 +675,24 @@ export class FederationDurableObject extends DurableObject<Env> {
       const retryCount = (target?.retryCount || 0) + 1;
       const delay = Math.min(60000 * Math.pow(2, retryCount - 1), 86400000);
       const nextRetry = Date.now() + delay;
-      await this.ctx.storage.put(`server:${destination}`, {
+      invitesToUpdate[`server:${destination}`] = {
         serverName: destination,
-        lastContact: target?.lastContact || 0,
+        lastContact: successes > 0 ? Date.now() : (target?.lastContact || 0),
         retryCount,
         nextRetry,
-      });
+      };
+      await this.batchPut(invitesToUpdate);
       await this.ctx.storage.setAlarm(nextRetry);
+    } else if (successes > 0) {
+      invitesToUpdate[`server:${destination}`] = {
+        serverName: destination,
+        lastContact: Date.now(),
+        retryCount: 0,
+        nextRetry: null,
+      };
+      await this.batchPut(invitesToUpdate);
+    } else {
+      await this.batchPut(invitesToUpdate);
     }
   }
 
