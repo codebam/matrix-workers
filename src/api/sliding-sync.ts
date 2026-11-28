@@ -636,6 +636,7 @@ async function getRoomData(
 
   // Get required state — collapse N requested (type, state_key) pairs into a
   // single query with OR conditions to avoid N+1 round-trips per room.
+  let allRoomStateRows: any[] | null = null;
   if (config.requiredState && config.requiredState.length > 0) {
     result.required_state = [];
 
@@ -685,6 +686,9 @@ async function getRoomData(
     }
 
     const stateEvents = await db.prepare(stateQuery).bind(...bindParams).all();
+    if (needsAll) {
+      allRoomStateRows = stateEvents.results as any[];
+    }
     const seenIds = new Set<string>();
     for (const event of stateEvents.results as any[]) {
       if (seenIds.has(event.event_id)) continue;
@@ -704,13 +708,14 @@ async function getRoomData(
   }
 
   // MSC4222: state_after = the current room state (after the timeline window).
-  const afterRows = await db.prepare(`
+  // Reuse full room_state rows when required_state already fetched them.
+  const afterRowsResults = allRoomStateRows ?? (await db.prepare(`
     SELECT e.event_id, e.event_type, e.state_key, e.content, e.sender, e.origin_server_ts, e.redacted_content
     FROM room_state rs JOIN events e ON rs.event_id = e.event_id
     WHERE rs.room_id = ?
-  `).bind(roomId).all();
+  `).bind(roomId).all()).results as any[];
   result.state_after = [];
-  for (const e of afterRows.results as any[]) {
+  for (const e of afterRowsResults) {
     try {
       result.state_after.push({
         type: e.event_type,
@@ -1794,6 +1799,10 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   }
 
   const isInitialSync = !posToken || sincePos === 0;
+  const hadExistingConnectionState = !!connectionState;
+  const prevPos = connectionState?.pos;
+  const prevInitialSyncComplete = connectionState?.initialSyncComplete === true;
+  const prevLastAccess = connectionState?.lastAccess ?? 0;
 
   if (!connectionState) {
     connectionState = {
@@ -1809,7 +1818,8 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   let hasChanges = isInitialSync; // Initial sync always has "changes"
 
   // Don't update connection state position yet - only if we have changes
-  connectionState.lastAccess = Date.now();
+  const now = Date.now();
+  connectionState.lastAccess = now;
 
   const response: SlidingSyncResponse = {
     pos: posToken || String(currentStreamPos), // Start with input pos, update later if changes
@@ -2431,16 +2441,25 @@ async function handleSimplifiedSlidingSync(c: Context<AppEnv>) {
   // Debug logging for response
   console.log('[sliding-sync] Response:', { userId, responsePos: response.pos, hasChanges, timeout, willWait: !hasChanges && timeout > 0 });
 
-  // ALWAYS save connection state - flags like initialSyncComplete must be persisted
-  // We use Durable Objects now (not KV), so rate limits aren't a concern
-  // Previously we only saved when hasChanges, but this caused initialSyncComplete
-  // to not persist, resulting in ephemeral data spam on every request
-  try {
-    await saveConnectionState(syncDO, userId, connId, connectionState);
-  } catch (error) {
-    console.error('[sliding-sync] Failed to save connection state:', error);
-    // Don't return error here - state can be rebuilt on next request
-    // But client may experience duplicated ephemeral data
+  // Persist connection state when anything meaningful changed, or periodically
+  // (every 5 minutes) to keep lastAccess fresh for the 24h stale-state cleanup.
+  // Skipping identical idle writes avoids a DO RPC + storage.put on every 25s poll.
+  const STATE_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+  const stateNeedsSave =
+    !hadExistingConnectionState ||
+    hasChanges ||
+    !prevInitialSyncComplete ||
+    prevPos !== currentStreamPos ||
+    (now - prevLastAccess) >= STATE_TOUCH_INTERVAL_MS;
+
+  if (stateNeedsSave) {
+    try {
+      await saveConnectionState(syncDO, userId, connId, connectionState);
+    } catch (error) {
+      console.error('[sliding-sync] Failed to save connection state:', error);
+      // Don't return error here - state can be rebuilt on next request
+      // But client may experience duplicated ephemeral data
+    }
   }
 
   // Long-polling: if no changes and timeout > 0, wait for events via Durable Object

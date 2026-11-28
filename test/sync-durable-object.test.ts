@@ -839,3 +839,97 @@ describe('SyncDurableObject wait/state/session edges after #71', () => {
     expect(sessions.has(kept)).toBe(true);
   });
 });
+
+describe('SyncDurableObject cost optimizations (lazy cache, batched alarm, timer cleanup)', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('hydrates pending events lazily once and serves subsequent /pending calls from memory', async () => {
+    const { state, do: sync } = makeSync();
+    await state.storage.put('event:$e1', {
+      event_id: '$e1',
+      room_id: '!r:ex.com',
+      type: 'm.room.message',
+      timestamp: 100,
+    });
+    const listSpy = vi.spyOn(state.storage, 'list');
+
+    const r1 = await sync.fetch(new Request('https://do/pending?since=0'));
+    expect(((await r1.json()) as { events: Array<{ event_id: string }> }).events.map(e => e.event_id)).toEqual(['$e1']);
+    expect(listSpy).toHaveBeenCalledTimes(1);
+
+    // Subsequent /pending calls and /notify updates do not re-scan storage
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$e2',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 200,
+        }),
+      })
+    );
+    const r2 = await sync.fetch(new Request('https://do/pending?since=0'));
+    expect(((await r2.json()) as { events: Array<{ event_id: string }> }).events.map(e => e.event_id)).toEqual(['$e1', '$e2']);
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('batch-deletes expired entries in alarm() and stops rescheduling when empty', async () => {
+    vi.useFakeTimers();
+    const now = 1_700_000_000_000;
+    vi.setSystemTime(now);
+    const { state, do: sync } = makeSync();
+
+    for (let i = 0; i < 5; i++) {
+      await state.storage.put(`event:$old${i}`, {
+        event_id: `$old${i}`,
+        room_id: '!r',
+        type: 'm.room.message',
+        timestamp: now - 25 * 60 * 60 * 1000,
+      });
+    }
+    const deleteSpy = vi.spyOn(state.storage, 'delete');
+
+    await (sync as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(deleteSpy).toHaveBeenCalledTimes(1);
+    expect(Array.isArray(deleteSpy.mock.calls[0][0])).toBe(true);
+    expect((deleteSpy.mock.calls[0][0] as string[]).length).toBe(5);
+    expect(state.storage.map.size).toBe(0);
+    // No remaining events or sliding_sync states -> alarm must not reschedule
+    expect(state.storage.alarm).toBeNull();
+  });
+
+  it('clears the long-poll timeout immediately when /notify wakes a waiter early', async () => {
+    vi.useFakeTimers();
+    const { do: sync } = makeSync();
+
+    const waitPromise = sync.fetch(
+      new Request('https://do/wait-for-events', {
+        method: 'POST',
+        body: JSON.stringify({ timeout: 25_000 }),
+      })
+    );
+    await vi.waitFor(() => {
+      expect(vi.getTimerCount()).toBe(1);
+    });
+
+    await sync.fetch(
+      new Request('https://do/notify', {
+        method: 'POST',
+        body: JSON.stringify({
+          event_id: '$wake',
+          room_id: '!r:ex.com',
+          type: 'm.room.message',
+          timestamp: 10,
+        }),
+      })
+    );
+
+    expect(await (await waitPromise).json()).toEqual({ hasEvents: true });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});

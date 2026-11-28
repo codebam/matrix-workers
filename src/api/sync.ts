@@ -83,6 +83,12 @@ interface SyncFilter {
   event_fields?: string[];
 }
 
+// Isolate-local cache for immutable Matrix sync filters, scoped per KVNamespace
+// instance via WeakMap so tests using fresh mock KV instances stay isolated
+// while production avoids repeated KV reads on every /sync poll.
+const MAX_CACHED_FILTERS_PER_KV = 500;
+const syncFilterCache = new WeakMap<KVNamespace, Map<string, SyncFilter>>();
+
 // Load a filter from KV storage or parse inline JSON
 async function loadFilter(env: Env, userId: string, filterParam?: string): Promise<SyncFilter | null> {
   if (!filterParam) return null;
@@ -97,15 +103,36 @@ async function loadFilter(env: Env, userId: string, filterParam?: string): Promi
     }
   }
 
+  const cacheKey = `filter:${userId}:${filterParam}`;
+  let kvCache = env.CACHE ? syncFilterCache.get(env.CACHE) : undefined;
+  if (kvCache) {
+    const cached = kvCache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+  }
+
   // Otherwise it's a filter ID - load from KV
-  const filterJson = await env.CACHE.get(`filter:${userId}:${filterParam}`);
+  const filterJson = await env.CACHE.get(cacheKey);
   if (!filterJson) {
     console.warn('[sync] Filter not found:', filterParam);
     return null;
   }
 
   try {
-    return JSON.parse(filterJson);
+    const parsed = JSON.parse(filterJson) as SyncFilter;
+    if (env.CACHE) {
+      if (!kvCache) {
+        kvCache = new Map();
+        syncFilterCache.set(env.CACHE, kvCache);
+      }
+      if (kvCache.size >= MAX_CACHED_FILTERS_PER_KV) {
+        const oldest = kvCache.keys().next().value;
+        if (oldest !== undefined) kvCache.delete(oldest);
+      }
+      kvCache.set(cacheKey, parsed);
+    }
+    return parsed;
   } catch {
     console.warn('[sync] Failed to parse stored filter JSON');
     return null;
@@ -782,27 +809,29 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     msc4354_sticky?: { events: StickyClientEvent[] };
   };
   let stickyByRoom: Record<string, StickyClientEvent[]> = {};
-  try {
-    stickyByRoom = await getStickyEventsForRooms(c.env.DB, joinedRoomIds, {
-      since: hasSinceToken ? sinceAccountDataPos : undefined,
-    });
-  } catch (error) {
-    console.error('[sync] Failed to load sticky events:', error);
-  }
-  try {
-    const stickyPduByRoom = await getStickyPduEventsForRooms(c.env.DB, joinedRoomIds);
-    for (const [roomId, events] of Object.entries(stickyPduByRoom)) {
-      const merged = [...(stickyByRoom[roomId] ?? [])];
-      const seen = new Set(merged.map((event) => event.event_id));
-      for (const event of events) {
-        if (seen.has(event.event_id)) continue;
-        seen.add(event.event_id);
-        merged.push(event);
-      }
-      stickyByRoom[roomId] = merged;
+  if (joinedRoomIds.length > 0) {
+    try {
+      stickyByRoom = await getStickyEventsForRooms(c.env.DB, joinedRoomIds, {
+        since: hasSinceToken ? sinceAccountDataPos : undefined,
+      });
+    } catch (error) {
+      console.error('[sync] Failed to load sticky events:', error);
     }
-  } catch (error) {
-    console.error('[sync] Failed to load sticky PDU events:', error);
+    try {
+      const stickyPduByRoom = await getStickyPduEventsForRooms(c.env.DB, joinedRoomIds);
+      for (const [roomId, events] of Object.entries(stickyPduByRoom)) {
+        const merged = [...(stickyByRoom[roomId] ?? [])];
+        const seen = new Set(merged.map((event) => event.event_id));
+        for (const event of events) {
+          if (seen.has(event.event_id)) continue;
+          seen.add(event.event_id);
+          merged.push(event);
+        }
+        stickyByRoom[roomId] = merged;
+      }
+    } catch (error) {
+      console.error('[sync] Failed to load sticky PDU events:', error);
+    }
   }
 
   for (const roomId of joinedRoomIds) {
@@ -864,6 +893,10 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       }
     }
 
+    // Cache room state within this room iteration so useStateAfter can reuse it
+    // without issuing a second identical getRoomState D1 query.
+    let fetchedRoomState: PDU[] | null = null;
+
     // A room joined within this window must carry its full state even on an
     // INCREMENTAL sync: the join's state snapshot is stored outside the
     // timeline (negative stream positions — invisible to the `> since`
@@ -879,6 +912,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       );
       if (joinedInWindow) {
         const state = await getRoomState(c.env.DB, roomId);
+        fetchedRoomState = state;
         for (const event of state) {
           const clientEvent = {
             type: event.type,
@@ -899,7 +933,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
 
     // Include full state if requested or initial sync
     if (fullState || !hasSinceToken) {
-      const state = await getRoomState(c.env.DB, roomId);
+      const state = fetchedRoomState ?? await getRoomState(c.env.DB, roomId);
+      fetchedRoomState = state;
       for (const event of state) {
         const clientEvent = {
           type: event.type,
@@ -1017,7 +1052,7 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     // clients are unchanged, and opted-in clients that still read `state`
     // keep working.
     if (useStateAfter) {
-      let afterState = await getRoomState(c.env.DB, roomId);
+      let afterState = fetchedRoomState ?? await getRoomState(c.env.DB, roomId);
       if (filter?.room?.state?.lazy_load_members) {
         const afterSenders = new Set(timelineEvents.map(e => e.sender));
         afterSenders.add(userId);
@@ -1041,29 +1076,30 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     }
     joinedRoom.state!.events = stateEvents;
 
-    // Get room-level account data
-    let roomAccountData = await getRoomAccountData(
-      c.env.DB,
-      userId,
-      roomId,
-      hasSinceToken ? sinceAccountDataPos : undefined
-    );
+    // Fetch room account data, receipts, typing, and summary in parallel
+    const [rawRoomAccountData, receipts, typingUsers, summary] = await Promise.all([
+      getRoomAccountData(
+        c.env.DB,
+        userId,
+        roomId,
+        hasSinceToken ? sinceAccountDataPos : undefined
+      ),
+      getReceiptsForRoom(c.env, roomId, userId),
+      getTypingUsers(c.env, roomId),
+      getRoomSummary(c.env.DB, roomId, userId),
+    ]);
+
     // Apply account_data filter to room account data
-    roomAccountData = applyEventFilter(
-      roomAccountData,
+    const roomAccountData = applyEventFilter(
+      rawRoomAccountData,
       withEventFormat(filter, filter?.room?.account_data)
     );
     joinedRoom.account_data!.events = roomAccountData;
 
-    // Get read receipts for this room (from Room Durable Object)
-    // Pass userId to filter m.read.private receipts (only visible to owner)
-    const receipts = await getReceiptsForRoom(c.env, roomId, userId);
     if (Object.keys(receipts.content).length > 0) {
       joinedRoom.ephemeral!.events.push(receipts);
     }
 
-    // Get typing indicators for this room (from Room Durable Object)
-    const typingUsers = await getTypingUsers(c.env, roomId);
     if (typingUsers.length > 0) {
       joinedRoom.ephemeral!.events.push({
         type: 'm.typing',
@@ -1077,7 +1113,6 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
       withEventFormat(filter, filter?.room?.ephemeral)
     );
 
-    const summary = await getRoomSummary(c.env.DB, roomId, userId);
     if (summary) joinedRoom.summary = summary;
 
     response.rooms!.join![roomId] = joinedRoom;
@@ -1240,7 +1275,8 @@ app.get('/_matrix/client/v3/sync', requireAuth(), async (c) => {
     hasPresence || hasSticky;
 
   // Parse timeout from query params (default 0 for no wait, max 30s)
-  const timeout = Math.min(parseInt(c.req.query('timeout') || '0'), 30000);
+  const parsedTimeout = parseInt(c.req.query('timeout') || '0', 10);
+  const timeout = Number.isFinite(parsedTimeout) ? Math.max(0, Math.min(parsedTimeout, 30000)) : 0;
 
   // If no changes and timeout > 0, wait for events via Durable Object
   if (!hasChanges && timeout > 0 && hasSinceToken) {

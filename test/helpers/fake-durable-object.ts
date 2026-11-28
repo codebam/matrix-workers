@@ -8,16 +8,38 @@ export class FakeStorage {
   map = new Map<string, unknown>();
   alarm: number | null = null;
 
-  async get<T = unknown>(key: string): Promise<T | undefined> {
-    return this.map.get(key) as T | undefined;
+  async get<T = unknown>(keyOrKeys: string | string[]): Promise<T | Map<string, T> | undefined> {
+    if (Array.isArray(keyOrKeys)) {
+      const out = new Map<string, T>();
+      for (const k of keyOrKeys) {
+        if (this.map.has(k)) {
+          out.set(k, this.map.get(k) as T);
+        }
+      }
+      return out;
+    }
+    return this.map.get(keyOrKeys) as T | undefined;
   }
 
-  async put(key: string, value: unknown): Promise<void> {
-    this.map.set(key, structuredClone(value));
+  async put(keyOrEntries: string | Record<string, unknown>, value?: unknown): Promise<void> {
+    if (typeof keyOrEntries === 'string') {
+      this.map.set(keyOrEntries, structuredClone(value));
+      return;
+    }
+    for (const [k, v] of Object.entries(keyOrEntries)) {
+      this.map.set(k, structuredClone(v));
+    }
   }
 
-  async delete(key: string): Promise<void> {
-    this.map.delete(key);
+  async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
+    if (Array.isArray(keyOrKeys)) {
+      let deleted = 0;
+      for (const k of keyOrKeys) {
+        if (this.map.delete(k)) deleted++;
+      }
+      return deleted;
+    }
+    return this.map.delete(keyOrKeys);
   }
 
   async deleteAll(): Promise<void> {

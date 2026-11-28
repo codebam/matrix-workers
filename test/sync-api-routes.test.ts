@@ -2661,3 +2661,45 @@ describe('GET /sync — per-stream token positions', () => {
     expect(body.device_lists).toEqual({ changed: [BOB], left: [] });
   });
 });
+
+describe('GET /sync — cost optimizations (KV filter cache + reused room state)', () => {
+  it('caches parsed KV filters per KVNamespace so repeat polls avoid KV reads', async () => {
+    getUserRooms.mockImplementation(async (_db, _u, membership?: string) => {
+      if (membership === 'join') return [ROOM, ROOM2];
+      return [];
+    });
+    const cache = mockKv({
+      [`filter:${USER}:fid-cached`]: JSON.stringify({ room: { rooms: [ROOM] } }),
+    });
+    const getSpy = vi.spyOn(cache, 'get');
+    const env = createEnv({ cache });
+
+    const r1 = await syncRequest(env, 'filter=fid-cached');
+    const r2 = await syncRequest(env, 'filter=fid-cached');
+
+    expect(Object.keys((r1.body.rooms as { join: object }).join)).toEqual([ROOM]);
+    expect(Object.keys((r2.body.rooms as { join: object }).join)).toEqual([ROOM]);
+    expect(getSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses getRoomState for use_state_after=true on initial sync (1 D1 query, not 2)', async () => {
+    getUserRooms.mockImplementation(async (_db, _u, membership?: string) => {
+      if (membership === 'join') return [ROOM];
+      return [];
+    });
+    getRoomState.mockResolvedValue([
+      makePdu({
+        type: 'm.room.name',
+        state_key: '',
+        event_id: '$name:example.com',
+        content: { name: 'General' },
+      }),
+    ]);
+    const env = createEnv();
+
+    const { body } = await syncRequest(env, 'use_state_after=true');
+    const joined = (body.rooms as { join: Record<string, { timeline: { state_after?: { events: unknown[] } } }> }).join[ROOM];
+    expect(joined.timeline.state_after?.events).toHaveLength(1);
+    expect(getRoomState).toHaveBeenCalledTimes(1);
+  });
+});

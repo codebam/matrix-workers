@@ -2952,3 +2952,31 @@ describe('tombstone filter and invite reconnect', () => {
     expect((body.rooms as any)[INVITE_ROOM].membership).toBe('invite');
   });
 });
+
+describe('MSC4186 — cost optimizations (skip redundant idle state save)', () => {
+  it('skips PUT /sliding-sync/state when idle long-poll has no changes and fresh lastAccess', async () => {
+    const existing: ConnectionState = {
+      userId: USER,
+      pos: 5,
+      lastAccess: Date.now(),
+      roomStates: {},
+      listStates: { all: { roomIds: [], count: 0 } },
+      initialSyncComplete: true,
+    };
+    const syncDo = createSyncDoStub({ states: { default: existing } });
+    const env = createEnv({
+      syncDo,
+      db: createSlidingDb({ maxStreamPos: 5, memberships: [] }),
+    });
+
+    const { status, body } = await postSync(MSC4186, env, {
+      pos: '5',
+      timeout: 5000,
+      lists: { all: { range: [0, 0] } },
+    });
+    expect(status).toBe(200);
+    expect(body.pos).toBe('5');
+    expect(syncDo.saves).toHaveLength(0);
+    expect(syncDo.fetches.some((f) => f.url.includes('/wait-for-events'))).toBe(true);
+  });
+});

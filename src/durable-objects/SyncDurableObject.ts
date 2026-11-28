@@ -40,11 +40,18 @@ interface SlidingSyncConnectionState {
 interface WaitEntry {
   resolve: (hasEvents: boolean) => void;
   resolved: boolean;
+  timer?: ReturnType<typeof setTimeout>;
 }
+
+const MAX_PENDING_EVENTS_CACHE = 1000;
+const STORAGE_DELETE_BATCH_SIZE = 128;
 
 export class SyncDurableObject extends DurableObject<Env> {
   private sessions: Map<WebSocket, SyncSession> = new Map();
   private pendingEvents: PendingEvent[] = [];
+  private pendingEventsById: Map<string, PendingEvent> = new Map();
+  private pendingEventsLoaded: boolean = false;
+  private pendingEventsLoadPromise: Promise<void> | null = null;
   // In-memory cache for sliding sync state (persisted to storage on save)
   private slidingSyncStates: Map<string, SlidingSyncConnectionState> = new Map();
   // Waiting resolvers for long-polling requests, keyed by a unique waiter id
@@ -206,8 +213,22 @@ export class SyncDurableObject extends DurableObject<Env> {
     const key = `event:${data.event_id}`;
     await this.ctx.storage.put(key, data);
 
-    // Add to in-memory list
+    // Update in-memory list/map (respecting cache cap when already hydrated)
     this.pendingEvents.push(data);
+    if (this.pendingEventsLoaded) {
+      if (this.pendingEventsById.has(data.event_id)) {
+        this.pendingEventsById.set(data.event_id, data);
+      } else if (this.pendingEventsById.size < MAX_PENDING_EVENTS_CACHE) {
+        this.pendingEventsById.set(data.event_id, data);
+      } else {
+        // Evict oldest entry by insertion order so bounded memory stays fresh
+        const oldestKey = this.pendingEventsById.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.pendingEventsById.delete(oldestKey);
+        }
+        this.pendingEventsById.set(data.event_id, data);
+      }
+    }
 
     // Notify all connected WebSockets
     const message = JSON.stringify({
@@ -232,6 +253,10 @@ export class SyncDurableObject extends DurableObject<Env> {
     for (const entry of entries) {
       if (!entry.resolved) {
         entry.resolved = true;
+        if (entry.timer !== undefined) {
+          clearTimeout(entry.timer);
+          entry.timer = undefined;
+        }
         entry.resolve(true);
         woke++;
       }
@@ -260,7 +285,8 @@ export class SyncDurableObject extends DurableObject<Env> {
         entry = e;
         this.waitingResolvers.set(waiterId, e);
 
-        setTimeout(() => {
+        e.timer = setTimeout(() => {
+          e.timer = undefined;
           if (!e.resolved) {
             e.resolved = true;
             // Delete by key — safe even if notify already removed us.
@@ -302,14 +328,39 @@ export class SyncDurableObject extends DurableObject<Env> {
     });
   }
 
-  private async getPendingEvents(since: number): Promise<PendingEvent[]> {
-    const events: PendingEvent[] = [];
-    // Limit the storage scan to prevent memory exhaustion on DOs
-    // that have accumulated many undelivered events
-    const allKeys = await this.ctx.storage.list({ prefix: 'event:', limit: 1000 });
+  // Lazy one-time hydration of pending events from DO storage to avoid
+  // repeated 1000-row storage.list scans on every /pending or /websocket call.
+  private async loadPendingEvents(): Promise<void> {
+    if (this.pendingEventsLoaded) return;
+    if (this.pendingEventsLoadPromise) {
+      await this.pendingEventsLoadPromise;
+      return;
+    }
 
-    for (const [, value] of allKeys) {
-      const event = value as PendingEvent;
+    this.pendingEventsLoadPromise = (async () => {
+      const allKeys = await this.ctx.storage.list<PendingEvent>({
+        prefix: 'event:',
+        limit: MAX_PENDING_EVENTS_CACHE,
+      });
+      this.pendingEventsById.clear();
+      for (const [, event] of allKeys) {
+        this.pendingEventsById.set(event.event_id, event);
+      }
+      this.pendingEventsLoaded = true;
+    })();
+
+    try {
+      await this.pendingEventsLoadPromise;
+    } finally {
+      this.pendingEventsLoadPromise = null;
+    }
+  }
+
+  private async getPendingEvents(since: number): Promise<PendingEvent[]> {
+    await this.loadPendingEvents();
+
+    const events: PendingEvent[] = [];
+    for (const event of this.pendingEventsById.values()) {
       if (event.timestamp > since) {
         events.push(event);
       }
@@ -364,34 +415,61 @@ export class SyncDurableObject extends DurableObject<Env> {
     }
   }
 
+  // Batch delete storage keys in chunks of 128 (Cloudflare DO limit)
+  private async batchDelete(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    if (keys.length === 1) {
+      await this.ctx.storage.delete(keys[0]);
+      return;
+    }
+    for (let i = 0; i < keys.length; i += STORAGE_DELETE_BATCH_SIZE) {
+      await this.ctx.storage.delete(keys.slice(i, i + STORAGE_DELETE_BATCH_SIZE));
+    }
+  }
+
   // Cleanup old events and stale connection state (run periodically via alarm)
   async alarm(): Promise<void> {
-    const eventCutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
-    const connectionCutoff = Date.now() - (24 * 60 * 60 * 1000); // 24 hours ago
+    const now = Date.now();
+    const eventCutoff = now - (24 * 60 * 60 * 1000); // 24 hours ago
+    const connectionCutoff = now - (24 * 60 * 60 * 1000); // 24 hours ago
 
-    // Clean up old pending events
+    // Clean up old pending events in batched deletes
     const allKeys = await this.ctx.storage.list({ prefix: 'event:', limit: 1000 });
+    const expiredEventKeys: string[] = [];
+    let remainingEvents = 0;
     for (const [key, value] of allKeys) {
       const event = value as PendingEvent;
       if (event.timestamp < eventCutoff) {
-        await this.ctx.storage.delete(key);
+        expiredEventKeys.push(key);
+        this.pendingEventsById.delete(event.event_id);
+      } else {
+        remainingEvents++;
       }
     }
 
     // Clean up in-memory pending events list
     this.pendingEvents = this.pendingEvents.filter(e => e.timestamp >= eventCutoff);
 
-    // Clean up stale sliding sync connection states
+    // Clean up stale sliding sync connection states in batched deletes
     const syncKeys = await this.ctx.storage.list({ prefix: 'sliding_sync:', limit: 100 });
+    const expiredSyncKeys: string[] = [];
+    let remainingSyncStates = 0;
     for (const [key, value] of syncKeys) {
       const state = value as SlidingSyncConnectionState;
       if (state.lastAccess && state.lastAccess < connectionCutoff) {
-        await this.ctx.storage.delete(key);
+        expiredSyncKeys.push(key);
         this.slidingSyncStates.delete(key);
+      } else {
+        remainingSyncStates++;
       }
     }
 
-    // Schedule next cleanup in 1 hour
-    await this.ctx.storage.setAlarm(Date.now() + (60 * 60 * 1000));
+    await this.batchDelete([...expiredEventKeys, ...expiredSyncKeys]);
+
+    // Only reschedule cleanup if there are still stored entries to expire later;
+    // stops idle/empty user SyncDOs from waking every hour indefinitely.
+    if (remainingEvents > 0 || remainingSyncStates > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + (60 * 60 * 1000));
+    }
   }
 }
