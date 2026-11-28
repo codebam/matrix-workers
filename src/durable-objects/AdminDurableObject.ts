@@ -39,6 +39,7 @@ interface ServerConfig {
 }
 
 const STATS_CACHE_TTL = 30 * 1000; // 30 seconds cache for stats
+const STATS_REFRESH_INTERVAL = 60 * 1000; // 1 minute periodic refresh while admins connected
 const DEFAULT_CONFIG: ServerConfig = {
   registration_enabled: true,
   updated_at: 0,
@@ -47,6 +48,7 @@ const DEFAULT_CONFIG: ServerConfig = {
 export class AdminDurableObject extends DurableObject<Env> {
   private statsCache: ServerStats | null = null;
   private statsCacheTime: number = 0;
+  private configCache: ServerConfig | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -96,8 +98,12 @@ export class AdminDurableObject extends DurableObject<Env> {
   }
 
   private async getConfig(): Promise<ServerConfig> {
+    if (this.configCache) {
+      return this.configCache;
+    }
     const stored = await this.ctx.storage.get<ServerConfig>('config');
-    return stored || DEFAULT_CONFIG;
+    this.configCache = stored || DEFAULT_CONFIG;
+    return this.configCache;
   }
 
   private async updateConfig(updates: Partial<ServerConfig>): Promise<ServerConfig> {
@@ -107,6 +113,7 @@ export class AdminDurableObject extends DurableObject<Env> {
       ...updates,
       updated_at: Date.now(),
     };
+    this.configCache = newConfig;
     await this.ctx.storage.put('config', newConfig);
     return newConfig;
   }
@@ -116,10 +123,20 @@ export class AdminDurableObject extends DurableObject<Env> {
     const url = new URL(request.url);
     const forceRefresh = url.searchParams.get('refresh') === 'true';
 
-    // Check cache first
+    // Check in-memory cache first
     const now = Date.now();
     if (!forceRefresh && this.statsCache && (now - this.statsCacheTime) < STATS_CACHE_TTL) {
       return Response.json(this.statsCache);
+    }
+
+    // Check persisted cache after hibernation before querying D1
+    if (!forceRefresh && !this.statsCache) {
+      const persisted = await this.ctx.storage.get<{ stats: ServerStats; timestamp: number }>('stats_cache');
+      if (persisted && persisted.stats && (now - persisted.timestamp) < STATS_CACHE_TTL) {
+        this.statsCache = persisted.stats;
+        this.statsCacheTime = persisted.timestamp;
+        return Response.json(persisted.stats);
+      }
     }
 
     // Fetch fresh stats from D1
@@ -204,9 +221,24 @@ export class AdminDurableObject extends DurableObject<Env> {
     };
     server.serializeAttachment(session);
 
-    // Send current stats immediately
-    const stats = await this.fetchStatsFromD1();
+    // Send current stats immediately (reuse warm cache if within TTL)
+    const now = Date.now();
+    let stats: ServerStats;
+    if (this.statsCache && (now - this.statsCacheTime) < STATS_CACHE_TTL) {
+      stats = this.statsCache;
+    } else {
+      stats = await this.fetchStatsFromD1();
+      this.statsCache = stats;
+      this.statsCacheTime = now;
+      await this.ctx.storage.put('stats_cache', { stats, timestamp: now });
+    }
     server.send(JSON.stringify({ type: 'stats', data: stats }));
+
+    // Ensure periodic stats refresh alarm is scheduled while an admin is connected
+    const currentAlarm = await this.ctx.storage.getAlarm();
+    if (!currentAlarm) {
+      await this.ctx.storage.setAlarm(Date.now() + STATS_REFRESH_INTERVAL);
+    }
 
     return new Response(null, {
       status: 101,
@@ -263,16 +295,29 @@ export class AdminDurableObject extends DurableObject<Env> {
     }
   }
 
-  async webSocketClose(_ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
-    // WebSocket is already closed, no action needed
+  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean): Promise<void> {
+    // Stop periodic stats refresh alarm once the last admin WebSocket disconnects
+    const remaining = this.ctx.getWebSockets().filter((s) => s !== ws);
+    if (remaining.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+    }
   }
 
-  async webSocketError(_ws: WebSocket, error: unknown): Promise<void> {
+  async webSocketError(ws: WebSocket, error: unknown): Promise<void> {
     console.error('Admin WebSocket error:', error);
+    const remaining = this.ctx.getWebSockets().filter((s) => s !== ws);
+    if (remaining.length === 0) {
+      await this.ctx.storage.deleteAlarm();
+    }
   }
 
   // Alarm handler for periodic stats refresh
   async alarm(): Promise<void> {
+    // Do not query D1, write storage, or reschedule when no admin WebSockets are connected
+    if (this.ctx.getWebSockets().length === 0) {
+      return;
+    }
+
     // Refresh stats cache
     this.statsCache = await this.fetchStatsFromD1();
     this.statsCacheTime = Date.now();
@@ -282,6 +327,6 @@ export class AdminDurableObject extends DurableObject<Env> {
     await this.broadcastToAdmins({ type: 'stats', data: this.statsCache });
 
     // Schedule next refresh in 1 minute
-    await this.ctx.storage.setAlarm(Date.now() + 60000);
+    await this.ctx.storage.setAlarm(Date.now() + STATS_REFRESH_INTERVAL);
   }
 }

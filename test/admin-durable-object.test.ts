@@ -233,11 +233,13 @@ describe('AdminDurableObject TOKENMAXX clock boundaries after #61', () => {
     });
     expect(ws.sent.some((s) => s.includes('"type":"stats"'))).toBe(true);
 
-    // Warm in-memory cache via alarm; still within TTL → no D1 on /stats
+    // Warm in-memory cache via alarm (requires an active admin socket); still within TTL → no D1 on /stats
     const tracker = { prepares: 0, firsts: 0 };
+    const state2 = new FakeDurableObjectState();
+    state2.sockets.push(new FakeWebSocket());
     const { do: admin2 } = makeAdmin({
       DB: mockAdminDb({ count: 9 }, tracker) as Env['DB'],
-    });
+    }, state2);
     await (admin2 as unknown as { alarm: () => Promise<void> }).alarm();
     const afterAlarm = tracker.firsts;
     vi.setSystemTime(NOW + 10_000);
@@ -468,5 +470,114 @@ describe('AdminDurableObject TOKENMAXX edges after #74', () => {
         }
       ).webSocketError(ws, new Error('boom'))
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('AdminDurableObject cost optimizations (idle alarm gating + hibernation cache)', () => {
+  const NOW = 1_700_000_000_000;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('alarm is a complete no-op when 0 admin WebSockets are connected', async () => {
+    const tracker = { prepares: 0, firsts: 0 };
+    const state = new FakeDurableObjectState();
+    const { do: admin } = makeAdmin(
+      { DB: mockAdminDb({ count: 5 }, tracker) as Env['DB'] },
+      state
+    );
+
+    await (admin as unknown as { alarm: () => Promise<void> }).alarm();
+
+    expect(tracker.prepares).toBe(0);
+    expect(tracker.firsts).toBe(0);
+    expect(state.storage.map.has('stats_cache')).toBe(false);
+    expect(state.storage.alarm).toBeNull();
+  });
+
+  it('schedules 60s alarm on WebSocket connect and cancels it when last WebSocket closes', async () => {
+    const state = new FakeDurableObjectState();
+    const { do: admin } = makeAdmin(
+      { DB: mockAdminDb({ count: 2 }) as Env['DB'] },
+      state
+    );
+    vi.stubGlobal(
+      'WebSocketPair',
+      class {
+        0 = new FakeWebSocket();
+        1 = new FakeWebSocket();
+      }
+    );
+
+    // First admin connects -> alarm is scheduled for +60s
+    await expect(
+      admin.fetch(
+        new Request('https://do/websocket?user_id=@admin1:ex.com', {
+          headers: { Upgrade: 'websocket' },
+        })
+      )
+    ).rejects.toThrow(/status/);
+    expect(state.storage.alarm).toBe(NOW + 60_000);
+
+    // Second admin connects later -> existing alarm preserved (not overwritten)
+    vi.setSystemTime(NOW + 10_000);
+    await expect(
+      admin.fetch(
+        new Request('https://do/websocket?user_id=@admin2:ex.com', {
+          headers: { Upgrade: 'websocket' },
+        })
+      )
+    ).rejects.toThrow(/status/);
+    expect(state.sockets).toHaveLength(2);
+    expect(state.storage.alarm).toBe(NOW + 60_000);
+
+    // First admin closes while second remains -> alarm stays active
+    const [ws1, ws2] = state.sockets;
+    await (
+      admin as unknown as {
+        webSocketClose: (ws: FakeWebSocket, code: number, reason: string, clean: boolean) => Promise<void>;
+      }
+    ).webSocketClose(ws1, 1000, 'bye', true);
+    expect(state.storage.alarm).toBe(NOW + 60_000);
+
+    // Remove ws1 as runtime does, then close last admin -> alarm deleted
+    state.sockets.splice(0, 1);
+    await (
+      admin as unknown as {
+        webSocketClose: (ws: FakeWebSocket, code: number, reason: string, clean: boolean) => Promise<void>;
+      }
+    ).webSocketClose(ws2, 1000, 'bye', true);
+    expect(state.storage.alarm).toBeNull();
+  });
+
+  it('serves fresh persisted stats_cache after hibernation without querying D1', async () => {
+    const state = new FakeDurableObjectState();
+    await state.storage.put('stats_cache', {
+      timestamp: NOW - 5_000,
+      stats: {
+        users: { total: 42, active: 40, registrations_24h: 1 },
+        rooms: { total: 10 },
+        events: { total: 500, last_24h: 20 },
+        media: { count: 3, total_size_bytes: 1024 },
+        unresolvedReports: 0,
+        lastUpdated: NOW - 5_000,
+      },
+    });
+    const tracker = { prepares: 0, firsts: 0 };
+    const { do: admin } = makeAdmin(
+      { DB: mockAdminDb({ count: 999 }, tracker) as Env['DB'] },
+      state
+    );
+
+    const res = await admin.fetch(new Request('https://do/stats'));
+    expect(await res.json()).toMatchObject({ users: { total: 42 }, rooms: { total: 10 } });
+    expect(tracker.firsts).toBe(0);
   });
 });
