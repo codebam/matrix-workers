@@ -379,4 +379,34 @@ describe('UserKeysDurableObject TOKENMAXX edge paths after #62', () => {
     expect(device.status).toBe(500);
     expect(await device.json()).toEqual({ error: 'Internal server error' });
   });
+
+  it('batches multi-key storage reads and writes for account-data and device-keys', async () => {
+    const { state, do: keys } = makeKeys();
+    const putSpy = vi.spyOn(state.storage, 'put');
+
+    await keys.fetch(
+      new Request('https://do/account-data/put', {
+        method: 'POST',
+        body: JSON.stringify({ event_type: 'm.secret_storage.default_key', content: { key: 'k1' } }),
+      })
+    );
+    await keys.fetch(
+      new Request('https://do/account-data/put', {
+        method: 'POST',
+        body: JSON.stringify({ event_type: 'm.cross_signing.master', content: { key: 'm1' } }),
+      })
+    );
+    // Each new type writes both value and index in a single batched put
+    expect(putSpy).toHaveBeenCalledTimes(2);
+
+    const getSpy = vi.spyOn(state.storage, 'get');
+    const allRes = await keys.fetch(new Request('https://do/account-data/get'));
+    expect(await allRes.json()).toEqual({
+      'm.secret_storage.default_key': { key: 'k1' },
+      'm.cross_signing.master': { key: 'm1' },
+    });
+    // 1 get for 'account_data_types' + 1 batched multi-key get for all types
+    expect(getSpy).toHaveBeenCalledTimes(2);
+    expect(Array.isArray(getSpy.mock.calls[1][0])).toBe(true);
+  });
 });

@@ -5203,3 +5203,31 @@ describe('RoomDurableObject hibernation novemdenary receipt/ws leftovers after #
     });
   }
 });
+
+describe('RoomDurableObject cost optimizations (cold-start receipt write)', () => {
+  it('PUT /receipt on a cold DO writes storage without scanning all receipts via storage.list', async () => {
+    const { state, do: room } = makeRoom();
+    const listSpy = vi.spyOn(state.storage, 'list');
+
+    const res = await room.fetch(
+      new Request('https://do/receipt', {
+        method: 'PUT',
+        body: JSON.stringify({
+          user_id: '@a:ex.com',
+          event_id: '$e1',
+          receipt_type: 'm.read',
+        }),
+      })
+    );
+    expect(res.status).toBe(200);
+    expect(listSpy).not.toHaveBeenCalled();
+
+    // Subsequent GET /receipts hydrates once and includes the newly written receipt
+    const getRes = await room.fetch(new Request('https://do/receipts'));
+    const body = (await getRes.json()) as {
+      receipts: Record<string, Record<string, Record<string, { ts: number }>>>;
+    };
+    expect(body.receipts.$e1['m.read']['@a:ex.com']).toBeDefined();
+    expect(listSpy).toHaveBeenCalledTimes(1);
+  });
+});

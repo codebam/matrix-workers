@@ -48,6 +48,7 @@ export class RoomDurableObject extends DurableObject<Env> {
   // so we delete-then-set in setReceiptCacheLRU() to refresh recency.
   private receiptsCache: Map<string, ReceiptData> = new Map();
   private receiptsCacheLoaded: boolean = false;
+  private receiptsCacheLoadPromise: Promise<void> | null = null;
 
   // LRU set for receiptsCache: refresh recency, then evict oldest if over cap.
   private setReceiptCacheLRU(key: string, value: ReceiptData): void {
@@ -66,44 +67,56 @@ export class RoomDurableObject extends DurableObject<Env> {
     super(ctx, env);
   }
 
-  // Load receipts from durable storage into cache
+  // Load receipts from durable storage into cache (deduplicating concurrent loads)
   private async loadReceiptsCache(): Promise<void> {
     if (this.receiptsCacheLoaded) return;
+    if (this.receiptsCacheLoadPromise) {
+      await this.receiptsCacheLoadPromise;
+      return;
+    }
 
-    const stored = await this.ctx.storage.list<ReceiptData>({ prefix: 'receipt:' });
-    for (const [key, value] of stored) {
-      // Handle both old and new key formats for backwards compatibility
-      // Old format: receipt:{userId}:{receiptType}
-      // New format: receipt:{userId}:{receiptType}:{threadContext}
-      const keyWithoutPrefix = key.replace('receipt:', '');
+    this.receiptsCacheLoadPromise = (async () => {
+      const stored = await this.ctx.storage.list<ReceiptData>({ prefix: 'receipt:' });
+      for (const [key, value] of stored) {
+        // Handle both old and new key formats for backwards compatibility
+        // Old format: receipt:{userId}:{receiptType}
+        // New format: receipt:{userId}:{receiptType}:{threadContext}
+        const keyWithoutPrefix = key.replace('receipt:', '');
 
-      // Check if this is new format (has user_id in data)
-      if (value.user_id) {
-        // New format - use key as-is
-        this.setReceiptCacheLRU(keyWithoutPrefix, value);
-      } else {
-        // Old format - need to add user_id and thread context
-        // Old key: {userId}:{receiptType} where userId is @localpart:server
-        // We need to extract userId - find the receipt_type in the key
-        const receiptType = value.receipt_type;
-        const receiptTypeIndex = keyWithoutPrefix.lastIndexOf(`:${receiptType}`);
-
-        if (receiptTypeIndex > 0) {
-          const userId = keyWithoutPrefix.substring(0, receiptTypeIndex);
-          const threadContext = value.thread_id ?? 'unthreaded';
-          const newCacheKey = `${userId}:${receiptType}:${threadContext}`;
-
-          // Backfill user_id into value
-          value.user_id = userId;
-          this.setReceiptCacheLRU(newCacheKey, value);
+        // Check if this is new format (has user_id in data)
+        if (value.user_id) {
+          // New format - use key as-is
+          this.setReceiptCacheLRU(keyWithoutPrefix, value);
         } else {
-          // Fallback: just use the key with unthreaded suffix
-          const threadContext = value.thread_id ?? 'unthreaded';
-          this.setReceiptCacheLRU(`${keyWithoutPrefix}:${threadContext}`, value);
+          // Old format - need to add user_id and thread context
+          // Old key: {userId}:{receiptType} where userId is @localpart:server
+          // We need to extract userId - find the receipt_type in the key
+          const receiptType = value.receipt_type;
+          const receiptTypeIndex = keyWithoutPrefix.lastIndexOf(`:${receiptType}`);
+
+          if (receiptTypeIndex > 0) {
+            const userId = keyWithoutPrefix.substring(0, receiptTypeIndex);
+            const threadContext = value.thread_id ?? 'unthreaded';
+            const newCacheKey = `${userId}:${receiptType}:${threadContext}`;
+
+            // Backfill user_id into value
+            value.user_id = userId;
+            this.setReceiptCacheLRU(newCacheKey, value);
+          } else {
+            // Fallback: just use the key with unthreaded suffix
+            const threadContext = value.thread_id ?? 'unthreaded';
+            this.setReceiptCacheLRU(`${keyWithoutPrefix}:${threadContext}`, value);
+          }
         }
       }
+      this.receiptsCacheLoaded = true;
+    })();
+
+    try {
+      await this.receiptsCacheLoadPromise;
+    } finally {
+      this.receiptsCacheLoadPromise = null;
     }
-    this.receiptsCacheLoaded = true;
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -176,9 +189,14 @@ export class RoomDurableObject extends DurableObject<Env> {
     const receiptData: ReceiptData = { user_id, event_id, receipt_type, ts, thread_id };
     await this.ctx.storage.put(storageKey, receiptData);
 
-    // Update cache (LRU-bounded)
-    await this.loadReceiptsCache();
-    this.setReceiptCacheLRU(`${user_id}:${receipt_type}:${threadContext}`, receiptData);
+    // Update cache only if already hydrated (or join an in-flight load);
+    // avoids scanning all receipts on a cold-start write-only DO wakeup.
+    if (this.receiptsCacheLoaded) {
+      this.setReceiptCacheLRU(`${user_id}:${receipt_type}:${threadContext}`, receiptData);
+    } else if (this.receiptsCacheLoadPromise) {
+      await this.receiptsCacheLoadPromise;
+      this.setReceiptCacheLRU(`${user_id}:${receipt_type}:${threadContext}`, receiptData);
+    }
 
     // Broadcast to WebSocket clients
     const message = JSON.stringify({
@@ -491,9 +509,14 @@ export class RoomDurableObject extends DurableObject<Env> {
     };
     await this.ctx.storage.put(storageKey, receiptData);
 
-    // Update cache (LRU-bounded)
-    await this.loadReceiptsCache();
-    this.setReceiptCacheLRU(`${userId}:${receiptType}:${threadContext}`, receiptData);
+    // Update cache only if already hydrated (or join an in-flight load);
+    // avoids scanning all receipts on a cold-start write-only DO wakeup.
+    if (this.receiptsCacheLoaded) {
+      this.setReceiptCacheLRU(`${userId}:${receiptType}:${threadContext}`, receiptData);
+    } else if (this.receiptsCacheLoadPromise) {
+      await this.receiptsCacheLoadPromise;
+      this.setReceiptCacheLRU(`${userId}:${receiptType}:${threadContext}`, receiptData);
+    }
 
     // Broadcast to other users
     const message = JSON.stringify({

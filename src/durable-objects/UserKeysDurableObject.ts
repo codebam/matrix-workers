@@ -108,13 +108,18 @@ export class UserKeysDurableObject extends DurableObject<Env> {
       });
     }
 
-    // Get all account data for this user
+    // Get all account data for this user in batched storage reads
     const allData: Record<string, any> = {};
     const eventTypes = await this.ctx.storage.get<string[]>('account_data_types') || [];
-    for (const type of eventTypes) {
-      const data = await this.ctx.storage.get<any>(`account_data:${type}`);
-      if (data !== undefined) {
-        allData[type] = data;
+    for (let i = 0; i < eventTypes.length; i += 128) {
+      const chunk = eventTypes.slice(i, i + 128);
+      const keys = chunk.map(type => `account_data:${type}`);
+      const values = await this.ctx.storage.get<any>(keys);
+      for (const type of chunk) {
+        const data = values.get(`account_data:${type}`);
+        if (data !== undefined) {
+          allData[type] = data;
+        }
       }
     }
     return new Response(JSON.stringify(allData), {
@@ -123,13 +128,16 @@ export class UserKeysDurableObject extends DurableObject<Env> {
   }
 
   private async putAccountData(eventType: string, content: any): Promise<Response> {
-    await this.ctx.storage.put(`account_data:${eventType}`, content);
-
-    // Track event types
+    // Track event types and batch write when adding a new type
     const eventTypes = await this.ctx.storage.get<string[]>('account_data_types') || [];
     if (!eventTypes.includes(eventType)) {
       eventTypes.push(eventType);
-      await this.ctx.storage.put('account_data_types', eventTypes);
+      await this.ctx.storage.put({
+        [`account_data:${eventType}`]: content,
+        account_data_types: eventTypes,
+      });
+    } else {
+      await this.ctx.storage.put(`account_data:${eventType}`, content);
     }
 
     console.log('[UserKeysDO] Stored account data:', eventType);
@@ -150,13 +158,18 @@ export class UserKeysDurableObject extends DurableObject<Env> {
       });
     }
 
-    // Get all device keys for this user
+    // Get all device keys for this user in batched storage reads
     const allKeys: Record<string, any> = {};
     const deviceIds = await this.ctx.storage.get<string[]>('device_ids') || [];
-    for (const did of deviceIds) {
-      const keys = await this.ctx.storage.get<any>(`device_keys:${did}`);
-      if (keys) {
-        allKeys[did] = keys;
+    for (let i = 0; i < deviceIds.length; i += 128) {
+      const chunk = deviceIds.slice(i, i + 128);
+      const storageKeys = chunk.map(did => `device_keys:${did}`);
+      const values = await this.ctx.storage.get<any>(storageKeys);
+      for (const did of chunk) {
+        const keys = values.get(`device_keys:${did}`);
+        if (keys) {
+          allKeys[did] = keys;
+        }
       }
     }
     return new Response(JSON.stringify(allKeys), {
@@ -165,13 +178,16 @@ export class UserKeysDurableObject extends DurableObject<Env> {
   }
 
   private async putDeviceKeys(deviceId: string, keys: any): Promise<Response> {
-    await this.ctx.storage.put(`device_keys:${deviceId}`, keys);
-
-    // Track device IDs
+    // Track device IDs and batch write when adding a new device
     const deviceIds = await this.ctx.storage.get<string[]>('device_ids') || [];
     if (!deviceIds.includes(deviceId)) {
       deviceIds.push(deviceId);
-      await this.ctx.storage.put('device_ids', deviceIds);
+      await this.ctx.storage.put({
+        [`device_keys:${deviceId}`]: keys,
+        device_ids: deviceIds,
+      });
+    } else {
+      await this.ctx.storage.put(`device_keys:${deviceId}`, keys);
     }
 
     console.log('[UserKeysDO] Stored device keys for device:', deviceId);
